@@ -13,6 +13,7 @@ import { assertCanvasTools, FFMPEG } from '../../src/env.mjs'
 import { ff } from '../../src/ffmpeg.mjs'
 import { synthCues, peaksFromPCM } from '../../src/sfx.mjs'
 import { hashOf, planPatch, spliceMaster } from '../../src/render-cache.mjs'
+import { encodeFilm } from '../../src/encode-film.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const RENDERER = join(HERE, '..', '..', 'vendor', 'lighttrail', 'tools', 'render.mjs')
@@ -162,17 +163,14 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
     '[1:a]volume=1.0[s];[0:a][s]amix=inputs=2:duration=first:normalize=0[m]',
     '-map', '[m]', '-c:a', 'aac', '-b:a', '192k', mixed])
 
-  // 6. 编码
+  // 6. 编码：按帧栅格分段，脏段新编、干净段沿用上一版（src/encode-chunks.mjs）
   mkdirSync(dirname(out), { recursive: true })
-  const tEncode = Date.now()
-  await ff(['-y', '-loglevel', 'error', '-i', master, '-i', mixed,
-    '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
-    '-maxrate', '8M', '-bufsize', '16M',
-    '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', out])
-
-  const encodeSeconds = (Date.now() - tEncode) / 1000
-  log('编码完成：' + encodeSeconds.toFixed(1) + 's')
-  return { out, renderSeconds, encodeSeconds, frames: scene.frames, cues: made.cues, decision }
+  const enc = await encodeFilm({
+    master, out, mixed, frames: scene.frames, fps, log,
+    dirty: decision.mode === 'patch' ? { from: decision.from, to: decision.to } : decision.mode === 'reuse' ? { none: true } : { all: true },
+  })
+  const encodeSeconds = enc.encodeSeconds
+  return { out, renderSeconds, encodeSeconds, frames: scene.frames, cues: made.cues, decision, encode: { mode: enc.mode, window: enc.window } }
 }
 
 function readCacheMeta(cacheDir) {
@@ -188,6 +186,7 @@ function readCacheMeta(cacheDir) {
 function writeCacheMeta(cacheDir, meta) {
   writeFileSync(join(cacheDir, 'meta.json'), JSON.stringify(meta), 'utf8')
 }
+
 
 function audioGraph(plan) {
   const speed = plan.options.speed

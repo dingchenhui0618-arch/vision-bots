@@ -73,6 +73,8 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
     })
     renderSeconds = r.renderSeconds
     state.decision = r.decision || null
+    state.encode = r.encode || null
+    state.encodeSeconds = r.encodeSeconds || 0
   } else {
     const assText = (built && built.assText) || toASS(state.captions.cards, {
       width: spec.width, height: spec.height,
@@ -102,7 +104,12 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
       ? '\n只是改了那一处：' + state.decision.reason + '，其余帧从母版切出来拼回去，渲染 ' + renderSeconds.toFixed(1) + 's。'
       : '') +
     (state.decision && state.decision.mode === 'reuse' ? '\n画面一点没变，直接复用母版，渲染 ' + renderSeconds.toFixed(1) + 's。' : '') +
-    (state.decision && state.decision.mode === 'full' && renderSeconds > state.plan.outDuration * 1.2 ? '\n渲染比实时慢 ' + (renderSeconds / state.plan.outDuration).toFixed(2) + ' 倍（整条重渲），这条模板靠分段缓存省时间。' : ''),
+    (state.decision && state.decision.mode === 'full' && renderSeconds > state.plan.outDuration * 1.2 ? '\n渲染比实时慢 ' + (renderSeconds / state.plan.outDuration).toFixed(2) + ' 倍（整条重渲），这条模板靠分段缓存省时间。' : '') +
+    (state.encode
+      ? '\n编码 ' + state.encodeSeconds.toFixed(1) + 's（' + (state.encode.mode === 'splice'
+        ? '只重编第 ' + state.encode.window.from + '–' + state.encode.window.to + ' 帧，其余从上一版成片流拷贝'
+        : '整条重编') + '）。'
+      : ''),
     { job: job.id })
 
   return { video: out, preview, renderSeconds, engine }
