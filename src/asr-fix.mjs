@@ -15,6 +15,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { chat } from './llm.mjs'
 
 /** execFile 不收 stdin，拼音查询要喂 JSON，所以自己开管道。 */
 function runStdin(cmd, args, input, { timeout = 120000, maxBuffer = 4 << 20 } = {}) {
@@ -44,23 +45,7 @@ const strip = s => String(s ?? '').replace(PUNCT, '')
 const LOW_P = 0.6
 const MAX_FIXES = words => Math.max(4, Math.ceil(words.length * 0.08))
 
-export const LLM = {
-  base: process.env.DSH_MEDIA_LLM_BASE || 'http://127.0.0.1:10100/v1',
-  model: process.env.DSH_MEDIA_LLM_MODEL || 'gpt-6-luna--fast',
-  timeoutMs: 45000,
-}
-
-function readKey() {
-  if (process.env.DSH_MEDIA_LLM_KEY) return process.env.DSH_MEDIA_LLM_KEY
-  const p = join(homedir(), '.codex', 'auth.json')
-  if (!existsSync(p)) return null
-  try {
-    const a = JSON.parse(readFileSync(p, 'utf8'))
-    return a.tokens?.access_token || a.OPENAI_API_KEY || null
-  } catch {
-    return null
-  }
-}
+// 模型配置、凭证和超时统一在 llm.mjs：制片人和错字治理不能各配一套。
 
 /** 术语表：仓库默认 + 群级覆盖。 */
 export function loadTerms(groupDir = null) {
@@ -178,34 +163,20 @@ ${wordList}
 输出 JSON 数组，元素为 {"i": 词位数字, "to": "改正后的词", "kind": "homophone|term|number|punct", "why": "不超过 12 字的理由"}。
 没有要改的输出 []。不要输出任何其他文字。`
 
+/**
+ * 只问模型要提案，接不接受由 validate 说了算。
+ * 走 llm.mjs 的统一客户端，失败口径和制片人那边一致：no-key / http-4xx / timeout / unreachable。
+ */
 async function callModel(wordList) {
-  const key = readKey()
-  if (!key) return { skipped: 'no-key' }
   const t0 = Date.now()
-  const ctl = new AbortController()
-  const timer = setTimeout(() => ctl.abort(), LLM.timeoutMs)
   try {
-    const res = await fetch(LLM.base.replace(/\/$/, '') + '/chat/completions', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key },
-      body: JSON.stringify({
-        model: LLM.model,
-        messages: [{ role: 'user', content: PROMPT(wordList) }],
-        max_completion_tokens: 900,
-      }),
-      signal: ctl.signal,
-    })
-    const text = await res.text()
-    if (!res.ok) return { skipped: `http-${res.status}`, detail: text.slice(0, 200) }
-    const j = JSON.parse(text)
-    const content = j.choices?.[0]?.message?.content || ''
-    const m = content.match(/\[[\s\S]*\]/)
+    const r = await chat({ prompt: PROMPT(wordList), maxTokens: 900 })
+    if (!r.ok) return { skipped: r.skipped, detail: r.detail || null }
+    const m = r.content.match(/\[[\s\S]*\]/)
     const proposals = m ? JSON.parse(m[0]) : []
-    return { proposals, ms: Date.now() - t0, model: j.model || LLM.model, tokens: j.usage?.total_tokens ?? null }
+    return { proposals, ms: Date.now() - t0, model: r.model, tokens: r.tokens }
   } catch (err) {
-    return { skipped: err.name === 'AbortError' ? 'timeout' : 'unreachable', detail: String(err.message).slice(0, 160) }
-  } finally {
-    clearTimeout(timer)
+    return { skipped: 'unreachable', detail: String(err.message).slice(0, 160) }
   }
 }
 
@@ -262,6 +233,9 @@ export async function validate(proposals, words, { terms, pinyin }) {
 
   for (const x of pairs) {
     if (accepted.length >= cap) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: `超过本轮上限 ${cap} 处` }); continue }
+    // 同一个词位只认第一条：seen 在上一轮建候选时还没填，必须在这儿再拦一次，
+    // 否则同一词位两条提案都会「采纳」，报告说改了 2 处、实际只落地 1 处。
+    if (seen.has(x.i)) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '同一个词位改了两次' }); continue }
     if (x.kind === 'homophone') {
       if (!pyOk) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '本机没有拼音校验，保守模式不采纳同音改动' }); continue }
       const k = needPinyin.indexOf(x)

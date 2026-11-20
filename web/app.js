@@ -118,14 +118,19 @@ function renderEvent(e) {
   }
   if (e.type === 'card') {
     const rows = e.card.fields.map(f => '<div class="card-row"><div class="k">' + esc(f.label) + '</div><div class="v">' + esc(f.value) + '</div></div>').join('')
+    const why = e.card.why ? '<div class="card-why"><span class="k">模板理由</span><span class="v">' + esc(e.card.why) + '</span></div>' : ''
     const done = state.group.meta.phase !== 'confirm'
     const actions = done
       ? '<div class="card-done">已按这张卡开工</div>'
       : '<button class="btn-ghost">先去改改</button><button class="btn-primary" data-confirm="1">开始</button>'
     return '<div class="card"><div class="card-head"><b>' + esc(e.card.title) + '</b><span>' + esc(e.card.subtitle || '') + '</span></div>' +
-      '<div class="card-rows">' + rows + '</div><div class="card-actions">' + actions + '</div></div>'
+      '<div class="card-rows">' + rows + '</div>' + why + '<div class="card-actions">' + actions + '</div></div>'
   }
-  if (e.type === 'progress') return '<div class="line"><span class="st">·</span><span>' + esc(e.text) + '</span></div>'
+  // 临时状态（「在读需求」这类）：同一个 bot 后面已经说话了就收起来，别留在时间线里
+  if (e.type === 'progress') {
+    if (e.transient && (state.group ? state.group.events : []).some(x => x.type === 'bot' && x.bot === e.bot && x.ts > e.ts)) return ''
+    return '<div class="line' + (e.transient ? ' waiting' : '') + '"><span class="st">' + (MARKS[e.bot] || '·') + '</span><span>' + esc(e.text) + '</span></div>'
+  }
   if (e.type === 'job') {
     const st = e.job.status === 'failed' ? 'paused' : e.job.status
     if (e.job.status === 'running') return '<div class="line"><span class="st">▸</span><span>' + esc(e.job.title) + '</span></div>'

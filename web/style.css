@@ -63,6 +63,10 @@ h1,h2,h3{margin:0;font-family:var(--font-display);font-weight:500}
 /* 机器报的进度：等宽、低对比、不抢人的话 */
 .line{font-family:var(--font-mono);font-size:var(--t-xs);color:var(--chalk-mute);padding-left:var(--space-3);margin-top:2px;display:flex;gap:var(--space-2);line-height:1.7}
 .line .st{color:var(--chalk-dim);flex:none;width:10px}
+/* 正在等模型读需求：身份标记呼吸，不转圈、不发光 */
+.line.waiting .st{animation:breathe 1.6s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:.28}50%{opacity:1}}
+@media (prefers-reduced-motion:reduce){.line.waiting .st{animation:none;opacity:.7}}
 
 /* 确认卡：像一张纸卡，不发光 */
 .card{border:1px solid var(--edge-strong);border-radius:var(--r-md);margin:var(--space-6) 0 0;overflow:hidden;background:var(--slate)}
@@ -72,8 +76,13 @@ h1,h2,h3{margin:0;font-family:var(--font-display);font-weight:500}
 .card-rows{display:grid;grid-template-columns:1fr 1fr}
 .card-row{padding:var(--space-3) var(--space-4);border-right:1px solid var(--edge);border-bottom:1px solid var(--edge)}
 .card-row:nth-child(2n){border-right:0}
+/* 字段是奇数时，最后一格铺满整行，不留半个空格子 */
+.card-row:last-child:nth-child(odd){grid-column:1/-1;border-right:0}
 .card-row .k{font-family:var(--font-mono);font-size:var(--t-xs);color:var(--chalk-mute);margin-bottom:2px}
 .card-row .v{font-size:var(--t-sm);color:var(--chalk)}
+.card-why{display:flex;gap:var(--space-3);padding:var(--space-3) var(--space-4);border-bottom:1px solid var(--edge);font-size:var(--t-sm);color:var(--chalk-soft);line-height:1.6}
+.card-why .k{font-family:var(--font-mono);font-size:var(--t-xs);color:var(--chalk-mute);flex:none;padding-top:2px}
+.card-why .v{color:var(--chalk-soft)}
 .card-actions{display:flex;gap:var(--space-2);padding:var(--space-3) var(--space-4);justify-content:flex-end;align-items:center}
 .card-done{margin-right:auto;font-family:var(--font-mono);font-size:var(--t-xs);color:var(--chalk-mute)}
 .btn-primary{height:32px;padding:0 var(--space-4);background:var(--chalk);color:var(--film-black);border-radius:var(--r-sm);font-weight:500;font-size:var(--t-sm)}

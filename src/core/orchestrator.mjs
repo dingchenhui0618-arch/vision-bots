@@ -10,42 +10,7 @@ import { TEMPLATES, templateById, specOf, ratiosOf } from '../bots/roster.mjs'
 import { parseEdit, locate, applyEdit, assertUntouched, loadPipeline, loadScene, savePipeline } from '../revise.mjs'
 import { buildCaptions } from '../captions.mjs'
 import { TARGET_TOLERANCE } from '../qa.mjs'
-
-const PLATFORMS = ['视频号', '抖音', '小红书']
-const PLATFORM_HINT = /视频号|抖音|小红书|B站|快手/
-
-// 短视频平台都是竖屏优先：用户没提画幅时按平台给默认值，卡片上可以改。
-const PLATFORM_RATIO = { 抖音: '9:16', 视频号: '9:16', 小红书: '9:16', 快手: '9:16', B站: '9:16' }
-const RATIO_HINT = [
-  [/竖屏|竖版|9s*[:：]s*16|手机/, '9:16'],
-  [/横屏|横版|16s*[:：]s*9|宽屏/, '16:9'],
-  [/3s*[:：]s*4/, '3:4'],
-]
-
-const guessPlatform = text => (String(text).match(PLATFORM_HINT) || [])[0] || '视频号'
-
-/** 画幅：用户明说了就听用户，没说按平台默认 */
-function guessRatio(text, platform) {
-  const s = String(text || '')
-  for (const [re, r] of RATIO_HINT) if (re.test(s)) return r
-  return PLATFORM_RATIO[platform] || '9:16'
-}
-
-function guessDuration(text) {
-  const s = String(text)
-  const m = s.match(/(\d+)\s*秒/)
-  if (m) return Number(m[1])
-  const n = s.match(/(\d+)\s*分钟/)
-  if (n) return Number(n[1]) * 60
-  return 60
-}
-
-function guessTemplate(text) {
-  const s = String(text)
-  if (/光轨/.test(s)) return 'lighttrail'
-  if (/ppt|PPT|底座/.test(s)) return 'ppt-base'
-  return 'subtitle-only'
-}
+import { understand, whyText, templateLine, PLATFORMS } from '../brief.mjs'
 
 export class Orchestrator {
   constructor(group) {
@@ -79,17 +44,10 @@ export class Orchestrator {
       return { phase: 'intake', waiting: 'brief' }
     }
 
-    const platform = guessPlatform(text)
-    const brief = {
-      platform,
-      ratio: guessRatio(text, platform),
-      duration: guessDuration(text),
-      template: guessTemplate(text),
-      hasScript: /有稿|稿子.*(给|在)|按稿/.test(String(text)),
-      banned: '',
-      speed: 1,
-      createdAt: new Date().toISOString(),
-    }
+    // 模型读需求，规则逐个字段校验：用户明说的模型改不掉，模型读岔了也记在 corrected 里
+    this.group.emit({ type: 'progress', bot: 'producer', text: '制片人在读需求…', transient: true })
+    const u = await understand({ text })
+    const brief = { ...u.brief, createdAt: new Date().toISOString() }
     this.group.meta.brief = brief
     this.group.save()
 
@@ -102,6 +60,7 @@ export class Orchestrator {
         id: 'brief',
         title: '开工确认',
         subtitle: `素材 ${assets.map(a => a.split(/[\\/]/).pop()).join('、')}，按这张卡开始`,
+        why: whyText(brief),
         fields: [
           { key: 'platform', label: '平台', value: brief.platform, options: PLATFORMS },
           { key: 'ratio', label: '画幅', value: ratioText, options: ratiosOf(tpl) },
@@ -113,8 +72,26 @@ export class Orchestrator {
       },
     })
     this.group.setPhase('confirm')
-    this.group.say('producer', `我按你说的填好了：${brief.platform} · ${spec.ratio} · ${brief.duration}s · ${tpl ? tpl.name : brief.template}。\n看一眼，没问题就点开始。`)
+    this.group.say('producer', this.briefSpeech(brief, u.meta, spec, tpl))
     return { phase: 'confirm', brief }
+  }
+
+  /**
+   * 把「我怎么读的、哪个模板为什么、哪些是我替他定的」说清楚。
+   * 模型没接上要直说——不能拿规则填的卡冒充听懂了。
+   */
+  briefSpeech(brief, meta, spec, tpl) {
+    const lines = [`我按你说的填好了：${brief.platform} · ${spec.ratio} · ${brief.duration}s · ${tpl ? tpl.name : brief.template}。`]
+    if (spec.unsupported) lines.push(`你问 ${spec.asked}，${tpl.name} 没做这个画幅，这条按 ${spec.ratio} 出；要 ${spec.asked} 我另排一版布局，时间线不用重剪。`)
+    lines.push(templateLine(brief))
+    if (brief.assumed && brief.assumed.length) lines.push('我替你定的：' + brief.assumed.join('、') + '。')
+    if (brief.corrected && brief.corrected.length) {
+      const show = brief.corrected.slice(0, 2).join('；')
+      lines.push('模型读岔了，我按你的原话算：' + show + (brief.corrected.length > 2 ? ` 等 ${brief.corrected.length} 处` : '') + '。')
+    }
+    if (meta && meta.skipped && meta.skipped !== 'off') lines.push(`（模型没接上：${meta.skipped}，这版是规则填的）`)
+    lines.push('看一眼，没问题就点开始。')
+    return lines.join('\n')
   }
 
   async awaitConfirm(text) {
@@ -126,7 +103,7 @@ export class Orchestrator {
   /** 确认卡落地 → 定 Goal → 派活。 */
   async confirm(values = {}) {
     const brief = { ...(this.group.meta.brief || {}), ...cleanValues(values) }
-    if (!brief.template) brief.template = guessTemplate('')
+    if (!brief.template) brief.template = 'subtitle-only'
     this.group.meta.brief = brief
     if (brief.template) this.group.meta.template = brief.template
     this.group.save()
