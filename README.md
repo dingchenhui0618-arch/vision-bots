@@ -1,8 +1,10 @@
-# 深层媒体工作室 · ds-media-studio
+# Vision Bots
 
 一句话：**一个主 bot 带一队小 bot，在一张群聊里把口播素材做成能直接发布的片子。**
 
 前台是群聊，不是功能面板。skill、模板、模型都在 bot 里面，用户只跟人说人话。
+
+> 仓库代号 `ds-media-studio`（目录名、`bin` 名 `dsm` 沿用），对外产品名 **Vision Bots**。
 
 ## 现在能跑什么
 
