@@ -1,5 +1,9 @@
 import { ff, probeFile } from './ffmpeg.mjs'
 
+// 目标时长允许多少差：制片人拍板和质检用同一个数，不许一处 15%、一处 12%——
+// 那会出现「制片人说达标了、质检查出没达标」，用户不知道该信谁（2026-11-20 实测踩到）。
+export const TARGET_TOLERANCE = 0.12
+
 /** 质检：每条结论必须带证据（时间点 / 数值），没有证据不许判通过。 */
 export async function qa({ file, plan, captions, targetDuration = null, asrFix = null }) {
   const info = await probeFile(file)
@@ -12,7 +16,7 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
     { duration, source: plan.sourceDuration, segments: plan.keep.length })
   if (targetDuration) {
     const delta = duration - targetDuration
-    add('target', Math.abs(delta) <= targetDuration * 0.12, `目标 ${targetDuration}s，实际 ${duration.toFixed(2)}s（差 ${delta.toFixed(1)}s）`, { delta })
+    add('target', Math.abs(delta) <= targetDuration * TARGET_TOLERANCE, `目标 ${targetDuration}s，实际 ${duration.toFixed(2)}s（差 ${delta.toFixed(1)}s）`, { delta })
   }
 
   if (audio) {

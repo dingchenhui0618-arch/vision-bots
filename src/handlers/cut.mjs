@@ -63,6 +63,20 @@ export async function runCut({ group, job, log, artifact, brief, state }) {
   state.fixReport = fix.report
   state.lowConfidence = fix.report.pending
 
+  // 交付之后「改一句」要基于这一份：词、句、时间线、字幕卡全在，不用重跑转写。
+  // 只存状态，不存媒体；素材路径还在 group.json 里，渲染时按它取帧。
+  writeFileSync(join(group.dir, 'pipeline.json'), JSON.stringify({
+    version: 1,
+    at: new Date().toISOString(),
+    template: group.meta.template,
+    brief,
+    source: info,
+    plan,
+    captions,
+    transcript: { words, segments },
+    fixReport: fix.report,
+  }), 'utf8')
+
   const fixed = fix.report.applied
   const pending = fix.report.pending
   group.say('cutter',

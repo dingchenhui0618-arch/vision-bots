@@ -7,6 +7,9 @@ import { runCut } from '../handlers/cut.mjs'
 import { runPack } from '../handlers/pack.mjs'
 import { runQc } from '../handlers/qc.mjs'
 import { TEMPLATES, templateById, specOf, ratiosOf } from '../bots/roster.mjs'
+import { parseEdit, locate, applyEdit, assertUntouched, loadPipeline, loadScene, savePipeline } from '../revise.mjs'
+import { buildCaptions } from '../captions.mjs'
+import { TARGET_TOLERANCE } from '../qa.mjs'
 
 const PLATFORMS = ['视频号', '抖音', '小红书']
 const PLATFORM_HINT = /视频号|抖音|小红书|B站|快手/
@@ -152,7 +155,7 @@ export class Orchestrator {
       const target = Number(brief.duration) || 0
       const actual = state.plan.outDuration
       let effectiveTarget = target
-      if (target && Math.abs(actual - target) > target * 0.15) {
+      if (target && Math.abs(actual - target) > target * TARGET_TOLERANCE) {
         effectiveTarget = 0
         const short = actual < target
         this.group.say('producer', short
@@ -196,22 +199,109 @@ export class Orchestrator {
     this.group.say('producer',
       `交付。\n` + items.map(i => `· ${i.label}：${i.file.split(/[\\/]/).pop()}`).join('\n') +
       `\n封面和发布文案归包装和运营，这条先不占你时间。` +
+      `\n要改哪句直接说「把『划走』改成『溜走』」，我改完只重跑那一处。` +
       (fix && fix.stats && fix.stats.changed ? `字幕里的错字改了 ${fix.stats.changed} 处，清单在错字清单里。` : '') +
       (fix && fix.pending.length ? `还有 ${fix.pending.length} 个词我没把握，没动它，也在清单里——发布前扫一眼那几个字。` : '') +
       (report && report.passed ? '质检全过。' : report ? `质检有 ${report.failed.length} 项没过，看报告。` : ''))
     this.group.setPhase('delivered')
   }
 
+  /**
+   * 交付之后说一句改动：变成 scene 的改动，只重渲那一处。
+   * 只改字的文本，词数和时间码由 revise.mjs 内部断言；渲染走模板的分段缓存。
+   */
   async revise(text) {
-    // 下一版接分段缓存：改一句只重渲相关片段。现在先如实说，别假装已经能。
-    this.group.say('producer', '收到，记下了。\n分段缓存还没接，改动目前整条重跑；接完以后改一句只重渲那两段。要现在就重跑就说「重跑」。')
-    return { phase: 'delivered' }
+    const s = String(text || '').trim()
+    const pipe = loadPipeline(this.group)
+    if (!pipe) {
+      this.group.say('producer', '这条没有可改的时间线（剪辑那一步没留下状态）。\n素材再拖进来，我整条重走一遍。')
+      return { phase: this.group.meta.phase, error: 'no-pipeline' }
+    }
+    const parsed = parseEdit(s)
+    if (!parsed) {
+      const scene = loadScene(this.group) || { bigs: [] }
+      const list = (scene.bigs || []).map(b => '· 第 ' + b.index + ' 章（' + b.f0 + '–' + b.f1 + 's）：' + b.text).join('\n')
+      this.group.say('producer', '改哪句？照这个样子说，我改完只重跑那一处：\n把「划走」改成「溜走」' + (list ? '\n\n现在是这 ' + scene.bigs.length + ' 章：\n' + list : ''))
+      return { phase: 'delivered', ask: 'edit' }
+    }
+    if (parsed.kind === 'rerun') {
+      this.group.say('producer', '重跑。没改字的话画面一帧都不会变，直接复用母版。')
+      return this.repack(pipe, '重跑')
+    }
+
+    const scene = loadScene(this.group)
+    const located = locate(pipe.transcript.words, parsed.from, { plan: pipe.plan, scene, chapter: parsed.chapter })
+    if (!located.ok) {
+      this.group.say('producer', located.reason + '。' + (located.hint ? '\n' + located.hint : '') + '\n时间线一个字没动。')
+      return { phase: 'delivered', error: 'not-found' }
+    }
+
+    let edit
+    try {
+      edit = applyEdit({ words: pipe.transcript.words, segments: pipe.transcript.segments, match: located.match, to: parsed.to })
+      assertUntouched(pipe.transcript.words, edit.words, { changed: edit.changed })
+    } catch (err) {
+      this.group.say('producer', '这句我不敢改：' + err.message + '\n时间码是剪辑定的，不会为了改字动它。')
+      return { phase: 'delivered', error: 'unsafe-edit' }
+    }
+
+    const brief = pipe.brief || {}
+    const next = {
+      ...pipe,
+      transcript: { ...pipe.transcript, words: edit.words, segments: edit.segments },
+      captions: buildCaptions(edit.words, pipe.plan, { maxChars: brief.maxChars || 14 }),
+    }
+    savePipeline(this.group, next)
+
+    const m = located.match
+    const show = t => String(t).replace(/[，。！？、；：,.!?;:…—~·\s]+$/u, '')
+    const where = (m.chapter ? '第 ' + m.chapter + ' 章' : '') + (m.film !== null ? '（' + m.film + 's）' : '')
+    this.group.say('producer',
+      where + '那句：' + edit.changed.map(c => '「' + show(c.from) + '」→「' + show(c.to) + '」').join('、') +
+      '。\n只动了 ' + edit.changed.length + ' 个词，词数和每个词的起止时间码都没动——时间线是剪辑定的，那句话改不了它。\n包装按改动重出，只重渲这一处。')
+
+    return this.repack(next, '改一句')
+  }
+
+  /** 用同一份时间线重出：画面没变就复用母版，变了就只重渲变化的那一段。 */
+  async repack(pipe, reason) {
+    const brief = pipe.brief || {}
+    const state = {
+      transcript: pipe.transcript,
+      plan: pipe.plan,
+      captions: pipe.captions,
+      fixReport: pipe.fixReport || null,
+      source: pipe.source || null,
+    }
+    try {
+      this.group.setPhase('packing')
+      await this.runner.run({ bot: 'packer', title: reason + ' · 重出', run: ctx => runPack({ ...ctx, brief, state }) })
+      this.group.setPhase('qc')
+      await this.runner.run({ bot: 'qc', title: reason + ' · 重检', run: ctx => runQc({ ...ctx, brief: qcBrief(brief, pipe.plan), state }) })
+      await this.deliver(state)
+      return { phase: 'delivered', reason, decision: state.decision || null }
+    } catch (err) {
+      this.group.setPhase('blocked')
+      this.group.say('producer', '重出卡住了：' + err.message + '\n我看过再给你方案，不用你动手。')
+      throw err
+    }
   }
 
   async busy() {
     this.group.say('producer', '在跑，跑完我报。\n要改的话现在说，我记进这版。')
     return { phase: this.group.meta.phase }
   }
+}
+
+/**
+ * 目标时长没达到时，质检不拿那个达不到的数字当标准（拍板过程在 dispatch 里写明）。
+ * 这里按当前时间线重算一遍，不读存下来的 met——重出之后那字段可能是旧的。
+ */
+function qcBrief(brief = {}, plan = null) {
+  const target = Number(brief.duration) || 0
+  const actual = plan ? Number(plan.outDuration) : null
+  const ok = !target || !actual ? true : Math.abs(actual - target) <= target * TARGET_TOLERANCE
+  return { ...brief, duration: ok ? target : 0 }
 }
 
 function cleanValues(v = {}) {

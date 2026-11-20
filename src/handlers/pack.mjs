@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { renderCut, renderStill } from '../render.mjs'
-import { toASS } from '../captions.mjs'
+import { toASS, toSRT } from '../captions.mjs'
 import { templateById, specOf } from '../bots/roster.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
@@ -47,6 +47,14 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
       state.scene = built.scene
       log(tpl.name + '：' + (built.scene.chapters || built.scene.bigs || []).length + ' 章，' + (built.scene.ratio || spec.ratio) + ' ' + spec.width + '×' + spec.height)
     }
+  }
+
+  // 字幕跟着这一版的文字走：改一句之后片子里是新的，交付的 SRT 也必须是新的。
+  // （以前 SRT 只在剪辑那一步写一次，改字之后片子对了、字幕还是旧的——交付物自相矛盾。）
+  if (state.captions && state.captions.cards) {
+    const subsPath = join(work, 'subs.srt')
+    writeFileSync(subsPath, toSRT(state.captions.cards), 'utf8')
+    artifact('subs', subsPath)
   }
 
   const engine = (built && built.engine) || tpl.engine || 'ffmpeg'
