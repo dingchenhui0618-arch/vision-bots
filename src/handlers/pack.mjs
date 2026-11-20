@@ -7,7 +7,7 @@ import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { renderCut, renderStill } from '../render.mjs'
 import { toASS } from '../captions.mjs'
-import { templateById } from '../bots/roster.mjs'
+import { templateById, specOf } from '../bots/roster.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
 
@@ -22,8 +22,12 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
   if (!state.plan) throw new Error('剪辑还没交时间线')
   const input = group.meta.assets[0]
   const tpl = templateById(group.meta.template) || templateById('subtitle-only')
-  const spec = tpl.spec
+  const spec = specOf(tpl, brief && brief.ratio)
   const work = join(group.dir, 'work', job.id)
+  if (spec.unsupported) {
+    log('「' + tpl.name + '」没有 ' + brief.ratio + '，按 ' + spec.ratio + ' 出片')
+    group.say('packer', '「' + tpl.name + '」还没做 ' + brief.ratio + '，这条按 ' + spec.ratio + '（' + spec.width + '×' + spec.height + '）出。要 ' + brief.ratio + ' 我另排一版布局。', { job: job.id })
+  }
   mkdirSync(work, { recursive: true })
 
   const mod = await loadTemplate(tpl.id)
@@ -35,13 +39,13 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
 
   let built = null
   if (builder) {
-    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief, spec, captions: state.captions })
+    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief: { ...brief, ratio: spec.ratio }, spec, captions: state.captions })
     if (built.scene) {
       const scenePath = join(work, 'scene.json')
       writeFileSync(scenePath, JSON.stringify(built.scene, null, 2), 'utf8')
       artifact('scene', scenePath)
       state.scene = built.scene
-      log(tpl.name + '：' + (built.scene.chapters || built.scene.bigs || []).length + ' 章，' + spec.width + '×' + spec.height)
+      log(tpl.name + '：' + (built.scene.chapters || built.scene.bigs || []).length + ' 章，' + (built.scene.ratio || spec.ratio) + ' ' + spec.width + '×' + spec.height)
     }
   }
 

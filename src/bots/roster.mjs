@@ -64,6 +64,7 @@ export const byId = id => BOTS.find(b => b.id === id) || null
 /**
  * 模板决定交付规格：选哪个模板，成片的画幅、时长区间、节奏就定了。
  * status: ready 能用 / building 在做 / planned 排期
+ * ratio 是模板的默认画幅；ratios 是它支持的画幅（和 template.json 的 layouts 必须对上，有脚本查）。
  */
 export const TEMPLATES = [
   {
@@ -71,7 +72,9 @@ export const TEMPLATES = [
     name: '纯字幕',
     bot: 'packer',
     status: 'ready',
-    spec: { ratio: '9:16', width: 1080, height: 1920, duration: [20, 180], fps: 30 },
+    ratio: '9:16',
+    ratios: { '9:16': { width: 1080, height: 1920 }, '3:4': { width: 1080, height: 1440 } },
+    spec: { duration: [20, 180], fps: 30 },
     note: '只做字幕和安全区，验证链路用，不是交付档位',
   },
   {
@@ -79,7 +82,9 @@ export const TEMPLATES = [
     name: 'PPT 底座',
     bot: 'packer',
     status: 'ready',
-    spec: { ratio: '3:4', width: 1080, height: 1440, duration: [45, 90], fps: 30 },
+    ratio: '3:4',
+    ratios: { '3:4': { width: 1080, height: 1440 }, '9:16': { width: 1080, height: 1920 } },
+    spec: { duration: [45, 90], fps: 30 },
     note: '口播为主、图文分屏、章节卡',
   },
   {
@@ -88,9 +93,34 @@ export const TEMPLATES = [
     bot: 'packer',
     status: 'ready',
     engine: 'canvas',
-    spec: { ratio: '3:4', width: 1080, height: 1440, duration: [45, 90], fps: 30 },
+    ratio: '3:4',
+    ratios: { '3:4': { width: 1080, height: 1440 }, '9:16': { width: 1080, height: 1920 } },
+    spec: { duration: [45, 90], fps: 30 },
     note: '逐帧渲染，词级锚点，密度高',
   },
 ]
 
 export const templateById = id => TEMPLATES.find(t => t.id === id) || null
+
+/** 模板支持的画幅名 */
+export const ratiosOf = tpl => Object.keys((tpl && tpl.ratios) || {})
+
+/**
+ * 定交付规格：要的画幅模板支持就用它，不支持就退回模板默认画幅，并把实情带出来（不静默改尺寸）。
+ */
+export function specOf(tpl, ratio = null) {
+  if (!tpl) return null
+  const ratios = tpl.ratios || {}
+  const fallback = ratios[tpl.ratio] ? tpl.ratio : (Object.keys(ratios)[0] || '3:4')
+  const pick = ratio && ratios[ratio] ? ratio : fallback
+  const size = ratios[pick] || { width: 1080, height: 1440 }
+  return {
+    ratio: pick,
+    width: size.width,
+    height: size.height,
+    fps: (tpl.spec && tpl.spec.fps) || 30,
+    duration: (tpl.spec && tpl.spec.duration) || [20, 180],
+    asked: ratio || null,
+    unsupported: Boolean(ratio && ratio !== pick),
+  }
+}

@@ -6,12 +6,27 @@ import { Runner } from './runner.mjs'
 import { runCut } from '../handlers/cut.mjs'
 import { runPack } from '../handlers/pack.mjs'
 import { runQc } from '../handlers/qc.mjs'
-import { TEMPLATES, templateById } from '../bots/roster.mjs'
+import { TEMPLATES, templateById, specOf, ratiosOf } from '../bots/roster.mjs'
 
 const PLATFORMS = ['视频号', '抖音', '小红书']
 const PLATFORM_HINT = /视频号|抖音|小红书|B站|快手/
 
+// 短视频平台都是竖屏优先：用户没提画幅时按平台给默认值，卡片上可以改。
+const PLATFORM_RATIO = { 抖音: '9:16', 视频号: '9:16', 小红书: '9:16', 快手: '9:16', B站: '9:16' }
+const RATIO_HINT = [
+  [/竖屏|竖版|9s*[:：]s*16|手机/, '9:16'],
+  [/横屏|横版|16s*[:：]s*9|宽屏/, '16:9'],
+  [/3s*[:：]s*4/, '3:4'],
+]
+
 const guessPlatform = text => (String(text).match(PLATFORM_HINT) || [])[0] || '视频号'
+
+/** 画幅：用户明说了就听用户，没说按平台默认 */
+function guessRatio(text, platform) {
+  const s = String(text || '')
+  for (const [re, r] of RATIO_HINT) if (re.test(s)) return r
+  return PLATFORM_RATIO[platform] || '9:16'
+}
 
 function guessDuration(text) {
   const s = String(text)
@@ -61,8 +76,10 @@ export class Orchestrator {
       return { phase: 'intake', waiting: 'brief' }
     }
 
+    const platform = guessPlatform(text)
     const brief = {
-      platform: guessPlatform(text),
+      platform,
+      ratio: guessRatio(text, platform),
       duration: guessDuration(text),
       template: guessTemplate(text),
       hasScript: /有稿|稿子.*(给|在)|按稿/.test(String(text)),
@@ -74,6 +91,8 @@ export class Orchestrator {
     this.group.save()
 
     const tpl = templateById(brief.template)
+    const spec = specOf(tpl, brief.ratio)
+    const ratioText = spec.ratio + ' · ' + spec.width + '×' + spec.height + (spec.unsupported ? '（' + tpl.name + ' 没有 ' + spec.asked + '）' : '')
     this.group.emit({
       type: 'card',
       card: {
@@ -82,6 +101,7 @@ export class Orchestrator {
         subtitle: `素材 ${assets.map(a => a.split(/[\\/]/).pop()).join('、')}，按这张卡开始`,
         fields: [
           { key: 'platform', label: '平台', value: brief.platform, options: PLATFORMS },
+          { key: 'ratio', label: '画幅', value: ratioText, options: ratiosOf(tpl) },
           { key: 'duration', label: '时长', value: brief.duration + 's', options: ['45s', '60s', '90s'] },
           { key: 'template', label: '模板', value: tpl ? tpl.name : brief.template, options: TEMPLATES.map(t => t.name + (t.status === 'ready' ? '' : '（在建）')) },
           { key: 'hasScript', label: '稿子', value: brief.hasScript ? '有稿' : '没稿，直接口播', options: ['没稿，直接口播', '有稿'] },
@@ -90,7 +110,7 @@ export class Orchestrator {
       },
     })
     this.group.setPhase('confirm')
-    this.group.say('producer', `我按你说的填好了：${brief.platform} · ${brief.duration}s · ${tpl ? tpl.name : brief.template}。\n看一眼，没问题就点开始。`)
+    this.group.say('producer', `我按你说的填好了：${brief.platform} · ${spec.ratio} · ${brief.duration}s · ${tpl ? tpl.name : brief.template}。\n看一眼，没问题就点开始。`)
     return { phase: 'confirm', brief }
   }
 
@@ -109,9 +129,14 @@ export class Orchestrator {
     this.group.save()
 
     const tpl = templateById(brief.template)
+    const spec = specOf(tpl, brief.ratio)
+    if (spec.unsupported) {
+      this.group.say('producer', `${tpl.name} 还没做 ${spec.asked}，这条按 ${spec.ratio} 出。\n要 ${spec.asked} 我另排一版布局，时间线不用重剪。`)
+      brief.ratio = spec.ratio
+    }
     this.group.say('producer',
-      `定了。\n目标：${brief.platform}，${brief.duration}s，${tpl ? tpl.name + '（' + tpl.spec.ratio + '）' : brief.template}，${brief.hasScript ? '按稿' : '没稿直接口播'}。\n阶段：剪辑 → 包装 → 质检 → 交付。${brief.hasScript ? '' : '没有稿子，我让剪辑直接听素材，不给你排逐字稿校对。'}`)
-    this.group.emit({ type: 'goal', goal: { platform: brief.platform, duration: brief.duration, template: brief.template, stages: ['剪辑', '包装', '质检', '交付'] } })
+      `定了。\n目标：${brief.platform}，${brief.duration}s，${tpl ? tpl.name + '（' + spec.ratio + '，' + spec.width + '×' + spec.height + '）' : brief.template}，${brief.hasScript ? '按稿' : '没稿直接口播'}。\n阶段：剪辑 → 包装 → 质检 → 交付。${brief.hasScript ? '' : '没有稿子，我让剪辑直接听素材，不给你排逐字稿校对。'}`)
+    this.group.emit({ type: 'goal', goal: { platform: brief.platform, ratio: spec.ratio, duration: brief.duration, template: brief.template, stages: ['剪辑', '包装', '质检', '交付'] } })
 
     await this.dispatch(brief)
     return { phase: this.group.meta.phase, brief }
@@ -192,6 +217,7 @@ export class Orchestrator {
 function cleanValues(v = {}) {
   const out = {}
   if (v.platform) out.platform = String(v.platform)
+  if (v.ratio) out.ratio = String(v.ratio).replace(/\s+/g, '')
   if (v.duration) out.duration = Number(String(v.duration).replace(/[^0-9.]/g, '')) || undefined
   if (v.template) {
     const t = TEMPLATES.find(x => x.id === v.template || x.name === v.template)

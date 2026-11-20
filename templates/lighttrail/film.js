@@ -9,6 +9,15 @@ const GRADE = 'contrast(1.06) saturate(0.92) brightness(0.97)'
 const FADE = 0.24
 let FPS = 30
 
+// 老工作目录里没有 template.json（模板是后加的）时，退回 3:4 那一套，别让片子渲染不出来。
+const FALLBACK_34 = {
+  size: [1080, 1440],
+  rail: { y: 0.585, x: 60, right: 60, height: 88, bar: 4, gap: 3 },
+  band: { top: 0.44 },
+  big: { left: 72, right: 72, bottom: 104, lineGap: 1.12, size: 96, min: 56, lineChars: 7, maxLines: 3, align: 'alt' },
+  label: { top: 44, side: 44, gap: 48, footer: 'bottom', inset: 44 },
+}
+
 export async function createFilm({ media }) {
   const S = await loadJSON('/project/scene.json')
   const PEAKS = await loadJSON('/project/peaks.json')
@@ -16,9 +25,15 @@ export async function createFilm({ media }) {
   FPS = S.fps
   setSize(w, h)
 
-  const RAIL = { y: 0.585 * h, x: 60, w: w - 120, h: 88, bar: 4, gap: 3 }
-  const BIG = { left: 72, bottom: 104, lineGap: 1.12 }
-  const BAND_TOP = 0.44 * h          // 大字区间的遮罩起点
+  // 画幅只决定布局：几何全部来自 template.json 的 layouts[ratio]，引擎里没有写死的坐标。
+  // 换画幅 = 换一份布局，时间线和 scene.json 一个字不用动。
+  let TPL = null
+  try { TPL = await loadJSON('/project/template.json') } catch (e) { TPL = null }
+  const L = (TPL && TPL.layouts && (TPL.layouts[S.ratio] || TPL.layouts[TPL.ratio])) || FALLBACK_34
+  const RAIL = { y: L.rail.y * h, x: L.rail.x, w: w - L.rail.x - L.rail.right, h: L.rail.height, bar: L.rail.bar, gap: L.rail.gap }
+  const BIG = L.big
+  const LABEL = L.label
+  const BAND_TOP = L.band.top * h    // 大字区间的遮罩起点
   media.register('person', { url: '/media/frames/person', count: S.person.count })
 
   // ── 成片帧 → 源帧（EDL 是唯一真相）──
@@ -32,14 +47,16 @@ export async function createFilm({ media }) {
 
   // ── 章节大字的排版：先定行，再由字宽定字号，整句不截断 ──
   const BIGTYPES = S.bigs.map((b, bi) => {
-    let lineChars = 7
+    let lineChars = BIG.lineChars
     let lines = splitLines(b.text, lineChars)
-    while (lines.length > 3 && lineChars < 15) { lineChars += 2; lines = splitLines(b.text, lineChars) }
+    while (lines.length > BIG.maxLines && lineChars < 15) { lineChars += 2; lines = splitLines(b.text, lineChars) }
     const cw = lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0))
     const longest = Math.max(1, ...cw)
-    const availW = w - BIG.left * 2
-    const size = Math.max(56, Math.min(96, Math.floor(availW / longest)))
-    return { ...b, lines, size, side: bi % 2 ? 'right' : 'left' }
+    const availW = w - BIG.left - BIG.right
+    const size = Math.max(BIG.min, Math.min(BIG.size, Math.floor(availW / longest)))
+    // 3:4 左右交替（设计语言）；9:16 一律左对齐——竖屏右侧是平台按钮区，居右的大字会被压住
+    const side = BIG.align === 'left' ? 'left' : (bi % 2 ? 'right' : 'left')
+    return { ...b, lines, size, side }
   })
 
   const flatChars = (b) => b.chars || []
@@ -132,7 +149,7 @@ export async function createFilm({ media }) {
     let ci = 0
     b.lines.forEach((ln, li) => {
       const wLn = c.measureText(ln).width
-      const x0 = b.side === 'right' ? w - BIG.left - wLn : BIG.left
+      const x0 = b.side === 'right' ? w - BIG.right - wLn : BIG.left
       const kLine = E.outExpo(clamp(seg(t, b.f0 + li * 0.06, b.f0 + li * 0.06 + 0.28)))
       const dy = (1 - kLine) * size * 0.22
       const base = top + li * lh + size * 0.86 + dy
@@ -159,24 +176,28 @@ export async function createFilm({ media }) {
   }
 
   // ── 标注：只放真实数字 ──
+  // 页脚放哪由布局决定：3:4 在画面底部；9:16 移到顶部 HUD，因为竖屏底部 380px 归平台文案区。
   function labels(c, t) {
+    const X = LABEL.side
+    const TOP = LABEL.top
     const tc = timecode(t)
-    txt(c, 'REC ' + tc, 44, 44, { size: 22, family: F.mono, weight: 600, color: rgba('bone', 0.7), spacing: 1 })
-    dot(c, 30, 37, 5, rgba('signal', Math.floor(t * 2) % 2 ? 0.35 : 1))
+    txt(c, 'REC ' + tc, X, TOP, { size: 22, family: F.mono, weight: 600, color: rgba('bone', 0.7), spacing: 1 })
+    dot(c, X - 14, TOP - 7, 5, rgba('signal', Math.floor(t * 2) % 2 ? 0.35 : 1))
 
     const cur = [...S.marks].reverse().find(m => t >= m.t) || S.marks[0]
     if (cur) {
       txt(c, String(cur.index).padStart(2, '0') + ' / ' + String(cur.total).padStart(2, '0'),
-        w - 44, 44, { size: 22, family: F.mono, weight: 700, color: rgba('bone', 0.8), align: 'right', spacing: 1 })
+        w - X, TOP, { size: 22, family: F.mono, weight: 700, color: rgba('bone', 0.8), align: 'right', spacing: 1 })
     }
 
+    const fy = LABEL.footer === 'top' ? TOP + LABEL.gap : h - LABEL.inset
     const a = win(t, 0.5, 4.2, 0.25, 0.3)
     if (a > 0) {
       const s = S.stats
       const str = '素材 ' + s.source.toFixed(1) + 's · 剪掉 ' + s.cut.toFixed(1) + 's · ' + s.segments + ' 段'
-      txt(c, str, 44, h - 44, { size: 22, family: F.mono, weight: 500, color: rgba('ash', 1), alpha: a, spacing: 0.5 })
+      txt(c, str, X, fy, { size: 22, family: F.mono, weight: 500, color: rgba('ash', 1), alpha: a, spacing: 0.5 })
     }
-    txt(c, '光轨 / LIGHTTRAIL', w - 44, h - 44, { size: 22, family: F.mono, weight: 500, color: rgba('ash', 0.8), align: 'right', spacing: 1 })
+    txt(c, '光轨 / LIGHTTRAIL', w - X, fy, { size: 22, family: F.mono, weight: 500, color: rgba('ash', 0.8), align: 'right', spacing: 1 })
   }
 
   return {

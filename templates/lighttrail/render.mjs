@@ -3,7 +3,7 @@
  * 除了渲染器本身，其它每一步都是 ffmpeg 的确定性操作，跑一次的结果可以复现。
  */
 import { spawn } from 'node:child_process'
-import { mkdirSync, writeFileSync, readdirSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertCanvasTools, FFMPEG } from '../../src/env.mjs'
@@ -47,6 +47,8 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
   const pcm = await ff(['-v', 'error', '-i', voice, '-f', 's16le', '-ac', '1', '-ar', '48000', '-'], { encoding: 'buffer' })
   writeFileSync(join(work, 'peaks.json'), JSON.stringify(peaksFromPCM(pcm.stdout)), 'utf8')
   writeFileSync(join(work, 'scene.json'), JSON.stringify(scene), 'utf8')
+  // 布局是模板的一部分，不是内容：引擎直接读它，画幅换了时间线一个字不动。
+  writeFileSync(join(work, 'template.json'), readFileSync(join(HERE, 'template.json'), 'utf8').replace(/^\uFEFF/, ''), 'utf8')
 
   // 4. 逐帧渲染（无头 Chrome + ANGLE）
   const master = join(work, 'master.mkv')

@@ -16,8 +16,13 @@ const SENT = /[。！？!?]$/
 const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu
 const clean = ws => ws.map(w => w.w).join('').replace(PUNCT, '')
 
-export function buildPptBase({ words, plan, segments }) {
+export function buildPptBase({ words, plan, segments, brief = {} }) {
   const t = template
+  // 画幅：brief 说的优先，模板不认就退回模板默认画幅
+  const layouts = t.layouts || {}
+  const RATIO = (brief.ratio && layouts[brief.ratio]) ? brief.ratio : (layouts[t.ratio] ? t.ratio : Object.keys(layouts)[0] || '3:4')
+  const L = layouts[RATIO]
+  const [W, H] = L.size
   const map = makeMapper(plan)
   const raw = []
 
@@ -51,12 +56,17 @@ export function buildPptBase({ words, plan, segments }) {
   const chapters = mergeSentences(raw, { shortSec: 0 })
 
   const total = chapters.length
-  const hold = t.type.head.hold
+  const hold = L.type.head.hold
+  const per = Math.max(4, Math.floor((W - L.type.head.x * 2) / L.type.head.size))
+  const outWords = words
+    .map(w => ({ t: map(w.start), text: String(w.w).replace(PUNCT, '') }))
+    .filter(w => w.text)
   const events = []
 
   chapters.forEach((c, i) => {
     const cardEnd = Math.min(c.end, c.start + hold)
-    events.push(`Dialogue: 0,${ts(c.start)},${ts(cardEnd)},Head,,0,0,0,,{\\fad(200,240)}${wrapHead(c.text)}`)
+    const ws = outWords.filter(w => w.t >= c.start - 0.02 && w.t < c.end + 0.02).map(w => w.text)
+    events.push(`Dialogue: 0,${ts(c.start)},${ts(cardEnd)},Head,,0,0,0,,{\\fad(200,240)}${wrapHead(c.text, per, ws)}`)
     events.push(`Dialogue: 0,${ts(c.start)},${ts(cardEnd)},Idx,,0,0,0,,{\\fad(200,240)}${String(i + 1).padStart(2, '0')} / ${String(total).padStart(2, '0')}`)
   })
 
@@ -66,9 +76,10 @@ export function buildPptBase({ words, plan, segments }) {
 
   const scene = {
     template: t.id,
-    ratio: t.ratio,
+    ratio: RATIO,
+    size: L.size,
     spec: t.spec,
-    layout: t.layout,
+    layout: L,
     chapters: chapters.map((c, i) => ({
       index: i + 1,
       start: round(c.start), end: round(c.end),
@@ -79,19 +90,80 @@ export function buildPptBase({ words, plan, segments }) {
 
   return {
     scene,
-    assText: header(t) + events.join('\n') + '\n',
-    layout: { ...t.layout, width: t.spec.width, height: t.spec.height },
+    assText: header(L) + events.join('\n') + '\n',
+    layout: { ...L, width: W, height: H },
   }
 }
 
 const round = n => Number(n.toFixed(2))
 
-/** 章节卡手动断行：每 10 字一行，最多两行；断行符是控制码，不参与转义。 */
-function wrapHead(text) {
+/**
+ * 章节卡手动断行。断行符是控制码，不参与转义。
+ * 优先按词断（`words` 的边界就是中文的词边界，按字数硬切会把「视频」拆成两个字），
+ * 词对不上章节文本时退回按字数平分；两种情况都做孤行治理，不留一个字单独一行。
+ */
+function wrapHead(text, per = 10, ws = null) {
   const t = text.slice(0, 20)
+  if (!t) return ''
+  const lines = wrapByWords(ws, per, t) || wrapByChars(t, per)
+  return lines.map(esc).join(String.fromCharCode(92) + 'N')
+}
+
+function wrapByWords(ws, per, t) {
+  if (!ws || !ws.length) return null
+  // 只取前 20 字，且必须和章节文本逐字对得上，否则说明词和句子不是同一份来源
+  const flat = []
+  let acc = ''
+  for (const w of ws) {
+    for (const ch of w) {
+      if (acc.length >= t.length) break
+      acc += ch
+      flat.push(ch)
+    }
+    if (acc.length >= t.length) break
+  }
+  if (acc !== t) return null
+  const words = []
+  let i = 0
+  for (const w of ws) {
+    const take = []
+    for (const ch of w) {
+      if (i >= t.length) break
+      take.push(ch)
+      i++
+    }
+    if (take.length) words.push(take.join(''))
+    if (i >= t.length) break
+  }
+  const pieces = []
+  for (const w of words) {
+    if (w.length <= per) { pieces.push(w); continue }
+    for (let k = 0; k < w.length; k += per) pieces.push(w.slice(k, k + per))
+  }
+  const total = pieces.join('').length
+  const n = Math.max(1, Math.ceil(total / per))
+  const budget = Math.max(1, Math.ceil(total / n))
+  const out = []
+  let cur = []
+  const len = l => l.reduce((s, w) => s + w.length, 0)
+  for (const w of pieces) {
+    if (cur.length && len(cur) + w.length > budget) { out.push(cur); cur = [] }
+    cur.push(w)
+  }
+  if (cur.length) out.push(cur)
+  // 孤行：末行只剩一两个字，从上一行借一个词下来
+  while (out.length > 1 && out.at(-1).length === 1 && len(out.at(-1)) <= 3 && out.at(-2).length > 1) {
+    out.at(-1).unshift(out.at(-2).pop())
+  }
+  return out.map(l => l.join(''))
+}
+
+function wrapByChars(t, per) {
+  const n = Math.max(1, Math.ceil(t.length / per))
+  const size = Math.max(1, Math.ceil(t.length / n))
   const lines = []
-  for (let i = 0; i < t.length; i += 10) lines.push(esc(t.slice(i, i + 10)))
-  return lines.join(String.fromCharCode(92) + 'N')
+  for (let i = 0; i < t.length; i += size) lines.push(t.slice(i, i + size))
+  return lines
 }
 
 function captions(words, plan, maxChars = 14) {
@@ -116,14 +188,15 @@ function captions(words, plan, maxChars = 14) {
   return cards
 }
 
-function header(t) {
+function header(L) {
+  const t = L
   const head = `Style: Head,${t.type.head.font},${t.type.head.size},&H00F4F4F0,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,0,0,7,${t.type.head.x},${t.type.head.x},${t.type.head.y},1`
   const idxs = `Style: Idx,${t.type.index.font},${t.type.index.size},&H00D7D7D3,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,2,0,1,0,0,9,${t.type.index.right},${t.type.index.right},${t.type.index.y},1`
   const sub = `Style: Sub,${t.type.caption.font},${t.type.caption.size},&H00F4F4F0,&H000000FF,&H00101011,&H80000000,-1,0,0,0,100,100,0,0,1,${t.type.caption.outline},0,2,72,72,${t.type.caption.bottom},1`
   return `[Script Info]
 ScriptType: v4.00+
-PlayResX: ${t.spec.width}
-PlayResY: ${t.spec.height}
+PlayResX: ${L.size[0]}
+PlayResY: ${L.size[1]}
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 

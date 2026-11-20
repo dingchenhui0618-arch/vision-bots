@@ -71,7 +71,7 @@ async function main() {
 
   new "<项目名>"          建一个群
   say "<话>" --attach <文件>   在群里说一句（可带素材）
-  confirm [--platform 视频号] [--duration 60] [--template 纯字幕] [--script]
+  confirm [--platform 视频号] [--ratio 9:16] [--duration 60] [--template 纯字幕] [--script]
   log [--group id] [--verbose] 打印群聊记录
   list                    列出所有群
   demo --input <视频>     一条龙跑完，打印全过程
@@ -116,6 +116,7 @@ async function main() {
     const t0 = Date.now()
     const values = {
       platform: opts.platform,
+      ratio: opts.ratio,
       duration: opts.duration,
       template: opts.template,
       hasScript: opts.script ? true : undefined,
@@ -132,9 +133,9 @@ async function main() {
     if (!existsSync(input)) die('找不到素材: ' + input)
     const g = Group.create(ROOT, basename(input).replace(/\.\w+$/, ''))
     const o = new Orchestrator(g)
-    const req = opts._.join(' ') || '按折光做个 60 秒的，发视频号'
+    const req = opts._.join(' ') || ('按折光做个 ' + (opts.duration || 60) + ' 秒的，发' + (opts.platform || '视频号'))
     await o.say(req, { assets: [input] })
-    await o.confirm({ template: opts.template || 'subtitle-only', duration: opts.duration, platform: opts.platform })
+    await o.confirm({ template: opts.template || 'subtitle-only', duration: opts.duration, platform: opts.platform, ratio: opts.ratio })
     console.log(render(g, { verbose: true }))
     return
   }

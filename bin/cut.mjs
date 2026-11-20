@@ -59,14 +59,15 @@ if (a.transcript) {
   await extractAudio(input, wav)
   step(`转写中（faster-whisper ${a.model}，CPU）`)
   if (hot) step('热词注入：' + hot)
-  const r = await transcribe(wav, { out: join(work, 'transcript.json'), model: a.model, hotwords: hot })
+  const r = await transcribe(wav, { out: join(work, 'asr-raw.json'), model: a.model, hotwords: hot })
   transcript = r.json
   step(`转写完成：${r.words} 个词，语言 ${r.language}`)
 }
 
 // 错字治理：只改词文本，词数与时间码由模块内部断言
 const fix = await correct({ words: transcript.words, terms, log: m => step(m) })
-transcript = { ...transcript, words: fix.words }
+transcript = { ...transcript, words: fix.words, segments: applyToSegments(fix.words, transcript.segments) }
+writeFileSync(join(work, 'transcript.json'), JSON.stringify(transcript, null, 1))
 writeFileSync(join(work, 'fix-report.json'), JSON.stringify(fix.report, null, 1))
 for (const f of fix.report.applied) step(`改字 ${f.at}s ${f.from} → ${f.to}（${f.kind}，${f.verified}）`)
 

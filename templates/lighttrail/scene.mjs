@@ -37,9 +37,13 @@ export function frameRanges(plan, fps) {
 
 const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu
 
-export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [] }) {
+export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [], ratio = null }) {
   const t = tpl
   const fps = t.spec.fps
+  // 画幅：brief 说的优先，模板不认就退回模板自己的默认画幅（不静默改尺寸）
+  const layouts = t.layouts || {}
+  const RATIO = (ratio && layouts[ratio]) ? ratio : (layouts[t.ratio] ? t.ratio : (Object.keys(layouts)[0] || '3:4'))
+  const L = layouts[RATIO] || { size: [t.spec.width || 1080, t.spec.height || 1440] }
   const map = makeMapper(plan)
   const ranges = frameRanges(plan, fps)
   const totalFrames = ranges.reduce((n, r) => n + (r.outF1 - r.outF0), 0)
@@ -108,7 +112,8 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [] 
 
   const scene = {
     template: t.id,
-    size: [t.spec.width, t.spec.height],
+    ratio: RATIO,
+    size: L.size,
     fps,
     frames: totalFrames,
     duration: round(duration),

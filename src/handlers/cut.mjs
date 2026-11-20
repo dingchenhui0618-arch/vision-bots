@@ -31,7 +31,8 @@ export async function runCut({ group, job, log, artifact, brief, state }) {
 
   const t0 = Date.now()
   log('转写中（faster-whisper，本地 CPU）')
-  const asr = await transcribe(wav, { out: join(work, 'transcript.json'), model: brief.asrModel || 'small', hotwords: hot })
+  // 原始转写留一份给审计，纠错后的才是下游真正用的 transcript.json
+  const asr = await transcribe(wav, { out: join(work, 'asr-raw.json'), model: brief.asrModel || 'small', hotwords: hot })
   const raw = asr.json.words
   const asrSeconds = (Date.now() - t0) / 1000
   log(`转写完成：${raw.length} 词 · ${asrSeconds.toFixed(1)}s`)
@@ -54,6 +55,7 @@ export async function runCut({ group, job, log, artifact, brief, state }) {
   // 句子文本也要跟着纠错走，否则大字用的还是错的（字幕改了、片子里没改）
   const segments = applyToSegments(words, asr.json.segments)
   const transcript = { ...asr.json, words, segments }
+  writeFileSync(join(work, 'transcript.json'), JSON.stringify(transcript, null, 1), 'utf8')
   state.transcript = transcript
   state.plan = plan
   state.captions = captions

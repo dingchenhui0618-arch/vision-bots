@@ -3,7 +3,8 @@
   "name": "光轨",
   "engine": "canvas",
   "ratio": "3:4",
-  "spec": { "ratio": "3:4", "width": 1080, "height": 1440, "fps": 30, "duration": [20, 90] },
+  "ratios": ["3:4", "9:16"],
+  "spec": { "fps": 30, "duration": [20, 90] },
   "palette": {
     "void": "#0A0A0D",
     "bone": "#F1EDE4",
@@ -11,13 +12,27 @@
     "ash": "#8B8983",
     "graphite": "#26262C"
   },
-  "type": {
-    "big": { "size": 96, "min": 56, "lineChars": 7, "lineGap": 1.12, "weight": 900, "left": 72, "top": 0.655 },
-    "caption": { "size": 36, "bottom": 96, "maxWidth": 880 },
-    "label": { "size": 24 },
-    "index": { "size": 26 }
+  "layouts": {
+    "3:4": {
+      "size": [1080, 1440],
+      "rail": { "y": 0.585, "x": 60, "right": 60, "height": 88, "bar": 4, "gap": 3 },
+      "band": { "top": 0.44 },
+      "big": { "left": 72, "right": 72, "bottom": 104, "lineGap": 1.12, "size": 96, "min": 56, "lineChars": 7, "maxLines": 3, "align": "alt" },
+      "label": { "top": 44, "side": 44, "gap": 48, "footer": "bottom", "inset": 44 }
+    },
+    "9:16": {
+      "size": [1080, 1920],
+      "rail": { "y": 0.5, "x": 60, "right": 60, "height": 96, "bar": 4, "gap": 3 },
+      "band": { "top": 0.46 },
+      "big": { "left": 72, "right": 200, "bottom": 340, "lineGap": 1.12, "size": 96, "min": 56, "lineChars": 7, "maxLines": 3, "align": "left" },
+      "label": { "top": 56, "side": 56, "gap": 48, "footer": "top" }
+    }
   },
-  "rail": { "y": 0.585, "height": 96, "bar": 4, "gap": 3, "barrier": 0.14 },
-  "post": { "bloom": 0.34, "grain": 0.035, "vig": 0.26, "ca": 1.1 },
+  "notes": {
+    "big": "大字按整句上屏，逐字由灰翻白跟读；行数超过 maxLines 才放宽 lineChars，不截断",
+    "rail": "一条光轨贯穿全片：点燃 → 扫描 → 变成声波基线，每章留一个齿",
+    "safe": "9:16 的 right=200 和 bottom=340 是给平台 UI 让位：右侧点赞/评论条、底部账号与文案区，正文不进这两块",
+    "label": "9:16 的页脚移到顶部 HUD：竖屏底部 380px 归平台，不放自有信息"
+  },
   "note": "人物满幅，一条光轨从点燃变成声波基线，大字按词落点砸下"
 }

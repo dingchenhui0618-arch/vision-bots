@@ -2,6 +2,8 @@ import { writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { ff, even } from './ffmpeg.mjs'
 
+const SCRIM_STEPS = 32
+
 /** 按保留区间切、拼、变速、烧字幕。全部一次 ffmpeg 完成，不落中间文件。 */
 export async function renderCut({ input, plan, assText, out, hasAudio = true, size = null, crf = 18, layout = null }) {
   const speed = plan.options.speed
@@ -28,8 +30,20 @@ export async function renderCut({ input, plan, assText, out, hasAudio = true, si
     if (layout.scrim) {
       const s = layout.scrim
       let i = 0
-      if (s.top) { parts.push(`[${vout}]drawbox=x=0:y=0:w=${W}:h=${s.top}:color=black@${s.topAlpha}:t=fill[sc${++i}]`); vout = `sc${i}` }
-      if (s.bottom) { parts.push(`[${vout}]drawbox=x=0:y=${H - s.bottom}:w=${W}:h=${s.bottom}:color=black@${s.bottomAlpha}:t=fill[sc${++i}]`); vout = `sc${i}` }
+      // 一条渐变要拆成条带画：drawbox 只能铺纯色，整块铺会在遮罩下沿留一条硬边。
+      const bands = (y0, h, aTop, aBottom) => {
+        if (!h || h <= 0) return
+        for (let k = 0; k < SCRIM_STEPS; k++) {
+          const ya = Math.round(y0 + (h * k) / SCRIM_STEPS)
+          const yb = Math.round(y0 + (h * (k + 1)) / SCRIM_STEPS)
+          const a = aTop + (aBottom - aTop) * ((k + 0.5) / SCRIM_STEPS)
+          if (yb <= ya || a <= 0.003) continue
+          parts.push(`[${vout}]drawbox=x=0:y=${ya}:w=${W}:h=${yb - ya}:color=black@${a.toFixed(3)}:t=fill[sc${++i}]`)
+          vout = `sc${i}`
+        }
+      }
+      bands(0, s.top, s.topAlpha, 0)
+      bands(H - s.bottom, s.bottom, 0, s.bottomAlpha)
     }
   } else if (size) {
     const [w, h] = size

@@ -12,7 +12,11 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 export const template = JSON.parse(readFileSync(join(HERE, 'template.json'), 'utf8'))
 
 export function build({ words, segments, plan, brief, captions }) {
-  const scene = buildScene({ words, segments, plan, brief, tpl: template, cards: (captions && captions.cards) || [] })
+  const scene = buildScene({
+    words, segments, plan, brief, tpl: template,
+    cards: (captions && captions.cards) || [],
+    ratio: (brief && brief.ratio) || null,
+  })
   return { scene, engine: 'canvas' }
 }
 
