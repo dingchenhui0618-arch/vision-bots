@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { makeMapper } from '../../src/plan.mjs'
 import { mergeSentences } from '../../src/chapters.mjs'
+import { wrapWords } from '../../src/segment.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 export const template = JSON.parse(readFileSync(join(HERE, 'template.json'), 'utf8'))
@@ -57,16 +58,13 @@ export function buildPptBase({ words, plan, segments, brief = {} }) {
 
   const total = chapters.length
   const hold = L.type.head.hold
-  const per = Math.max(4, Math.floor((W - L.type.head.x * 2) / L.type.head.size))
-  const outWords = words
-    .map(w => ({ t: map(w.start), text: String(w.w).replace(PUNCT, '') }))
-    .filter(w => w.text)
+  const headMax = W - L.type.head.x * 2
+  const per = Math.max(4, Math.floor(headMax / L.type.head.size))
   const events = []
 
   chapters.forEach((c, i) => {
     const cardEnd = Math.min(c.end, c.start + hold)
-    const ws = outWords.filter(w => w.t >= c.start - 0.02 && w.t < c.end + 0.02).map(w => w.text)
-    events.push(`Dialogue: 0,${ts(c.start)},${ts(cardEnd)},Head,,0,0,0,,{\\fad(200,240)}${wrapHead(c.text, per, ws)}`)
+    events.push(`Dialogue: 0,${ts(c.start)},${ts(cardEnd)},Head,,0,0,0,,${wrapHead(c.text, per, { maxPx: headMax, size: L.type.head.size })}`)
     events.push(`Dialogue: 0,${ts(c.start)},${ts(cardEnd)},Idx,,0,0,0,,{\\fad(200,240)}${String(i + 1).padStart(2, '0')} / ${String(total).padStart(2, '0')}`)
   })
 
@@ -99,71 +97,18 @@ const round = n => Number(n.toFixed(2))
 
 /**
  * 章节卡手动断行。断行符是控制码，不参与转义。
- * 优先按词断（`words` 的边界就是中文的词边界，按字数硬切会把「视频」拆成两个字），
- * 词对不上章节文本时退回按字数平分；两种情况都做孤行治理，不留一个字单独一行。
+ * 断行点来自中文分词（src/segment.mjs）——按字数硬切会把「视频」拆成「视 / 频」。
  */
-function wrapHead(text, per = 10, ws = null) {
-  const t = text.slice(0, 20)
+function wrapHead(text, per = 10, { maxPx = 0, size = 0 } = {}) {
+  const t = String(text || '').slice(0, 20)
   if (!t) return ''
-  const lines = wrapByWords(ws, per, t) || wrapByChars(t, per)
-  return lines.map(esc).join(String.fromCharCode(92) + 'N')
-}
-
-function wrapByWords(ws, per, t) {
-  if (!ws || !ws.length) return null
-  // 只取前 20 字，且必须和章节文本逐字对得上，否则说明词和句子不是同一份来源
-  const flat = []
-  let acc = ''
-  for (const w of ws) {
-    for (const ch of w) {
-      if (acc.length >= t.length) break
-      acc += ch
-      flat.push(ch)
-    }
-    if (acc.length >= t.length) break
-  }
-  if (acc !== t) return null
-  const words = []
-  let i = 0
-  for (const w of ws) {
-    const take = []
-    for (const ch of w) {
-      if (i >= t.length) break
-      take.push(ch)
-      i++
-    }
-    if (take.length) words.push(take.join(''))
-    if (i >= t.length) break
-  }
-  const pieces = []
-  for (const w of words) {
-    if (w.length <= per) { pieces.push(w); continue }
-    for (let k = 0; k < w.length; k += per) pieces.push(w.slice(k, k + per))
-  }
-  const total = pieces.join('').length
-  const n = Math.max(1, Math.ceil(total / per))
-  const budget = Math.max(1, Math.ceil(total / n))
-  const out = []
-  let cur = []
-  const len = l => l.reduce((s, w) => s + w.length, 0)
-  for (const w of pieces) {
-    if (cur.length && len(cur) + w.length > budget) { out.push(cur); cur = [] }
-    cur.push(w)
-  }
-  if (cur.length) out.push(cur)
-  // 孤行：末行只剩一两个字，从上一行借一个词下来
-  while (out.length > 1 && out.at(-1).length === 1 && len(out.at(-1)) <= 3 && out.at(-2).length > 1) {
-    out.at(-1).unshift(out.at(-2).pop())
-  }
-  return out.map(l => l.join(''))
-}
-
-function wrapByChars(t, per) {
-  const n = Math.max(1, Math.ceil(t.length / per))
-  const size = Math.max(1, Math.ceil(t.length / n))
-  const lines = []
-  for (let i = 0; i < t.length; i += size) lines.push(t.slice(i, i + size))
-  return lines
+  const lines = wrapWords(t, per)
+  // 行首禁则把「的」并回上一行后，最长行会比 per 宽一个字：按最长行缩字号，别让它顶出安全区
+  const longest = Math.max(...lines.map(l => l.length))
+  const fit = maxPx > 0 && size > 0 ? Math.floor(maxPx / Math.max(1, longest)) : size
+  const fs = fit > 0 && fit < size ? '\\fs' + fit : ''
+  const tag = '{\\fad(200,240)' + fs + '}'
+  return tag + lines.map(esc).join(String.fromCharCode(92) + 'N')
 }
 
 function captions(words, plan, maxChars = 14) {

@@ -4,6 +4,7 @@
  */
 import { makeMapper } from '../../src/plan.mjs'
 import { mergeSentences, CHAPTER_MAX } from '../../src/chapters.mjs'
+import { segment } from '../../src/segment.mjs'
 
 const round = (n, k = 3) => Number(n.toFixed(k))
 
@@ -91,6 +92,8 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     return {
       index: i + 1,
       text: ch.text,
+      // 词边界跟着内容走：画布引擎按它断行，不靠字数硬切（「视 / 频」那种切口）
+      words: segment(ch.text),
       f0: round(ch.start),
       // 大字挂到这一章结束（下一章开始）为止，而不是「字数 × 0.16s」就撤。
       // 按字数算的窗口在 16–20 字的章节上会提前 1–1.5s 消失，那一段画面只剩声音、没有一个字。

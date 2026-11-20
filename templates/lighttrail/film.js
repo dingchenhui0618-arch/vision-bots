@@ -48,8 +48,11 @@ export async function createFilm({ media }) {
   // ── 章节大字的排版：先定行，再由字宽定字号，整句不截断 ──
   const BIGTYPES = S.bigs.map((b, bi) => {
     let lineChars = BIG.lineChars
-    let lines = splitLines(b.text, lineChars)
-    while (lines.length > BIG.maxLines && lineChars < 15) { lineChars += 2; lines = splitLines(b.text, lineChars) }
+    // scene.json 带词边界（src/segment.mjs 分的词）；老 scene 没有就退回按字
+    const parts = b.words && b.words.length ? b.words : [...b.text]
+    let lines = splitLines(parts, lineChars)
+    while (lines.length > BIG.maxLines && lineChars < 15) { lineChars += 2; lines = splitLines(parts, lineChars) }
+    fixLineStart(lines)
     const cw = lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0))
     const longest = Math.max(1, ...cw)
     const availW = w - BIG.left - BIG.right
@@ -238,17 +241,47 @@ export async function createFilm({ media }) {
   }
 }
 
-function splitLines(text, lineChars) {
+const chWidth = ch => (/[\x00-\xff]/.test(ch) ? 0.56 : 1)
+
+// 行首禁则：和 src/segment.mjs 同一份字表。单字助词不许起行，并回上一行，
+// 那一行最多宽一个字——字号本来就是按最长行算的，不会顶出画面。
+const NO_LINE_START = '的了着过吧呢吗啊呀嘛地得'
+function fixLineStart(lines) {
+  for (let i = 1; i < lines.length; i++) {
+    let moved = 0
+    while (moved < 2 && lines[i].length > 1 && NO_LINE_START.includes(lines[i][0])) {
+      lines[i - 1] += lines[i][0]
+      lines[i] = lines[i].slice(1)
+      moved++
+    }
+  }
+  return lines
+}
+
+/** 按词断行：断点只在词边界上，词本身比一行还宽时才逐字切。 */
+function splitLines(parts, lineChars) {
   const lines = []
   let cur = ''
   let w = 0
-  for (const ch of text) {
-    const cw = /[\x00-\xff]/.test(ch) ? 0.56 : 1
-    if (w + cw > lineChars + 0.01 && cur) { lines.push(cur); cur = ''; w = 0 }
+  const flush = () => { if (cur) lines.push(cur); cur = ''; w = 0 }
+  const putChar = ch => {
+    const cw = chWidth(ch)
+    if (cur && w + cw > lineChars + 0.01) flush()
     cur += ch
     w += cw
   }
-  if (cur) lines.push(cur)
+  for (const part of parts) {
+    let ww = 0
+    for (const ch of part) ww += chWidth(ch)
+    if (ww > lineChars + 0.01) { // 整词超宽（长英文 / 长数字）：只能硬切
+      for (const ch of part) putChar(ch)
+      continue
+    }
+    if (cur && w + ww > lineChars + 0.01) flush() // 词边界换行
+    cur += part
+    w += ww
+  }
+  flush()
   return lines
 }
 
