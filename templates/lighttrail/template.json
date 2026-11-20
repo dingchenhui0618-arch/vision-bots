@@ -1,0 +1,23 @@
+{
+  "id": "lighttrail",
+  "name": "光轨",
+  "engine": "canvas",
+  "ratio": "3:4",
+  "spec": { "ratio": "3:4", "width": 1080, "height": 1440, "fps": 30, "duration": [20, 90] },
+  "palette": {
+    "void": "#0A0A0D",
+    "bone": "#F1EDE4",
+    "signal": "#FF5A1F",
+    "ash": "#8B8983",
+    "graphite": "#26262C"
+  },
+  "type": {
+    "big": { "size": 96, "min": 56, "lineChars": 7, "lineGap": 1.12, "weight": 900, "left": 72, "top": 0.655 },
+    "caption": { "size": 36, "bottom": 96, "maxWidth": 880 },
+    "label": { "size": 24 },
+    "index": { "size": 26 }
+  },
+  "rail": { "y": 0.585, "height": 96, "bar": 4, "gap": 3, "barrier": 0.14 },
+  "post": { "bloom": 0.34, "grain": 0.035, "vig": 0.26, "ca": 1.1 },
+  "note": "人物满幅，一条光轨从点燃变成声波基线，大字按词落点砸下"
+}

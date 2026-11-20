@@ -1,0 +1,46 @@
+/* 剪辑室的色与字：一个暗房，一块场记板。
+   命名按角色，不按色相——看到 token 名就该知道这是给什么的。 */
+:root {
+  /* 底：胶片黑 */
+  --film-black: #0f0f10;
+  --slate: #17171a;        /* 面板表面 */
+  --slate-inset: #1f1f23;  /* 嵌进去的一块：输入框、气泡、数据格 */
+  --slate-lift: #24242a;   /* hover */
+
+  /* 线：只用 1px，不当装饰用 */
+  --edge: #26262a;
+  --edge-strong: #38383e;
+
+  /* 字：白板笔的四个明度 */
+  --chalk: #f2f2ee;
+  --chalk-soft: #cfcfca;
+  --chalk-dim: #a3a39f;
+  --chalk-mute: #8e8e93;
+
+  /* 提示：全场唯一的亮色，只出现在当前项和光标位置 */
+  --cue: #d9d9d3;
+  /* 失败：质检问题专用，暗红，不刺眼 */
+  --flag: #a2504a;
+
+  /* 字阶：一屏最多用四档 */
+  --t-xs: 12px;
+  --t-sm: 13px;
+  --t-md: 15px;
+  --t-lg: 20px;
+  --t-xl: 30px;
+
+  --font-display: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-text: "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", "Consolas", ui-monospace, monospace;
+
+  --r-sm: 4px;
+  --r-md: 8px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+}

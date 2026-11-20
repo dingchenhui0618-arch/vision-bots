@@ -1,0 +1,19 @@
+{
+  "name": "ds-media-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "垂类自媒体创作工作台：多 bot 群聊 + 确定性视频管线",
+  "bin": {
+    "dsm": "./bin/studio.mjs"
+  },
+  "scripts": {
+    "cut": "node bin/cut.mjs",
+    "studio": "node bin/studio.mjs",
+    "serve": "node src/server.mjs",
+    "demo": "node bin/studio.mjs demo --input .test/talk.mp4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

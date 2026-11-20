@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+
+# 运行时产物：群聊事件、工作目录、成片、预览
+groups/
+work/
+out/
+
+# 临时试验脚本与素材（合成语音、测试片）
+.test/
+.scratch/
+
+# 日志
+*.log
+
+# 凭据
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini

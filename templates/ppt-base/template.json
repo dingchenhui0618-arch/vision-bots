@@ -1,0 +1,55 @@
+{
+  "id": "ppt-base",
+  "name": "PPT 底座",
+  "ratio": "3:4",
+  "spec": {
+    "width": 1080,
+    "height": 1440,
+    "fps": 30,
+    "duration": [
+      45,
+      90
+    ]
+  },
+  "layout": {
+    "bg": "0x0c0c0d",
+    "videoRect": {
+      "x": 0,
+      "y": 0,
+      "w": 1080,
+      "h": 1440
+    },
+    "scrim": {
+      "top": 380,
+      "topAlpha": 0.42,
+      "bottom": 340,
+      "bottomAlpha": 0.46
+    }
+  },
+  "type": {
+    "head": {
+      "font": "Microsoft YaHei",
+      "size": 84,
+      "x": 104,
+      "y": 132,
+      "hold": 1.7
+    },
+    "index": {
+      "font": "Cascadia Mono",
+      "size": 34,
+      "right": 104,
+      "y": 140
+    },
+    "caption": {
+      "font": "Microsoft YaHei",
+      "size": 74,
+      "bottom": 128,
+      "outline": 3
+    }
+  },
+  "rules": {
+    "chapters": "按句末标点 / 12 字 / 6.5 秒切章，不切断词；不足 4 字并入上一章",
+    "head": "章节卡只在章首出现 1.7s，不长期压住画面",
+    "safety": "文字离边 ≥ 80px，字幕不上抬到画面上沿"
+  }
+}

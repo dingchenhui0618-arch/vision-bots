@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>媒体工作室</title>
+<link rel="stylesheet" href="/tokens.css" />
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div class="brand-text"><b>媒体工作室</b><span>本地 · 预览版 0.1</span></div>
+    </div>
+    <button class="btn-new" id="newGroup"><span class="plus" aria-hidden="true"></span>新建项目</button>
+    <div class="rail-label">项目</div>
+    <div class="groups" id="groups"></div>
+    <div class="rail-foot"><span class="dot"></span>4 个 bot 在岗 · 素材不出本机</div>
+  </aside>
+
+  <main class="chat">
+    <header class="chat-head">
+      <div class="chat-title">
+        <h1 id="groupName">选一个项目</h1>
+        <span class="phase" id="phase"></span>
+      </div>
+      <div class="roster" id="roster"></div>
+    </header>
+    <div class="stream" id="stream"></div>
+    <footer class="composer">
+      <textarea id="input" rows="1" placeholder="说一句需求：平台、时长、模板；素材直接拖进来"></textarea>
+      <div class="pending" id="pending"></div>
+      <div class="composer-row">
+        <div class="composer-tools">
+          <button class="btn-attach" id="pick" type="button"><span class="clip" aria-hidden="true"></span>素材</button>
+          <input id="file" type="file" accept="video/*" hidden />
+          <span class="hint">拖进来也行 · Enter 发送</span>
+        </div>
+        <button id="send" class="btn-primary">发送</button>
+      </div>
+    </footer>
+  </main>
+
+  <aside class="panel" id="panel">
+    <div class="panel-tabs" id="tabs">
+      <button data-tab="video" class="active">成片</button>
+      <button data-tab="subs">字幕</button>
+      <button data-tab="report">质检</button>
+      <button data-tab="timeline">时间线</button>
+    </div>
+    <div class="panel-body" id="panelBody"></div>
+  </aside>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

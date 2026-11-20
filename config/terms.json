@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "note": "错字治理的术语表。hotwords 转写前注入 initial_prompt；terms 做确定性替换（from 是 ASR 常写错的形态，to 是正确形态）。只允许四类：homophone 同音字 / term 专有名词 / number 数字 / punct 标点。带 next 的条目只在「下一个词以此开头」时生效，用来修被拆成两个词的错（如「化」+「走」）。",
+  "hotwords": [
+    "口播", "完播率", "转场", "光轨", "拆条", "封面", "钩子", "留存", "卡点", "分镜",
+    "气口", "跳切", "成片", "素材", "字幕", "封面图", "完播", "二创", "爆款", "脚本", "划走"
+  ],
+  "terms": [
+    { "kind": "homophone", "to": "划走", "from": ["画走", "华走", "化走"], "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "划", "from": ["化", "画"], "next": "走", "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "剪", "from": ["检", "减", "捡"], "next": ["删", "辑", "映"], "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "完播率", "from": ["完播绿", "完波率"], "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "转场", "from": ["转长", "传场"], "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "口播", "from": ["口拨", "扣播"], "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "卡点", "from": ["咔点", "卡典"], "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "气口", "from": ["气扣", "器口"], "onlyIfLowConfidence": true },
+    { "kind": "homophone", "to": "留存", "from": ["刘存", "留村"], "onlyIfLowConfidence": true },
+    { "kind": "term", "to": "光轨", "from": ["光鬼", "光归"] },
+    { "kind": "term", "to": "抖音", "from": ["斗音", "抖阴"] },
+    { "kind": "term", "to": "视频号", "from": ["视频好", "是频号"] },
+    { "kind": "term", "to": "小红书", "from": ["小虹书", "小红熟"] }
+  ]
+}
