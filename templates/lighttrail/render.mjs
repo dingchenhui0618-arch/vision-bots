@@ -1,31 +1,66 @@
 /**
  * 光轨 · 渲染驱动：抽帧 → 切音 → 包络 → 逐帧渲染 → 音效 → 混音 → 编码。
  * 除了渲染器本身，其它每一步都是 ffmpeg 的确定性操作，跑一次的结果可以复现。
+ *
+ * 分段缓存：母版放在群目录的 cache/ 下，下次改一句只重渲那一章覆盖的帧，
+ * 其余帧从母版里切出来无损拼回去（src/render-cache.mjs）。
  */
 import { spawn } from 'node:child_process'
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, renameSync, rmSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertCanvasTools, FFMPEG } from '../../src/env.mjs'
 import { ff } from '../../src/ffmpeg.mjs'
 import { synthCues, peaksFromPCM } from '../../src/sfx.mjs'
+import { hashOf, planPatch, spliceMaster } from '../../src/render-cache.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const RENDERER = join(HERE, '..', '..', 'vendor', 'lighttrail', 'tools', 'render.mjs')
 const FILM = join(HERE, 'film.js')
 
-export async function renderLighttrail({ input, plan, scene, work, out, log = () => {}, stills = null, force = false }) {
+/** 渲染任意帧区间（闭区间）。patch 与整条渲染走同一条路，参数一模一样。 */
+export async function renderFrames({ work, mediaDir, size, fps, from, to, out, log = () => {} }) {
+  const { fonts, chrome } = assertCanvasTools()
+  await run(process.execPath, [
+    RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
+    '--mode', 'frames', '--from', String(from), '--to', String(to), '--out', out,
+    '--size', size[0] + 'x' + size[1], '--samples', '4', '--fonts', fonts, '--chrome', chrome,
+  ], { log })
+  return out
+}
+
+export async function renderLighttrail({ input, plan, scene, work, out, log = () => {}, stills = null, force = false, cacheDir = null }) {
   const { fonts, chrome } = assertCanvasTools()
   const [width, height] = scene.size
+  const size = scene.size
   const fps = scene.fps
-  const mediaDir = join(work, 'media')
+  const sceneStamp = hashOf(JSON.stringify(scene))
+  const tplJSON0 = readFileSync(join(HERE, 'template.json'), 'utf8').replace(/^\uFEFF/, '')
+  const hash0 = hashOf(tplJSON0, readFileSync(FILM, 'utf8'))
+  const cached = cacheDir ? readCacheMeta(cacheDir) : null
+
+  // 0. 什么都没变、成片也还在：连抽帧和编码都不用做
+  if (!force && !stills && cacheDir && cached && cached.sceneStamp === sceneStamp && cached.hash === hash0 && existsSync(out)) {
+    log('画面、声音、模板都没变，成片直接复用')
+    return { out, renderSeconds: 0, frames: scene.frames, decision: { mode: 'reuse', reason: '整条没变，成片复用' } }
+  }
+
+  const stamp = statSync(input)
+  const assetStamp = stamp.size + ':' + Math.round(stamp.mtimeMs)
+  const personHash = hashOf(JSON.stringify(scene.person), String(fps), assetStamp)
+  const voiceHash = hashOf(JSON.stringify(plan.keep), JSON.stringify(plan.options || {}), assetStamp)
+
+  const mediaDir = cacheDir ? join(cacheDir, 'media') : join(work, 'media')
   const frameDir = join(mediaDir, 'frames', 'person')
+  if (cacheDir) mkdirSync(cacheDir, { recursive: true })
   mkdirSync(frameDir, { recursive: true })
 
   // 1. 抽帧：按 EDL 的每段切，帧号连续，成片帧 → 源帧的映射写在 scene.person.ranges
   const t0 = Date.now()
+  const haveFrames = cacheDir && cached && cached.person === personHash && existsSync(join(frameDir, 'f_000000.jpg'))
+  if (haveFrames) log('复用上次抽好的 ' + (scene.person.count) + ' 帧')
   let n = 0
-  for (const [i, r] of scene.person.ranges.entries()) {
+  for (const [i, r] of (haveFrames ? [] : scene.person.ranges).entries()) {
     const count = r.outF1 - r.outF0
     log('抽帧 ' + (i + 1) + '/' + scene.person.ranges.length + '：源 ' + r.srcSec.toFixed(2) + 's 起 ' + r.durSec.toFixed(2) + 's → ' + count + ' 帧')
     await ff([
@@ -36,38 +71,88 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
     ])
     n += count
   }
-  log('抽帧完成：' + readdirSync(frameDir).length + ' 帧 · ' + ((Date.now() - t0) / 1000).toFixed(1) + 's')
+  if (!haveFrames) log('抽帧完成：' + readdirSync(frameDir).length + ' 帧 · ' + ((Date.now() - t0) / 1000).toFixed(1) + 's')
 
   // 2. 切音：和成片同一条时间线（trim → concat → atempo → loudnorm）
-  const voice = join(work, 'voice.wav')
-  await ff(['-y', '-loglevel', 'error', '-i', input, '-filter_complex', audioGraph(plan), '-map', '[ac]',
-    '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '1', voice])
+  const workVoice = join(work, 'voice.wav')
+  const voice = cacheDir ? join(cacheDir, 'voice.wav') : workVoice
+  const haveVoice = cacheDir && cached && cached.voice === voiceHash && existsSync(voice)
+  if (haveVoice) {
+    log('复用上次切好的声音')
+  } else {
+    await ff(['-y', '-loglevel', 'error', '-i', input, '-filter_complex', audioGraph(plan), '-map', '[ac]',
+      '-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '1', voice])
+  }
 
   // 3. 声波包络：从切完的人声里量，画出来的波形和耳朵听到的一致
-  const pcm = await ff(['-v', 'error', '-i', voice, '-f', 's16le', '-ac', '1', '-ar', '48000', '-'], { encoding: 'buffer' })
-  writeFileSync(join(work, 'peaks.json'), JSON.stringify(peaksFromPCM(pcm.stdout)), 'utf8')
+  const peaksJSON = haveVoice && cached.peaksJSON
+    ? cached.peaksJSON
+    : JSON.stringify(peaksFromPCM((await ff(['-v', 'error', '-i', voice, '-f', 's16le', '-ac', '1', '-ar', '48000', '-'], { encoding: 'buffer' })).stdout))
+  writeFileSync(join(work, 'peaks.json'), peaksJSON, 'utf8')
   writeFileSync(join(work, 'scene.json'), JSON.stringify(scene), 'utf8')
   // 布局是模板的一部分，不是内容：引擎直接读它，画幅换了时间线一个字不动。
-  writeFileSync(join(work, 'template.json'), readFileSync(join(HERE, 'template.json'), 'utf8').replace(/^\uFEFF/, ''), 'utf8')
+  const tplJSON = readFileSync(join(HERE, 'template.json'), 'utf8').replace(/^\uFEFF/, '')
+  writeFileSync(join(work, 'template.json'), tplJSON, 'utf8')
 
-  // 4. 逐帧渲染（无头 Chrome + ANGLE）
-  const master = join(work, 'master.mkv')
+  // 4. 逐帧渲染（无头 Chrome + ANGLE）——有缓存就只渲变化的那一段
+  const hash = hashOf(tplJSON, readFileSync(FILM, 'utf8'))
+  const peaks = hashOf(peaksJSON)
+  const workMaster = join(work, 'master.mkv')
+  const cacheMaster = cacheDir ? join(cacheDir, 'master.mkv') : null
+  if (cacheDir) mkdirSync(cacheDir, { recursive: true })
+
+  let decision = { mode: 'full', reason: '没有缓存目录' }
+  if (cacheDir && !stills && !force) {
+    const prev = readCacheMeta(cacheDir)
+    decision = planPatch({ prev, next: { scene, hash, peaks }, fps })
+  }
+  if (stills || force) decision = { mode: 'full', reason: stills ? '只要静帧' : '强制重渲' }
+
   const tRender = Date.now()
-  const reuseMaster = !stills && !force && existsSync(master)
-  if (!reuseMaster) log('逐帧渲染 ' + scene.frames + ' 帧（' + width + '×' + height + '@' + fps + '，光轨引擎）')
-  const shotDir = join(work, 'stills')
-  const pick = stills
-    ? ['--mode', 'stills', '--stills', stills.map(Number).join(','), '--out-dir', shotDir]
-    : ['--mode', 'frames', '--from', '0', '--to', String(scene.frames - 1), '--out', master]
-  if (reuseMaster) log('复用已有画面母版（master.mkv），只重做声音与编码')
-  else await run(process.execPath, [
-    RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
-    ...pick, '--size', width + 'x' + height, '--samples', '4',
-    '--fonts', fonts, '--chrome', chrome,
-  ], { log })
-  const renderSeconds = (Date.now() - tRender) / 1000
-  log('渲染完成：' + renderSeconds.toFixed(1) + 's（' + (scene.duration / renderSeconds).toFixed(2) + '× 实时）')
-  if (stills) return { stills: shotDir, renderSeconds, frames: scene.frames }
+  let master = workMaster
+  let renderSeconds = 0
+  if (stills) {
+    log('逐帧渲染静帧 ' + stills.length + ' 张（' + width + '×' + height + '@' + fps + '，光轨引擎）')
+    const shotDir = join(work, 'stills')
+    await run(process.execPath, [
+      RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
+      '--mode', 'stills', '--stills', stills.map(Number).join(','), '--out-dir', shotDir,
+      '--size', width + 'x' + height, '--samples', '4', '--fonts', fonts, '--chrome', chrome,
+    ], { log })
+    renderSeconds = (Date.now() - tRender) / 1000
+    log('静帧完成：' + renderSeconds.toFixed(1) + 's')
+    return { stills: shotDir, renderSeconds, frames: scene.frames, decision }
+  }
+
+  if (decision.mode === 'reuse') {
+    log('画面没有任何变化，直接复用母版（' + decision.reason + '）')
+    master = cacheMaster
+  } else if (decision.mode === 'patch') {
+    const patchPath = join(work, 'patch.mkv')
+    log('分段重渲：' + decision.reason + '（' + (decision.to - decision.from + 1) + '/' + scene.frames + ' 帧）')
+    await renderFrames({ work, mediaDir, size, fps, from: decision.from, to: decision.to, out: patchPath, log })
+    const next = join(cacheDir, 'master.next.mkv')
+    await spliceMaster({ master: cacheMaster, patch: patchPath, from: decision.from, to: decision.to, frames: scene.frames, fps, out: next, log })
+    renameSync(next, cacheMaster)
+    master = cacheMaster
+  } else {
+    log('逐帧渲染 ' + scene.frames + ' 帧（' + width + '×' + height + '@' + fps + '，光轨引擎）' + (decision.mode === 'full' && decision.reason ? '——' + decision.reason : ''))
+    const tmp = cacheMaster ? join(cacheDir, 'master.next.mkv') : workMaster
+    await renderFrames({ work, mediaDir, size, fps, from: 0, to: scene.frames - 1, out: tmp, log })
+    if (cacheMaster) {
+      renameSync(tmp, cacheMaster)
+      master = cacheMaster
+    }
+  }
+  renderSeconds = (Date.now() - tRender) / 1000
+  if (cacheDir) {
+    writeCacheMeta(cacheDir, {
+      hash, peaks, scene, frames: scene.frames, createdAt: Date.now(),
+      // 抽帧与切音的指纹：EDL 和素材没变就不用重做这两步
+      person: personHash, voice: voiceHash, sceneStamp, peaksJSON,
+    })
+  }
+  log('渲染完成：' + renderSeconds.toFixed(1) + 's（' + (scene.duration / Math.max(0.1, renderSeconds)).toFixed(2) + '× 实时）')
 
   // 5. 音效 + 混音
   const sfx = join(work, 'sfx.wav')
@@ -79,12 +164,29 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
 
   // 6. 编码
   mkdirSync(dirname(out), { recursive: true })
+  const tEncode = Date.now()
   await ff(['-y', '-loglevel', 'error', '-i', master, '-i', mixed,
     '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
     '-maxrate', '8M', '-bufsize', '16M',
     '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-shortest', out])
 
-  return { out, renderSeconds, frames: scene.frames, cues: made.cues }
+  const encodeSeconds = (Date.now() - tEncode) / 1000
+  log('编码完成：' + encodeSeconds.toFixed(1) + 's')
+  return { out, renderSeconds, encodeSeconds, frames: scene.frames, cues: made.cues, decision }
+}
+
+function readCacheMeta(cacheDir) {
+  try {
+    const meta = JSON.parse(readFileSync(join(cacheDir, 'meta.json'), 'utf8'))
+    if (!existsSync(join(cacheDir, 'master.mkv'))) return null
+    return meta
+  } catch {
+    return null
+  }
+}
+
+function writeCacheMeta(cacheDir, meta) {
+  writeFileSync(join(cacheDir, 'meta.json'), JSON.stringify(meta), 'utf8')
 }
 
 function audioGraph(plan) {
@@ -100,7 +202,7 @@ function audioGraph(plan) {
   return parts.join(';')
 }
 
-function run(cmd, args, { log = () => {} } = {}) {
+export function run(cmd, args, { log = () => {} } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LIGHTTRAIL_FFMPEG: FFMPEG } })
     let err = ''

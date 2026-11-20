@@ -72,6 +72,7 @@
 - **音效只回应动作**：点燃 click、拉线 zip、扫描 scan、每章一下 impact、收尾 drop，全部本地合成（`src/sfx.mjs`，无样本文件）。
 - 只有四色：夜 `#0A0A0D` / 骨白 `#F1EDE4` / 信号橙 `#FF5A1F` / 灰 `#8B8983`。
 - **9:16 单独排过**：光轨在 0.5h，大字带进到距底 340px，页脚上移到顶部 HUD；右侧 200px、底部 340px 是给平台 UI 的留白，不是随手留的。
+- **改一句只重渲那一句**：母版存在群目录的 `cache/` 里。改一章的字，只有那一章显示区间（±2 帧）重渲，其余帧从母版流拷贝切出来拼回去；改动覆盖超过 45% 才整条重渲。抽好的源帧、切好的声音、量好的包络也按指纹复用；整条没变就直接交回上一版成片（0.01s）。判据在 `src/render-cache.mjs`。
 
 ![光轨 9:16](docs/template-lighttrail-916.jpg)
 
@@ -120,6 +121,8 @@ node bin/studio.mjs demo --input 素材.mp4    # 命令行跑一遍全过程
 node bin/studio.mjs demo --input 素材.mp4 --template 光轨 --duration 60   # 换模板
 node bin/studio.mjs demo --input 素材.mp4 --template 光轨 --ratio 9:16    # 竖屏
 node scripts/check-templates.mjs            # 模板一致性（roster 画幅 ↔ template.json）
+node scripts/check-wrapping.mjs              # 断行只许落在词边界上
+node scripts/check-patch.mjs --group <群 id>  # 分段缓存：改一句只重渲那一句，画面等于整条重渲
 node bin/cut.mjs -i 素材.mp4 -o 成片.mp4  # 只跑视频管线，不经过 bot 层
 ```
 
@@ -145,6 +148,7 @@ src/
   chapters.mjs           分章规则：残句并走，并长了不并（两个模板共用）
   segment.mjs            中文分词：断行只落在词边界上（零依赖：ICU + 术语表）
   sfx.mjs                音效合成（本地，无样本）
+  render-cache.mjs       分段缓存：算哪几帧变了，把母版切出来拼回新母版
 scripts/check-templates.mjs  模板一致性：roster 的画幅必须和 template.json 的 layouts 对上
 scripts/check-wrapping.mjs   断行自检：只许在词边界换行，一个字不许丢
   server.mjs             本地 HTTP + SSE + 素材上传
@@ -169,11 +173,10 @@ groups/<群 id>/          一个项目：events.jsonl / assets / work / out
 
 ## 已知限制
 
-- 渲染速度：光轨逐帧引擎本机 0.20–0.37× 实时（16.7s 成片 46–84s），60s 成片 3 分钟左右；PPT 底座 14–23s。**分段缓存**：现在改一句仍整条重跑，母版可复用（声音与编码 1s 内重出）。
+- 渲染速度：光轨逐帧引擎本机 0.20–0.37× 实时（16.7s 成片 46–84s），PPT 底座 7–23s。**分段缓存已接引擎层**：17s 片子第一次出片 66s，一模一样再跑 **0.01s**，改一句 **37–39s**（重渲 6s + 切片 1s + 混音 2s + 编码约 25s）。群聊里说「改一句」还差最后一段：把话变成 scene 的改动，下一轮接。
 - 光轨的「字藏人物身后」还没做：它要人物蒙版（原实现依赖 macOS Vision），Windows 上还没有替代实现。现在的大字压在人物前方、靠遮罩保证可读。
 - 断行靠 Node 自带的分词（ICU）加术语表兜底：通用自媒体词（口播 / 划走 / 完播率）已经能整词保留，**词典里没有的行业词仍会被拆开**——客户往 `config/terms.json` 的 `hotwords` 加词即可，但没有导入界面。
 - 遮罩渐变是 32 条带插值出来的（drawbox 只能铺纯色），比硬边好，但仍是有档的；要真渐变得另做一张遮罩层。
-- 「改一句只重渲相关片段」还没接，目前改动整条重跑。
 - 错字治理的覆盖面取决于术语表：通用自媒体词已内置，垂直行业词要客户自己加（现在只认一个 JSON，没有导入界面）。
 - 数字写法有意不统一：不把「三秒」改成「3秒」、「一个人」改成「1个人」。要统一得按模板配置，现在没做。
 - 本机没有 pypinyin 时进保守模式，只做术语表和数字；模型提的同音改动一律不采纳（宁可留错字，不改错字）。

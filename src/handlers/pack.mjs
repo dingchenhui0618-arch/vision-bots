@@ -57,8 +57,14 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
 
   if (engine === 'canvas' && mod && mod.render) {
     log('逐帧渲染中（' + spec.width + '×' + spec.height + '，' + (built.scene.frames) + ' 帧，' + tpl.name + '）')
-    const r = await mod.render({ input, plan: state.plan, scene: built.scene, work, out, spec: { ...spec, template: mod.template }, log })
+    const r = await mod.render({
+      input, plan: state.plan, scene: built.scene, work, out,
+      spec: { ...spec, template: mod.template }, log,
+      // 母版放群级缓存：换一次工作目录也还是同一份母版，改一句才有的可切
+      cacheDir: join(group.dir, 'cache', tpl.id),
+    })
     renderSeconds = r.renderSeconds
+    state.decision = r.decision || null
   } else {
     const assText = (built && built.assText) || toASS(state.captions.cards, {
       width: spec.width, height: spec.height,
@@ -84,7 +90,11 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
     '出片了：' + tpl.name + '，' + spec.width + '×' + spec.height + '，' + state.plan.outDuration.toFixed(1) + 's，渲染 ' + renderSeconds.toFixed(1) + 's。' +
     (state.scene && state.scene.bigs ? '\n' + state.scene.bigs.length + ' 章大字，逐字落在音节上；光轨一条到底，音效跟着动作走。' : '') +
     (state.scene && state.scene.chapters ? '\n分 ' + state.scene.chapters.length + ' 章，小节标题取的是原话，没有改写。' : '') +
-    (renderSeconds > state.plan.outDuration * 1.2 ? '\n渲染比实时慢 ' + (renderSeconds / state.plan.outDuration).toFixed(2) + ' 倍，这条模板要上分段缓存。' : ''),
+    (state.decision && state.decision.mode === 'patch'
+      ? '\n只是改了那一处：' + state.decision.reason + '，其余帧从母版切出来拼回去，渲染 ' + renderSeconds.toFixed(1) + 's。'
+      : '') +
+    (state.decision && state.decision.mode === 'reuse' ? '\n画面一点没变，直接复用母版，渲染 ' + renderSeconds.toFixed(1) + 's。' : '') +
+    (state.decision && state.decision.mode === 'full' && renderSeconds > state.plan.outDuration * 1.2 ? '\n渲染比实时慢 ' + (renderSeconds / state.plan.outDuration).toFixed(2) + ' 倍（整条重渲），这条模板靠分段缓存省时间。' : ''),
     { job: job.id })
 
   return { video: out, preview, renderSeconds, engine }
