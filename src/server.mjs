@@ -6,6 +6,7 @@ import { join, extname, resolve, relative, isAbsolute } from 'node:path'
 import { Group } from './core/group.mjs'
 import { Orchestrator } from './core/orchestrator.mjs'
 import { BOTS } from './bots/roster.mjs'
+import { botRoster, templateLibrary, readTerms, validateTerms, auditTerms, writeTerms, trial } from './assets.mjs'
 
 const ROOT = process.env.DSM_HOME || resolve(process.cwd(), 'groups')
 const WEB = resolve(process.cwd(), 'web')
@@ -133,6 +134,37 @@ const routes = [
       send(res, 200, { ok: true })
     } catch (e) { send(res, 500, { ok: false, error: e.message }) }
   }],
+  // ── 资产层：机器级的资产，不属于某个项目 ──
+  ['GET', /^\/api\/assets$/, (req, res) => {
+    const terms = readTerms()
+    send(res, 200, { bots: botRoster(), templates: templateLibrary(), terms: { ...terms, warnings: validateTerms(terms).warnings } })
+  }],
+
+  // 存术语表：先形状校验，再同音门。两道门都过才落盘，落盘走临时文件 + rename。
+  ['POST', /^\/api\/assets\/terms$/, async (req, res) => {
+    const b = await body(req)
+    const cur = readTerms()
+    if (b.rev && b.rev !== cur.rev) {
+      return send(res, 409, { ok: false, error: '术语表在别处被改过（你手里这版是旧的），刷新再存', rev: cur.rev })
+    }
+    const draft = { version: cur.version, note: cur.note, hotwords: b.hotwords || [], terms: b.terms || [] }
+    const v = validateTerms(draft)
+    if (!v.ok) return send(res, 400, { ok: false, stage: 'shape', errors: v.errors, warnings: v.warnings })
+    const a = await auditTerms(draft)
+    if (a.errors.length) {
+      return send(res, 400, { ok: false, stage: 'homophone', errors: a.errors, warnings: [...v.warnings, ...a.warnings], pinyinMode: a.pinyinMode })
+    }
+    const saved = writeTerms(draft)
+    send(res, 200, { ok: true, terms: saved, warnings: [...v.warnings, ...a.warnings], pinyinMode: a.pinyinMode, checked: a.checked })
+  }],
+
+  // 试验台：拿草稿（不用先存）在真 applyTerms 上跑一遍，验的是「会不会命中」，不是转写本身。
+  ['POST', /^\/api\/assets\/terms\/trial$/, async (req, res) => {
+    const b = await body(req)
+    const terms = Array.isArray(b.terms) ? b.terms.filter(t => t && typeof t === 'object') : readTerms().terms
+    send(res, 200, { ok: true, ...trial(String(b.text || ''), terms) })
+  }],
+
   ['GET', /^\/file$/, (req, res, m) => {
     const q = new URL('http://x' + req.url).searchParams
     const g = getGroup(q.get('g'))

@@ -30,7 +30,9 @@ h1,h2,h3{margin:0;font-family:var(--font-display);font-weight:500}
 .group .name{font-size:var(--t-sm);color:var(--chalk);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .group .meta{font-family:var(--font-mono);font-size:var(--t-xs);color:var(--chalk-mute)}
 .group.active .meta{color:var(--chalk-dim)}
-.rail-foot{display:flex;align-items:center;gap:var(--space-2);font-size:var(--t-xs);color:var(--chalk-mute);border-top:1px solid var(--edge);padding-top:var(--space-3)}
+.rail-foot{display:flex;align-items:center;gap:var(--space-2);font-size:var(--t-xs);color:var(--chalk-mute);border-top:1px solid var(--edge);padding-top:var(--space-3);text-decoration:none}
+.rail-foot b{margin-left:auto;font-weight:400;font-family:var(--font-mono);font-size:var(--t-xs);color:var(--chalk-dim);transition:color .12s}
+a.rail-foot:hover b{color:var(--chalk)}
 .dot{width:4px;height:4px;border-radius:50%;background:var(--chalk-dim);flex:none}
 
 /* ── 中：群聊 */

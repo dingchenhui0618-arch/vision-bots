@@ -54,6 +54,11 @@ function getLexicon() {
   return lexicon
 }
 
+/** 术语表改过之后清掉缓存：不清的话界面说「保存成功」，断行还在用旧词。 */
+export function resetLexicon() {
+  lexicon = null
+}
+
 /** 把 ICU 拆碎的单字按词表合回整词。 */
 function merge(raw, lex) {
   const out = []

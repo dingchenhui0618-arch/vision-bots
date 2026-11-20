@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>资产层 · Vision Bots</title>
+<link rel="stylesheet" href="/tokens.css" />
+<link rel="stylesheet" href="/style.css" />
+<link rel="stylesheet" href="/assets.css" />
+</head>
+<body>
+<header class="bar">
+  <a class="back" href="/">← 群聊</a>
+  <div class="bar-title">
+    <b>资产层</b>
+    <span id="stamp">读盘中…</span>
+  </div>
+  <div class="bar-right">
+    <span class="save-state" id="saveState"></span>
+    <button class="btn-primary" id="save" disabled>保存术语表</button>
+  </div>
+</header>
+
+<main class="page">
+  <section class="block">
+    <div class="block-head">
+      <b>bot 名册</b><span>长驻身份 · 人设、模型档、工具、产物契约</span>
+      <em id="botsCount"></em>
+    </div>
+    <div id="bots"></div>
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <b>模板库</b><span>模板决定交付规格：画幅、时长区间、节奏</span>
+      <em id="tplCount"></em>
+    </div>
+    <div id="tpls"></div>
+  </section>
+
+  <section class="block">
+    <div class="block-head">
+      <b>术语表</b><span>转写前注热词，转写后按术语替换；本机唯一需要客户自己维护的资产</span>
+      <em id="termsPath"></em>
+    </div>
+    <p class="note" id="termsNote"></p>
+
+    <div class="sub">热词 · 转写前注入 initial_prompt</div>
+    <div class="hw-row">
+      <div class="hotwords" id="hotwords"></div>
+      <input class="hw-add" id="hwNew" placeholder="加个热词，回车" spellcheck="false" />
+    </div>
+
+    <div class="sub">术语 · 转写后确定性替换</div>
+    <div class="terms" id="terms"></div>
+    <div class="terms-foot">
+      <button class="btn-add" id="addTerm">+ 加一条术语</button>
+      <span class="hint" id="termsHint">「写成」和「后接」里多个词用逗号分开；「后接」用来修被 ASR 拆成两个词的错（如「化」+「走」）</span>
+    </div>
+    <div class="issues" id="issues"></div>
+
+    <div class="sub">试一下 · 拿这张表在真替换逻辑上跑一遍</div>
+    <div class="note">验的是「这条术语会不会命中」，不是转写本身：这里没有真实时间戳，置信度按 0.5 算（低置信那一侧）。保存后转写才会带上新热词。</div>
+    <div class="trial">
+      <textarea id="trialIn" rows="2" placeholder="贴一句 ASR 可能写错的话，比如：观众三秒就画走了">观众三秒就画走了</textarea>
+      <button class="btn-ghost" id="trialGo">跑一遍</button>
+    </div>
+    <div class="trial-out" id="trialOut"></div>
+  </section>
+</main>
+<script src="/assets.js"></script>
+</body>
+</html>
