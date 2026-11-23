@@ -83,8 +83,9 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
       font: brief.font || 'Microsoft YaHei',
     })
     log('渲染中（' + spec.width + '×' + spec.height + '，' + state.plan.keep.length + ' 段，' + tpl.name + '）')
-    await renderCut({ input, plan: state.plan, assText, out, hasAudio: state.source.hasAudio, size: [spec.width, spec.height], layout: built ? built.layout || null : null })
+    const cut = await renderCut({ input, plan: state.plan, assText, out, hasAudio: state.source.hasAudio, size: [spec.width, spec.height], layout: built ? built.layout || null : null })
     renderSeconds = (Date.now() - t0) / 1000
+    state.encode = { mode: 'full', window: null, encoder: { id: cut.encoder } }
   }
 
   artifact('video', out, { template: tpl.id, duration: state.plan.outDuration })
@@ -108,7 +109,7 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
     (state.encode
       ? '\n编码 ' + state.encodeSeconds.toFixed(1) + 's（' + (state.encode.mode === 'splice'
         ? '只重编第 ' + state.encode.window.from + '–' + state.encode.window.to + ' 帧，其余从上一版成片流拷贝'
-        : '整条重编') + '）。'
+        : '整条重编') + (state.encode.encoder && state.encode.encoder.label ? '，' + state.encode.encoder.label : '') + '）。'
       : ''),
     { job: job.id })
 

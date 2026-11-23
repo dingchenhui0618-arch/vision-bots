@@ -170,7 +170,7 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
     dirty: decision.mode === 'patch' ? { from: decision.from, to: decision.to } : decision.mode === 'reuse' ? { none: true } : { all: true },
   })
   const encodeSeconds = enc.encodeSeconds
-  return { out, renderSeconds, encodeSeconds, frames: scene.frames, cues: made.cues, decision, encode: { mode: enc.mode, window: enc.window } }
+  return { out, renderSeconds, encodeSeconds, frames: scene.frames, cues: made.cues, decision, encode: { mode: enc.mode, window: enc.window, encoder: enc.encoder } }
 }
 
 function readCacheMeta(cacheDir) {

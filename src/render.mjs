@@ -1,6 +1,7 @@
 import { writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { ff, even } from './ffmpeg.mjs'
+import { resolveEncoder, videoArgs } from './encoder.mjs'
 
 const SCRIM_STEPS = 32
 
@@ -63,12 +64,16 @@ export async function renderCut({ input, plan, assText, out, hasAudio = true, si
 
   args.push('-filter_complex', parts.join(';'), '-map', `[${vout}]`)
   if (hasAudio) args.push('-map', '[ac]', '-c:a', 'aac', '-b:a', '192k')
-  args.push('-c:v', 'libx264', '-preset', 'medium', '-crf', String(crf), '-pix_fmt', 'yuv420p',
+  // 编码器按机器能力选（src/encoder.mjs）。这条路径整条重编、从不拼接，
+  // 所以要的是「同观感下最快」，不是「栅格对齐」——every: 0 关掉栅格。
+  const enc = resolveEncoder()
+  args.push(...videoArgs(enc, { crf, every: 0 }),
+    '-metadata:s:v:0', 'encoder=' + enc.tag,
     '-movflags', '+faststart', '-r', '30', out)
 
   // ass 用相对路径，避开 Windows 下 filter 里转义盘符的坑
   await ff(args, { cwd: dirname(out) })
-  return { out, segments: plan.keep.length, layout: layout ? 'template' : size ? 'fit' : 'native' }
+  return { out, segments: plan.keep.length, layout: layout ? 'template' : size ? 'fit' : 'native', encoder: enc.id }
 }
 
 export async function renderStill(input, time, out) {

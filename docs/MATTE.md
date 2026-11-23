@@ -1,0 +1,73 @@
+# Windows 人物蒙版方案（「字藏人物身后」）
+
+结论先行：**换模型，不换架构**。光轨引擎已经有「按帧序列喂图」的口子（engine/media.js），
+film.js 现在把人物整张 drawImage 上去；缺的不是引擎能力，是**每帧的人物 alpha 图**。
+所以要做的是离线跑一次人像抠像，产出一串 alpha PNG，落到 media/masks/person/，
+再让 film.js 用这张 alpha 把人物画在中层文字之上、HUD 之下。Windows 上不需要 Vision。
+
+## 1. 现在卡在哪
+
+- macOS 上这条路走的是 Vision 的人像分割；Windows 没有对应 API（Windows Studio Effects 不可脚本化）。
+- repo 里没有 matte 代码：grep 全仓只有 person 帧（media/frames/person），没有 mask。
+- vendor/lighttrail 的 media.js 支持任意序列（prefix/ext 可配），所以 alpha 序列天然能接；
+  film.js:37 注册 person，film.js:223 一行 drawImage 把人物铺满画面——这里要改成分层合成。
+
+## 2. 候选模型（Windows 可跑）
+
+| 方案 | 模型/依赖 | 720p CPU 速度 | 边缘（发丝/帽檐） | 备注 |
+|---|---|---|---|---|
+| MediaPipe Selfie Segmenter | tflite 250KB，mediapipe | ~30 fps | 一般，帽檐和发丝糊 | 最省事，适合先跑通 |
+| **MODNet** | onnx ~25MB，onnxruntime | ~3–5 fps（512 输入） | 好，肖像专用 | **主选**，CPU 可跑，DirectML 可加速 |
+| RVM | onnx ~15MB，onnxruntime | ~10 fps（downsample 0.25+递归） | 好，视频时序稳 | 递归状态对长片友好，但要喂全序列 |
+| BackgroundMattingV2 | 需要干净背景板 | — | 很好 | 单机位手持素材没有背景板，排除 |
+| rembg/u2net_human_seg | 176MB | ~0.5–1 fps | 好 | 太慢，70 秒片子要 35 分钟，排除 |
+
+**选 MODNet**：肖像抠像里质量/成本最平衡，纯 ONNX，不吃 CUDA；再用**引导滤波**按原帧亮度细化边缘，
+最后做一次时间平滑（同一像素相邻帧 alpha 的一阶差分限幅），抑制闪烁。
+MediaPipe 作为「机器太慢时的快速档」，命令行可选，不默认。
+
+## 3. 接口契约（先定死，再写代码）
+
+1. 产物：media/masks/person/f_%06d.png，8 位灰度，255=人，0=背景；**张数与顺序严格等于 person 帧**。
+2. scene.json 增加可选字段 person.matte = { seq:'masks/person', count, pad:6, ext:'png' }；
+   没有这个字段就是「没有蒙版」，引擎按老样子把人物画在最上层，并在群里明说「这条没做人物蒙版」。
+3. 缓存键与抽帧同源：matte 的指纹 = personHash + 模型名 + 模型文件 SHA256。
+   换模型、换参数、换素材都必须重算，不能沿用旧 mask。
+4. 源分辨率（720×1280）算完直接存**成片分辨率**（1080×1920）的 alpha，避免渲染时每帧缩放。
+
+## 4. 绘制分层（film.js）
+
+    bg（人物帧画面） → 中层文字/标签 chips → 人物(alpha) → HUD / 大字 / 字幕
+
+现在的顺序是「人物 → 文字」，所以字压在脸上；改成人物用离屏 canvas 做 destination-in 之后再画，
+字就自然藏到人后面。字幕和 HUD 永远在最上层（要可读），这一点和折光一致。
+
+## 5. 成本与预算
+
+- 需要蒙版的帧 = EDL 保留段的源帧，不是整条素材。70 秒片子大约 500–900 帧。
+- MODNet 512 CPU 单帧 ~0.25s → 一条 60 秒成片约 2–4 分钟，**一次性**，落缓存；
+  之后「改一句」只重算受影响帧（和 master 的分段缓存同一个思路）。
+- 磁盘：1080×1920 灰度 PNG 每张约 120–400KB，800 帧约 100–300MB，放 groups/<id>/cache。
+
+## 6. 验收（写进 scripts/check-matte.mjs，可复跑）
+
+1. **对齐**：mask 张数 = person 帧数；随机抽 5 帧，人物 bbox 与画面里人物实际位置误差 < 2% 宽。
+2. **边缘**：帽檐/肩膀边缘 3px 过渡带内 alpha 单调，不能有 0/255 硬台阶（>60% 像素违反即失败）。
+3. **闪烁**：静态区域（背景墙）相邻帧 alpha 平均绝对差 < 1/255。
+4. **降级**：删掉模型目录后重跑，必须**明确报错并在群里说**「没做人物蒙版，字会压在人前面」，
+   不许静默按老样子出片。
+5. **观感**：真素材跑一条 15 秒，抽帧看「字在人后面」+ 帽檐不穿帮，图落 docs/。
+
+## 7. 顺序
+
+1. tools/matte.py（uv + onnxruntime + MODNet）跑通一帧 → 一段 → 整条；先量速度和内存。
+2. render.mjs 抽帧之后接 matte（缓存 + 指纹）；scene.json 带 matte 字段。
+3. film.js 改成四层；template.json 不动（布局不变）。
+4. check-matte.mjs + 真素材一条 15 秒成片 + 抽帧证据。
+5. 文档：README「人物蒙版」一节、docs/PROGRESS.md 里程碑。
+
+## 8. 已知风险
+
+- 手在脸前挥动、帽子边缘逆光 → 蒙版啃掉边缘：用引导滤波 + 每帧 alpha 膨胀 1px 兜底，宁可多留背景。
+- 递归模型（RVM）长序列漂移：先走 MODNet（逐帧独立），时序问题用平滑层解决。
+- 模型权重不入库：安装时下载 + 固定 SHA256，校验失败就停，不猜。
