@@ -1,12 +1,33 @@
 /** 剪辑：转写 → 错字治理 → 气口检测 → 保留区间 → 字幕卡。只报数字和决定。 */
 import { join } from 'node:path'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { probe } from '../probe.mjs'
 import { extractAudio } from '../ffmpeg.mjs'
 import { transcribe } from '../asr.mjs'
 import { buildPlan } from '../plan.mjs'
 import { buildCaptions, toSRT } from '../captions.mjs'
 import { correct, loadTerms, hotwordPrompt, applyToSegments } from '../asr-fix.mjs'
+import { sectionsOf } from '../sections.mjs'
+import { titleSections } from '../section-titles.mjs'
+
+const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
+
+/**
+ * 这个模板这一段能放多少字的大字。只有画布模板（有 big 布局）才有：
+ * PPT 底座的章节卡按契约必须用原话，不许改写，所以那边不接标题模型。
+ */
+function bigBudget(templateId, ratio) {
+  if (!templateId) return 0
+  try {
+    const tpl = JSON.parse(readFileSync(join(TPL_ROOT, templateId, 'template.json'), 'utf8').replace(/^\uFEFF/, ''))
+    const layouts = tpl.layouts || {}
+    const R = (ratio && layouts[ratio]) ? ratio : (layouts[tpl.ratio] ? tpl.ratio : Object.keys(layouts)[0])
+    const big = R && layouts[R] && layouts[R].big
+    if (!big || !big.lineChars) return 0
+    return Math.max(6, Math.min(16, (big.lineChars || 6) * (big.maxLines || 2) - 2))
+  } catch { return 0 }
+}
 
 const KIND_LABEL = { homophone: '同音字', term: '专有名词', number: '数字' }
 
@@ -62,6 +83,23 @@ export async function runCut({ group, job, log, artifact, brief, state }) {
   state.source = info
   state.fixReport = fix.report
   state.lowConfidence = fix.report.pending
+
+  // 段落大字标题：模型提案，接地校验（字必须来自这一段自己说过的话）。
+  // 时间码还是时间码：模型只产出文本，段落边界仍由 mergeSections 决定。
+  const secs = sectionsOf({ segments, plan })
+  const budget = bigBudget(group.meta.template || brief.template, brief.ratio)
+  if (budget && secs.length) {
+    group.emit({ type: 'progress', bot: 'cutter', text: '剪辑在给 ' + secs.length + ' 段起大字标题…', transient: true })
+    const t = await titleSections({ sections: secs, maxChars: budget, log })
+    state.sectionTitles = t.titles
+    brief.sectionTitles = t.titles
+    state.titleStats = t.stats || null
+    const adopted = t.titles.filter(x => x.source === 'model')
+    if (adopted.length) {
+      log('大字标题：' + adopted.map(x => x.index + '「' + x.text + '」').join(' '))
+      group.emit({ type: 'progress', bot: 'cutter', text: '大字标题定了 ' + adopted.length + ' / ' + secs.length + ' 段', transient: true })
+    }
+  }
 
   // 交付之后「改一句」要基于这一份：词、句、时间线、字幕卡全在，不用重跑转写。
   // 只存状态，不存媒体；素材路径还在 group.json 里，渲染时按它取帧。

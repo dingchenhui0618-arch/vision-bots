@@ -6,7 +6,7 @@
  * 每个字段都带来源（user / model / default）：群里要说清哪些是他说的，哪些是我替他定的。
  */
 import { TEMPLATES, templateById } from './bots/roster.mjs'
-import { chatJSON } from './llm.mjs'
+import { chatJSON, LLM } from './llm.mjs'
 
 export const PLATFORMS = ['视频号', '抖音', '小红书', 'B站', '快手']
 const PLATFORM_HINT = /视频号|抖音|小红书|B站|快手/
@@ -308,7 +308,7 @@ export async function understand({ text = '', askModel = true, call = chatJSON, 
     const merged = mergeBrief({ text, model: null })
     return { brief: merged.brief, meta: { model: null, skipped: 'off', ms: Date.now() - t0, tokens: null } }
   }
-  const r = await call({ prompt: PROMPT(text), maxTokens: 400, timeoutMs })
+  const r = await call({ prompt: PROMPT(text), maxTokens: 500, timeoutMs, model: LLM.models.smart })
   const merged = mergeBrief({ text, model: r.ok ? r.value : null })
   return {
     brief: merged.brief,

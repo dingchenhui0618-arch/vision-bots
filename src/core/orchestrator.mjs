@@ -243,10 +243,12 @@ export class Orchestrator {
   /** 用同一份时间线重出：画面没变就复用母版，变了就只重渲变化的那一段。 */
   async repack(pipe, reason) {
     const brief = pipe.brief || {}
+    // 字幕从词表重算：断句/断行规则改过之后，旧卡片就是错的（stale 的派生物不能当源头）
+    const captions = buildCaptions(pipe.transcript.words, pipe.plan, { maxChars: brief.maxChars || 14 })
     const state = {
       transcript: pipe.transcript,
       plan: pipe.plan,
-      captions: pipe.captions,
+      captions,
       fixReport: pipe.fixReport || null,
       source: pipe.source || null,
     }

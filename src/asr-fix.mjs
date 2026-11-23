@@ -15,7 +15,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { chat } from './llm.mjs'
+import { chat, LLM } from './llm.mjs'
 
 /** execFile 不收 stdin，拼音查询要喂 JSON，所以自己开管道。 */
 function runStdin(cmd, args, input, { timeout = 120000, maxBuffer = 4 << 20 } = {}) {
@@ -170,7 +170,7 @@ ${wordList}
 async function callModel(wordList) {
   const t0 = Date.now()
   try {
-    const r = await chat({ prompt: PROMPT(wordList), maxTokens: 900 })
+    const r = await chat({ prompt: PROMPT(wordList), maxTokens: 1200, model: LLM.models.fast })
     if (!r.ok) return { skipped: r.skipped, detail: r.detail || null }
     const m = r.content.match(/\[[\s\S]*\]/)
     const proposals = m ? JSON.parse(m[0]) : []

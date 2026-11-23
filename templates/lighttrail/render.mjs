@@ -14,6 +14,7 @@ import { ff } from '../../src/ffmpeg.mjs'
 import { synthCues, peaksFromPCM } from '../../src/sfx.mjs'
 import { hashOf, planPatch, spliceMaster } from '../../src/render-cache.mjs'
 import { encodeFilm } from '../../src/encode-film.mjs'
+import { subjectBand, grabSourcePairs } from '../../src/frame-audit.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const RENDERER = join(HERE, '..', '..', 'vendor', 'lighttrail', 'tools', 'render.mjs')
@@ -30,11 +31,71 @@ export async function renderFrames({ work, mediaDir, size, fps, from, to, out, l
   return out
 }
 
+/** 在保留段里均匀取几个源时间点，用来量人物在哪。 */
+function sampleTimes(plan, n = 9) {
+  const total = plan.keep.reduce((s, [a, b]) => s + (b - a), 0)
+  const out = []
+  for (let i = 0; i < n; i++) {
+    let target = ((i + 0.5) / n) * total
+    for (const [a, b] of plan.keep) {
+      const d = b - a
+      if (target <= d) { out.push(a + Math.min(Math.max(0.05, target), Math.max(0.05, d - 0.05))); break }
+      target -= d
+    }
+  }
+  return out
+}
+
+/**
+ * 问一遍渲染器：这版画面把字和轨道画在哪（含这版几何）。
+ * 不逐帧跑——盒子是按内容布局的，每 0.4 秒取一帧就够覆盖每张字幕和每段大字。
+ */
+export async function qaBoxes({ work, mediaDir, size, frames, fps, out, log = () => {} }) {
+  const { fonts, chrome } = assertCanvasTools()
+  const step = Math.max(1, Math.round(fps * 0.4))
+  try {
+    await runQa(work, mediaDir, size, frames, fps, out, step, fonts, chrome, log)
+  } catch (e) {
+    writeFileSync(out + '.error.txt', String(e.message || e) + '\n' + String(e.stack || ''), 'utf8')
+    throw e
+  }
+  const lines = readFileSync(out, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l))
+  const boxes = []
+  let layout = null
+  for (const row of lines) {
+    if (row.layout) layout = row.layout
+    for (const b of row.boxes || []) boxes.push({ ...b, frame: row.f, t0: row.f / fps, t1: row.f / fps })
+  }
+  return { boxes, layout, samples: lines.length }
+}
+
+function runQa(work, mediaDir, size, frames, fps, out, step, fonts, chrome, log) {
+  return run(process.execPath, [
+    RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
+    '--mode', 'qa', '--from', '0', '--to', String(frames - 1), '--q-step', String(step),
+    '--out', out, '--size', size[0] + 'x' + size[1], '--fonts', fonts, '--chrome', chrome,
+  ], { log })
+}
+
 export async function renderLighttrail({ input, plan, scene, work, out, log = () => {}, stills = null, force = false, cacheDir = null }) {
   const { fonts, chrome } = assertCanvasTools()
   const [width, height] = scene.size
   const size = scene.size
   const fps = scene.fps
+
+  // 0. 人物在哪：轨道要按它让位，质检也要拿它判「字有没有压到人」。
+  // 这一步只读素材像素，不依赖模型；量不出来就记 ok:false，绝不静默当"没问题"。
+  // 默认不开：纯运动差分在近景口播上量不准（人占画面一大半，帽子和裤子都会误判），
+  // 与其拿一个错的头部区间把轨道推到脸上，不如先按版式契约走——所有文字只占画面下 38%，
+  // 这个契约由质检从盒子里逐帧验。人物蒙版接上（docs/MATTE.md）之后换成 alpha 轮廓判定。
+  if (process.env.VISION_BOTS_HEADBAND === '1' && !scene.person.headBand) {
+    const band = subjectBand(await grabSourcePairs({ input, times: sampleTimes(plan, 9), gap: 0.25, size: [108, 192] }))
+    scene.person.headBand = band
+    log(band.ok ? '人物头部实测：' + (band.band.top * 100).toFixed(0) + '%–' + (band.band.bottom * 100).toFixed(0) + '%' : '人物位置没量出来：' + band.reason)
+  } else if (!scene.person.headBand) {
+    log('人物蒙版未接入：按版式契约排（文字只在下 38% 的带子里）')
+  }
+
   const sceneStamp = hashOf(JSON.stringify(scene))
   const tplJSON0 = readFileSync(join(HERE, 'template.json'), 'utf8').replace(/^\uFEFF/, '')
   const hash0 = hashOf(tplJSON0, readFileSync(FILM, 'utf8'))
@@ -42,6 +103,9 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
 
   // 0. 什么都没变、成片也还在：连抽帧和编码都不用做
   if (!force && !stills && cacheDir && cached && cached.sceneStamp === sceneStamp && cached.hash === hash0 && existsSync(out)) {
+    // 就算复用成片，也要把这一版的项目文件落到工作目录：
+    // 质检要拿同一份 scene/peaks/template 回放画面（不然盒子采样直接 404）
+    writeProjectFiles(work, scene, tplJSON0, cached.peaksJSON)
     log('画面、声音、模板都没变，成片直接复用')
     return { out, renderSeconds: 0, frames: scene.frames, decision: { mode: 'reuse', reason: '整条没变，成片复用' } }
   }
@@ -89,11 +153,9 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
   const peaksJSON = haveVoice && cached.peaksJSON
     ? cached.peaksJSON
     : JSON.stringify(peaksFromPCM((await ff(['-v', 'error', '-i', voice, '-f', 's16le', '-ac', '1', '-ar', '48000', '-'], { encoding: 'buffer' })).stdout))
-  writeFileSync(join(work, 'peaks.json'), peaksJSON, 'utf8')
-  writeFileSync(join(work, 'scene.json'), JSON.stringify(scene), 'utf8')
   // 布局是模板的一部分，不是内容：引擎直接读它，画幅换了时间线一个字不动。
   const tplJSON = readFileSync(join(HERE, 'template.json'), 'utf8').replace(/^\uFEFF/, '')
-  writeFileSync(join(work, 'template.json'), tplJSON, 'utf8')
+  writeProjectFiles(work, scene, tplJSON, peaksJSON)
 
   // 4. 逐帧渲染（无头 Chrome + ANGLE）——有缓存就只渲变化的那一段
   const hash = hashOf(tplJSON, readFileSync(FILM, 'utf8'))
@@ -171,6 +233,14 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
   })
   const encodeSeconds = enc.encodeSeconds
   return { out, renderSeconds, encodeSeconds, frames: scene.frames, cues: made.cues, decision, encode: { mode: enc.mode, window: enc.window, encoder: enc.encoder } }
+}
+
+/** 渲染项目目录：scene / peaks / template 三件套，渲染器和质检都从这儿读。 */
+function writeProjectFiles(work, scene, tplJSON, peaksJSON) {
+  mkdirSync(work, { recursive: true })
+  if (peaksJSON) writeFileSync(join(work, 'peaks.json'), peaksJSON, 'utf8')
+  writeFileSync(join(work, 'scene.json'), JSON.stringify(scene), 'utf8')
+  writeFileSync(join(work, 'template.json'), tplJSON, 'utf8')
 }
 
 function readCacheMeta(cacheDir) {

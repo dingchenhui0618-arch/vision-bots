@@ -5,6 +5,8 @@
 import { makeMapper } from '../../src/plan.mjs'
 import { mergeSentences, CHAPTER_MAX } from '../../src/chapters.mjs'
 import { segment } from '../../src/segment.mjs'
+// 段落推导和剪辑共用一份：剪辑给段落起标题、这里把标题画上屏，索引错一位大字就挂错段
+import { sentencesOf, sectionsOf, applyTitles } from '../../src/sections.mjs'
 
 const round = (n, k = 3) => Number(n.toFixed(k))
 
@@ -36,8 +38,6 @@ export function frameRanges(plan, fps) {
   return ranges
 }
 
-const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu
-
 export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [], ratio = null }) {
   const t = tpl
   const fps = t.spec.fps
@@ -59,9 +59,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
   })).filter(c => c.text && c.f1 > c.f0)
 
   // ── 章节：取 ASR 整句，短句并进去，但并长了不并（和 PPT 底座同一套规则）──
-  const sentences = (segments || [])
-    .map(s => ({ start: map(s.start), end: Math.max(map(s.start) + 1.0, map(s.end)), text: String(s.text || '').replace(PUNCT, '') }))
-    .filter(s => s.text && s.end > s.start)
+  const sentences = sentencesOf({ segments, plan })
   const chapters = mergeSentences(sentences).map(c => ({ start: round(c.start), end: round(c.end), text: c.text }))
   if (chapters.length < 2) {
     // 句子信息不可用（whisper 有时整段只回一个 segment）时退回到按卡片分组：
@@ -82,28 +80,30 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     chapters.splice(0, chapters.length, ...mergeSentences(chapters, { maxChars: CHAPTER_MAX, shortSec: 0 }))
   }
 
-  // ── 大字：一章一个落点，整句上屏不截断；逐字落点留给 film.js 排 ──
-  const bigs = chapters.map((ch, i) => {
-    const chars = []
-    for (const b of beats) {
-      if (b.f0 < ch.start - 0.02 || b.f0 > ch.end + 0.02) continue
-      for (const k of b.chars) chars.push(k)
-    }
-    return {
-      index: i + 1,
-      text: ch.text,
-      // 词边界跟着内容走：画布引擎按它断行，不靠字数硬切（「视 / 频」那种切口）
-      words: segment(ch.text),
-      f0: round(ch.start),
-      // 大字挂到这一章结束（下一章开始）为止，而不是「字数 × 0.16s」就撤。
-      // 按字数算的窗口在 16–20 字的章节上会提前 1–1.5s 消失，那一段画面只剩声音、没有一个字。
-      f1: round(ch.end),
-      chars,
-    }
-  })
+  // ── 段落与大字：几秒一段，一段一句大字 ──
+  // 以前「一章 = 一句」，68 秒切 22 章，平均 3.1 秒换一次大字，观感是字幕在抖（用户 2026-11-23 否掉）。
+  // 现在大字跟着段落走，一句话那一级交给下面的字幕 pill。
+  // 用没合并过的整句做段落：pickTitle 才能挑到 6–12 字的钉子句（合并过的长句里挑不出短句）
+  // 大字文本：模型给过且过了接地校验就用模型的（source: 'model'），否则沿用原句。
+  // 这里不做任何改写校验——校验在 section-titles.mjs 里做完，带 ok:false 的根本贴不进来。
+  const titled = applyTitles(sectionsOf({ segments, plan }), brief.sectionTitles)
+  const sections = titled.sections
+  const bigs = sections.map((sec) => ({
+    index: sec.index,
+    text: sec.text,
+    // 词边界跟着内容走：画布引擎按它断行，不靠字数硬切（「视 / 频」那种切口）
+    words: segment(sec.text),
+    f0: round(sec.start),
+    // 大字挂到这一段结束为止，不按字数提前撤（早退会留下只闻其声、不见其字的空档）
+    f1: round(sec.end),
+    lines: sec.lines,
+  }))
 
-  // ── 一条光轨：点燃 → 扫描 → 变成声波基线，每章一个齿 ──
-  const marks = chapters.map((ch, i) => ({ t: round(ch.start), index: i + 1, total: chapters.length }))
+  // ── 字幕：一句一张，压在底部 pill 里，逐句换；词级落点一起带上 ──
+  const subs = beats.map(b => ({ text: b.text, f0: b.f0, f1: b.f1 }))
+
+  // ── 一条光轨：点燃 → 扫描 → 变成声波基线，每段一个齿 ──
+  const marks = sections.map(s => ({ t: round(s.start), index: s.index, total: sections.length }))
 
   // ── 音效只回应看得见的动作：点燃、扫描、每章一下、收尾 ──
   const cues = []
@@ -124,6 +124,8 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     person: { seq: 'person', count: ranges.reduce((n, r) => n + r.srcCount, 0), ranges },
     beats,
     bigs,
+    subs,
+    sections: sections.map(s => ({ index: s.index, start: round(s.start), end: round(s.end), text: s.text, lines: s.lines })),
     marks,
     cues,
     stats: {

@@ -8,16 +8,44 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
-export const LLM = {
-  base: process.env.DSH_MEDIA_LLM_BASE || 'http://127.0.0.1:10100/v1',
-  model: process.env.DSH_MEDIA_LLM_MODEL || 'gpt-6-luna--fast',
-  timeoutMs: Number(process.env.DSH_MEDIA_LLM_TIMEOUT_MS || 45000),
+/**
+ * 本机配置文件：config/llm.local.json（.gitignore 排除，密钥只落在这里和我们自己的环境变量）。
+ * 优先级：环境变量 > 配置文件 > 默认值。所以在客户机器上换模型只改这个文件，不动代码。
+ */
+const LOCAL = fileURLToPath(new URL('../config/llm.local.json', import.meta.url))
+
+function readLocal() {
+  if (!existsSync(LOCAL)) return {}
+  try { return JSON.parse(readFileSync(LOCAL, 'utf8').replace(/^\uFEFF/, '')) || {} } catch { return {} }
 }
 
-/** OpenCodex 的凭证：环境变量优先，其次是本机 codex 登录态。不入库、不打印。 */
+const local = readLocal()
+const env = process.env
+
+export const LLM = {
+  base: env.DSH_MEDIA_LLM_BASE || local.base || 'http://127.0.0.1:10100/v1',
+  model: env.DSH_MEDIA_LLM_MODEL || local.model || (local.models && local.models.smart) || 'gpt-6-luna--fast',
+  // 两档就够：fast 用在每片必经的检查（错字、语义审读），smart 用在要判断力的地方（读需求、写标题）
+  models: {
+    fast: env.DSH_MEDIA_LLM_FAST || (local.models && local.models.fast) || env.DSH_MEDIA_LLM_MODEL || local.model || 'gpt-6-luna--fast',
+    smart: env.DSH_MEDIA_LLM_SMART || (local.models && local.models.smart) || env.DSH_MEDIA_LLM_MODEL || local.model || 'gpt-6-luna--fast',
+  },
+  timeoutMs: Number(env.DSH_MEDIA_LLM_TIMEOUT_MS || local.timeoutMs || 45000),
+  /**
+   * 是否允许模型先思考。默认 false，原因是实测：deepseek-flash / MiniMax-M3 这类思考模型
+   * 会把 max_tokens 全部烧在 reasoning_content 上，content 返回空字符串，finish_reason=length。
+   * 我们的活都是「按格式输出 JSON」，不需要长思考；真要思考就把这个开关打开并给足 4000+ 预算。
+   */
+  thinking: String(env.DSH_MEDIA_LLM_THINKING || (local.thinking === true ? 'on' : 'off')) === 'on',
+  source: env.DSH_MEDIA_LLM_BASE ? 'env' : (local.base ? 'config/llm.local.json' : 'default'),
+}
+
+/** 凭证：环境变量 > 本机配置文件 > codex 登录态。不入库、不打印。 */
 export function readKey() {
-  if (process.env.DSH_MEDIA_LLM_KEY) return process.env.DSH_MEDIA_LLM_KEY
+  if (env.DSH_MEDIA_LLM_KEY) return env.DSH_MEDIA_LLM_KEY
+  if (local.key) return String(local.key)
   const p = join(homedir(), '.codex', 'auth.json')
   if (!existsSync(p)) return null
   try {
@@ -30,14 +58,14 @@ export function readKey() {
 
 /** 给「模型到底通没通」这类报错和自检用，不含密钥。 */
 export function llmStatus() {
-  return { model: LLM.model, base: LLM.base, key: Boolean(readKey()) }
+  return { model: LLM.model, models: LLM.models, base: LLM.base, key: Boolean(readKey()), thinking: LLM.thinking, source: LLM.source }
 }
 
 /**
  * 一次纯文本调用。返回 {ok, content, ms, tokens, model} 或 {ok:false, skipped, detail, ms}。
  * skipped: no-key / http-<code> / timeout / unreachable / empty
  */
-export async function chat({ prompt, system = null, maxTokens = 700, timeoutMs = LLM.timeoutMs } = {}) {
+export async function chat({ prompt, system = null, maxTokens = 700, timeoutMs = LLM.timeoutMs, model = null } = {}) {
   const key = readKey()
   if (!key) return { ok: false, skipped: 'no-key' }
   const messages = []
@@ -51,7 +79,13 @@ export async function chat({ prompt, system = null, maxTokens = 700, timeoutMs =
     const res = await fetch(LLM.base.replace(/\/$/, '') + '/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key },
-      body: JSON.stringify({ model: LLM.model, messages, max_completion_tokens: maxTokens }),
+      body: JSON.stringify({
+        model: model || LLM.model,
+        messages,
+        max_tokens: maxTokens,
+        // 这个网关（TokenRouter / vLLM 系）认 enable_thinking；不认的服务器会忽略这个字段
+        ...(LLM.thinking ? {} : { enable_thinking: false }),
+      }),
       signal: ctl.signal,
     })
     const text = await res.text()
@@ -60,7 +94,7 @@ export async function chat({ prompt, system = null, maxTokens = 700, timeoutMs =
     const j = JSON.parse(text)
     const content = j.choices?.[0]?.message?.content || ''
     if (!content.trim()) return { ok: false, skipped: 'empty', ms }
-    return { ok: true, content, ms, tokens: j.usage?.total_tokens ?? null, model: j.model || LLM.model }
+    return { ok: true, content, ms, tokens: j.usage?.total_tokens ?? null, model: j.model || model || LLM.model }
   } catch (err) {
     const ms = Date.now() - t0
     return { ok: false, skipped: err.name === 'AbortError' ? 'timeout' : 'unreachable', detail: String(err.message).slice(0, 160), ms }

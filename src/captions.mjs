@@ -1,44 +1,90 @@
 /** 把词级时间戳排成字幕卡：按语义长度断行，成片时间，无标点。 */
 import { makeMapper } from './plan.mjs'
+import { segment } from './segment.mjs'
 
 const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu
+
+// 口播里的连接词：字幕卡片别拿它收尾，一断就成了"半句话"
+const CONNECTORS = ['但是', '所以', '因为', '然后', '而且', '不过', '就是', '其实', '如果', '只有', '或者', '还是', '可是', '于是', '另外', '这种', '这个', '现在', '今天', '就是']
 const SENTENCE_END = /[。！？!?]$/
 
-export function buildCaptions(words, plan, { maxChars = 14, maxLines = 2, maxGap = 0.55 } = {}) {
+export function buildCaptions(words, plan, { maxChars = 14, maxLines = 2, maxGap = 0.55, sentenceGap = 0.25 } = {}) {
   const map = makeMapper(plan)
-  const cards = []
-  let buffer = []
-  let lastEnd = null
 
-  // 逐字落点：大字按音节落下要用它；同时保证拼出来的文字和卡片文本逐字一致
-  const flush = () => {
-    if (!buffer.length) return
+  // 1) 先切句：whisper 中文经常不带标点，标点不能当唯一依据——停顿（> sentenceGap）就是句子边界。
+  //    以前不切句，字幕会攒到 14 字硬断：「我最近研究了一」/「圈真正的机会是在OPC结合内」这种
+  //    跨句、断词的字幕（2026-11-23 真素材上被抓出来）。
+  const groups = []
+  let cur = []
+  let lastEnd = null
+  for (const w of words) {
+    const gap = lastEnd === null ? 0 : w.start - lastEnd
+    if (cur.length && (gap > sentenceGap || SENTENCE_END.test(String(cur.at(-1).w)))) { groups.push(cur); cur = [] }
+    cur.push(w)
+    lastEnd = w.end
+    if (SENTENCE_END.test(String(w.w))) { groups.push(cur); cur = [] }
+  }
+  if (cur.length) groups.push(cur)
+
+  const cards = []
+  for (const g of groups) {
+    // 逐字落点：大字按音节落下要用它；同时保证拼出来的文字和卡片文本逐字一致
     const chars = []
-    for (const w of buffer) {
+    for (const w of g) {
       const f0 = map(w.start)
       const f1 = Math.max(f0 + 0.04, map(w.end))
       const cs = [...String(w.w).replace(PUNCT, '')].filter(Boolean)
       const n = cs.length
       cs.forEach((ch, i) => chars.push({ ch, f0: +(f0 + (f1 - f0) * i / n).toFixed(3), f1: +(f0 + (f1 - f0) * (i + 1) / n).toFixed(3) }))
     }
-    const text = chars.map(k => k.ch).join('').trim()
-    const start = map(buffer[0].start)
-    const end = Math.max(start + 0.35, map(buffer.at(-1).end))
-    if (text && end > start) cards.push({ start, end, text, chars, srcStart: buffer[0].start, srcEnd: buffer.at(-1).end })
-    buffer = []
+    if (!chars.length) continue
+    const text = chars.map(k => k.ch).join('')
+    // 2) 句内断卡只落在词边界：掉字、断词都会让字幕读起来像乱码
+    const bounds = wordBounds(text)
+    let at = 0
+    while (at < chars.length) {
+      let end = Math.min(chars.length, at + maxChars)
+      if (end < chars.length) {
+        const cand = bounds.filter(b => b > at && b <= end).pop()
+        if (cand && cand - at >= 3) end = cand
+      }
+      // 卡片不要以连接词收尾（"…技术但是我"这种断法读起来像断气）：把连接词推到下一张
+      if (end < chars.length) {
+        const seg0 = text.slice(at, end)
+        // 末尾 4 个字里出现连接词就退到它前面（"…技术但是我" → "…技术" + "但是…"）
+        const tail = Math.max(0, seg0.length - 4)
+        let cut = 0
+        for (const c of CONNECTORS) {
+          const idx = seg0.lastIndexOf(c)
+          if (idx >= 6 && idx >= tail && idx + c.length === seg0.length) { cut = Math.max(cut, seg0.length - idx) }
+          else if (idx >= 6 && idx >= tail && seg0.length - (idx + c.length) <= 2) { cut = Math.max(cut, seg0.length - idx) }
+        }
+        if (cut && end - cut >= 6) end -= cut
+      }
+      const piece = chars.slice(at, end)
+      const cardText = piece.map(k => k.ch).join('').trim()
+      if (cardText) {
+        cards.push({
+          start: piece[0].f0,
+          end: Math.max(piece[0].f0 + 0.35, piece.at(-1).f1),
+          text: cardText,
+          chars: piece,
+        })
+      }
+      at = end
+    }
   }
 
-  for (const w of words) {
-    const gap = lastEnd === null ? 0 : w.start - lastEnd
-    const text = buffer.map(x => x.w).join('').replace(PUNCT, '')
-    if (buffer.length && (gap > maxGap || text.length + w.w.length > maxChars || SENTENCE_END.test(buffer.at(-1).w))) {
-      flush()
+  // 太碎的卡（"一圈"、"人太少了"这种 2–3 字）并回上一张，只要不超长：一闪而过的字幕等于没有
+  for (let i = cards.length - 1; i > 0; i--) {
+    const c = cards[i], p = cards[i - 1]
+    if (c.text.length < 4 && p.text.length + c.text.length <= 16) {
+      p.text += c.text
+      p.chars = p.chars.concat(c.chars)
+      p.end = Math.max(p.end, c.end)
+      cards.splice(i, 1)
     }
-    buffer.push(w)
-    lastEnd = w.end
-    if (SENTENCE_END.test(w.w)) flush()
   }
-  flush()
 
   // 一个字都不许丢：与原文逐字核对
   const original = words.map(w => w.w).join('').replace(PUNCT, '')
@@ -46,6 +92,15 @@ export function buildCaptions(words, plan, { maxChars = 14, maxLines = 2, maxGap
   const missing = original.length - shown.length
   return { cards, coverage: { originalChars: original.length, shownChars: shown.length, missing } }
 }
+
+/** 词边界：ICU 分词 + 术语表补词（和断行同一套），返回字符下标。 */
+function wordBounds(text) {
+  const out = []
+  let acc = 0
+  for (const w of segment(text)) { acc += [...w].length; out.push(acc) }
+  return out
+}
+
 
 const esc = s => s.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}')
 

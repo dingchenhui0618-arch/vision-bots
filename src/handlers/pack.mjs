@@ -39,7 +39,7 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
 
   let built = null
   if (builder) {
-    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief: { ...brief, ratio: spec.ratio }, spec, captions: state.captions })
+    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief: { ...brief, ratio: spec.ratio, sectionTitles: state.sectionTitles || brief.sectionTitles || null }, spec, captions: state.captions })
     if (built.scene) {
       const scenePath = join(work, 'scene.json')
       writeFileSync(scenePath, JSON.stringify(built.scene, null, 2), 'utf8')
@@ -75,6 +75,10 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
     state.decision = r.decision || null
     state.encode = r.encode || null
     state.encodeSeconds = r.encodeSeconds || 0
+    // 质检要靠这三样回放这版画面：工作目录（scene/peaks/template）、媒体目录（人物帧）、模板 id
+    state.buildDir = work
+    state.mediaDir = join(group.dir, 'cache', tpl.id, 'media')
+    state.templateId = tpl.id
   } else {
     const assText = (built && built.assText) || toASS(state.captions.cards, {
       width: spec.width, height: spec.height,

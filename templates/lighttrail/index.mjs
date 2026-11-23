@@ -8,6 +8,9 @@ import { fileURLToPath } from 'node:url'
 import { buildScene } from './scene.mjs'
 import { renderLighttrail } from './render.mjs'
 
+// 质检要用它回放这版画面：问每个元素画在哪（盒子），不靠模板嘴上说
+export { qaBoxes } from './render.mjs'
+
 const HERE = dirname(fileURLToPath(import.meta.url))
 export const template = JSON.parse(readFileSync(join(HERE, 'template.json'), 'utf8'))
 

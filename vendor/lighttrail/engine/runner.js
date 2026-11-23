@@ -27,7 +27,8 @@ async function main() {
   if (mode === 'qa') {           // one draw per frame at the frame time; report every registered box + head boxes
     const cv = document.createElement('canvas'); cv.width = W; cv.height = H; const c2 = cv.getContext('2d');
     QA.on = true; let batch = [];
-    for (let f = Number(q.get('from')); f <= Number(q.get('to')); f++) {
+    const step = Math.max(1, Number(q.get('step') || 1)); // 采样步长：2052 帧不需要逐帧问盒子，盒子是按内容布局的
+    for (let f = Number(q.get('from')); f <= Number(q.get('to')); f += step) {
       await film.prepare(f); film.prefetch?.(f + 1);
       c2.save(); film.draw(c2, f / film.fps, f, f / film.fps); c2.restore();
       batch.push(JSON.stringify({ f, ...film.qa(f) }));
