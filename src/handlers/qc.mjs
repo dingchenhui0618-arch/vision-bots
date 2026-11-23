@@ -12,7 +12,7 @@ import { loadTerms } from '../asr-fix.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
 
-export async function runQc({ group, job, log, artifact, brief, state }) {
+export async function runQc({ group, job, log, artifact, brief, state, narrate = true }) {
   if (!state.video) throw new Error('没有成片可查')
   const dir = join(group.dir, 'work', job.id, 'frames')
   mkdirSync(dir, { recursive: true })
@@ -101,13 +101,39 @@ export async function runQc({ group, job, log, artifact, brief, state }) {
 
   const passed = report.checks.filter(c => c.ok)
   if (report.passed) {
-    group.say('qc', `${report.checks.length} 项全过。` + passed.map(c => `\n· ${c.detail}`).join('') + `\n抽了 ${frames.length} 帧：f1 ${frames[0].t}s / f3 ${frames[2].t}s / f5 ${frames[4].t}s。可以直接发。`, { job: job.id })
+    if (narrate) group.say('qc', `${report.checks.length} 项全过。` + passed.map(c => `\n· ${c.detail}`).join('') + `\n抽了 ${frames.length} 帧：f1 ${frames[0].t}s / f3 ${frames[2].t}s / f5 ${frames[4].t}s。可以直接发。`, { job: job.id })
   } else {
     const bad = report.checks.filter(c => !c.ok)
     const withFrame = bad.filter(c => c.evidence && c.evidence.file)
-    group.say('qc', `不通过，${bad.length} 项有问题：` + bad.map(c => `\n· ${c.id}：${c.detail}${c.evidence && c.evidence.file ? `（帧 ${c.evidence.frame}，已附）` : ''}`).join('') +
+    if (narrate) group.say('qc', `不通过，${bad.length} 项有问题：` + bad.map(c => `\n· ${c.id}：${c.detail}${c.evidence && c.evidence.file ? `（帧 ${c.evidence.frame}，已附）` : ''}`).join('') +
       `\n抽了 ${frames.length} 帧全在报告里${withFrame.length ? '，' + withFrame.length + ' 项带了定位帧' : '，数值类问题看报告里的数字'}。`, { job: job.id })
   }
 
-  return report
+  // 给 bot 说话用的事实：每项检查的结论和数字都在 checks 里
+  const failedChecks = report.checks.filter(c => !c.ok)
+  const targetChk = report.checks.find(c => c.id === 'target')
+  return {
+    ...report,
+    narrative: {
+      template: state.templateId || (group.meta.template || null),
+      ratio: state.scene ? state.scene.ratio : null,
+      width: state.scene ? state.scene.width : (state.source ? state.source.width : null),
+      height: state.scene ? state.scene.height : (state.source ? state.source.height : null),
+      checks: report.checks.length,
+      passed: report.checks.filter(c => c.ok).length,
+      failed: failedChecks.map(c => ({ id: c.id, detail: c.detail })),
+      frames: frames.length,
+      frameList: frames.map(f => ({ t: f.t, frame: f.frame })),
+      // 差额由管线算好给出来：模型自己减会算出没出处的数，被校验器拦，白跑一轮
+      targetSec: targetChk ? (Number(brief.duration) || null) : null,
+      outSec: targetChk ? Number(dur.toFixed(1)) : null,
+      gapSec: targetChk ? Number(Math.abs(dur - (Number(brief.duration) || dur)).toFixed(1)) : null,
+      duration: targetChk && targetChk.evidence ? targetChk.evidence : null,
+      semanticIssues: report.semantic && Array.isArray(report.semantic.issues)
+        ? report.semantic.issues.slice(0, 6).map(i => ({ at: i.at, kind: i.kind, text: i.text }))
+        : null,
+      fix: state.fixReport && state.fixReport.applied ? { changed: state.fixReport.applied.length, pending: (state.fixReport.pending || []).length } : null,
+      semantic: report.semantic ? { ok: report.semantic.ok, skipped: report.semantic.skipped, issues: (report.semantic.issues || []).length } : null,
+    },
+  }
 }

@@ -65,12 +65,16 @@ export function llmStatus() {
  * 一次纯文本调用。返回 {ok, content, ms, tokens, model} 或 {ok:false, skipped, detail, ms}。
  * skipped: no-key / http-<code> / timeout / unreachable / empty
  */
-export async function chat({ prompt, system = null, maxTokens = 700, timeoutMs = LLM.timeoutMs, model = null } = {}) {
+export async function chat({ prompt, system = null, messages: given = null, maxTokens = 700, timeoutMs = LLM.timeoutMs, model = null, tools = null, toolChoice = null } = {}) {
   const key = readKey()
   if (!key) return { ok: false, skipped: 'no-key' }
-  const messages = []
-  if (system) messages.push({ role: 'system', content: String(system) })
-  messages.push({ role: 'user', content: String(prompt) })
+  // 两种用法：给 prompt 一次性问完（读需求、纠错），或给 messages 自己管多轮（bot 的会话）
+  let messages = []
+  if (Array.isArray(given) && given.length) messages = given.map(m => ({ ...m }))
+  else {
+    if (system) messages.push({ role: 'system', content: String(system) })
+    messages.push({ role: 'user', content: String(prompt) })
+  }
 
   const t0 = Date.now()
   const ctl = new AbortController()
@@ -85,6 +89,8 @@ export async function chat({ prompt, system = null, maxTokens = 700, timeoutMs =
         max_tokens: maxTokens,
         // 这个网关（TokenRouter / vLLM 系）认 enable_thinking；不认的服务器会忽略这个字段
         ...(LLM.thinking ? {} : { enable_thinking: false }),
+        // 给 bot 用的函数调用：模型只能选工具和传参，不能自己写时间码
+        ...(tools && tools.length ? { tools, tool_choice: toolChoice || 'auto' } : {}),
       }),
       signal: ctl.signal,
     })
@@ -92,9 +98,13 @@ export async function chat({ prompt, system = null, maxTokens = 700, timeoutMs =
     const ms = Date.now() - t0
     if (!res.ok) return { ok: false, skipped: 'http-' + res.status, detail: text.slice(0, 200), ms }
     const j = JSON.parse(text)
-    const content = j.choices?.[0]?.message?.content || ''
-    if (!content.trim()) return { ok: false, skipped: 'empty', ms }
-    return { ok: true, content, ms, tokens: j.usage?.total_tokens ?? null, model: j.model || model || LLM.model }
+    const msg = j.choices?.[0]?.message || {}
+    const content = msg.content || ''
+    const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : []
+    const finishReason = j.choices?.[0]?.finish_reason || null
+    // 只调工具不回话是合法的一步（finish_reason=tool_calls），不能当空回复
+    if (!content.trim() && !toolCalls.length) return { ok: false, skipped: 'empty', ms, finishReason }
+    return { ok: true, content, toolCalls, finishReason, ms, tokens: j.usage?.total_tokens ?? null, model: j.model || model || LLM.model }
   } catch (err) {
     const ms = Date.now() - t0
     return { ok: false, skipped: err.name === 'AbortError' ? 'timeout' : 'unreachable', detail: String(err.message).slice(0, 160), ms }

@@ -1,5 +1,6 @@
 /** 本地服务：同一套 group/orchestrator，界面和 CLI 共用。 */
 import { createServer } from 'node:http'
+import { createReadStream, statSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, extname, resolve, relative, isAbsolute } from 'node:path'
@@ -171,7 +172,27 @@ const routes = [
     const target = resolve(g.dir, q.get('p') || '')
     if (!target.startsWith(g.dir)) return send(res, 403, { error: 'forbidden' })
     if (!existsSync(target)) return send(res, 404, { error: 'not found' })
-    send(res, 200, readFileSync(target), MIME[extname(target)] || 'application/octet-stream')
+    const type = MIME[extname(target)] || 'application/octet-stream'
+    // 播放器要 Range：整段返回时 Chrome 拿不到 moov/关键帧位置，进度条能拖、画面出不来
+    const size = statSync(target).size
+    const range = req.headers.range
+    if (range) {
+      const mm = /bytes=(\d*)-(\d*)/.exec(range)
+      const start = mm && mm[1] ? Number(mm[1]) : 0
+      const end = mm && mm[2] ? Math.min(Number(mm[2]), size - 1) : size - 1
+      if (start >= size || end < start) {
+        res.writeHead(416, { 'content-range': 'bytes */' + size })
+        return res.end()
+      }
+      res.writeHead(206, {
+        'content-type': type, 'accept-ranges': 'bytes',
+        'content-range': 'bytes ' + start + '-' + end + '/' + size,
+        'content-length': end - start + 1, 'cache-control': 'no-store',
+      })
+      return createReadStream(target, { start, end }).pipe(res)
+    }
+    res.writeHead(200, { 'content-type': type, 'accept-ranges': 'bytes', 'content-length': size, 'cache-control': 'no-store' })
+    createReadStream(target).pipe(res)
   }],
 ]
 

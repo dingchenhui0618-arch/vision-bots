@@ -1,21 +1,24 @@
 /**
- * 编排：制片人只听用户，派活给谁由阶段决定；每个 bot 干完在自己的群里说话。
- * 模型只做判断和措辞，不碰时间码——所有数字来自管线。
+ * 编排：用户只跟制片人说话；制片人自己看项目、派活、验收、交付。
+ *
+ * 这一层只做三件事：
+ *   1. 状态机（要素材、等确认、跑着、已交付）——规则，不确定的事不交给模型
+ *   2. 把「自然语言 → 结构化动作」里稳定的部分做掉（改一句的解析）
+ *   3. 硬门兜底：模型忘了验收、忘了报差额，规则补一条系统提示，不静默
+ *
+ * bot 说的每句话都来自模型（Director → runAgent）；模板句只允许走 group.note。
  */
-import { Runner } from './runner.mjs'
-import { runCut } from '../handlers/cut.mjs'
-import { runPack } from '../handlers/pack.mjs'
-import { runQc } from '../handlers/qc.mjs'
+import { Director } from '../agent/director.mjs'
 import { TEMPLATES, templateById, specOf, ratiosOf } from '../bots/roster.mjs'
-import { parseEdit, locate, applyEdit, assertUntouched, loadPipeline, loadScene, savePipeline } from '../revise.mjs'
-import { buildCaptions } from '../captions.mjs'
+import { parseEdit } from '../revise.mjs'
 import { TARGET_TOLERANCE } from '../qa.mjs'
-import { understand, whyText, templateLine, PLATFORMS } from '../brief.mjs'
+import { understand, templateLine, PLATFORMS } from '../brief.mjs'
 
 export class Orchestrator {
   constructor(group) {
     this.group = group
-    this.runner = new Runner(group)
+    this.state = {}
+    this.director = null
   }
 
   /** 用户在群里说一句话；带素材就会一起进来。 */
@@ -36,11 +39,11 @@ export class Orchestrator {
     const assets = this.group.meta.assets || []
     const hasBrief = Boolean(String(text || '').trim())
     if (!assets.length) {
-      this.group.say('producer', '素材呢？把口播视频拖进群里。\n有稿子一起给，没有也行，我让剪辑直接听。')
+      this.group.note('素材还没进来。把口播视频拖进群，有稿子一起给，没有也行。')
       return { phase: 'intake', waiting: 'assets' }
     }
     if (!hasBrief) {
-      this.group.say('producer', '素材收到了。\n想要什么：平台、大概多长、有没有稿子。一句话说完就行。')
+      this.group.note('素材收到了。还差一句需求：平台、大概多长、有没有稿子。')
       return { phase: 'intake', waiting: 'brief' }
     }
 
@@ -60,7 +63,7 @@ export class Orchestrator {
         id: 'brief',
         title: '开工确认',
         subtitle: `素材 ${assets.map(a => a.split(/[\\/]/).pop()).join('、')}，按这张卡开始`,
-        why: whyText(brief),
+        why: u.why || null,
         fields: [
           { key: 'platform', label: '平台', value: brief.platform, options: PLATFORMS },
           { key: 'ratio', label: '画幅', value: ratioText, options: ratiosOf(tpl) },
@@ -72,35 +75,25 @@ export class Orchestrator {
       },
     })
     this.group.setPhase('confirm')
-    this.group.say('producer', this.briefSpeech(brief, u.meta, spec, tpl))
+
+    // 这段必须由它自己说：模型读岔了、替用户定了什么，都得从它嘴里出来
+    const d = new Director(this.group, { brief, state: {} })
+    await d.utter('producer', briefTask(brief, u.meta, spec, tpl), {
+      platform: brief.platform, duration: brief.duration, width: spec.width, height: spec.height,
+      unsupported: spec.unsupported, asked: spec.asked, assumed: brief.assumed, corrected: brief.corrected,
+      modelSkipped: u.meta && u.meta.skipped !== 'off' ? (u.meta.skipped || null) : null,
+    })
     return { phase: 'confirm', brief }
   }
 
-  /**
-   * 把「我怎么读的、哪个模板为什么、哪些是我替他定的」说清楚。
-   * 模型没接上要直说——不能拿规则填的卡冒充听懂了。
-   */
-  briefSpeech(brief, meta, spec, tpl) {
-    const lines = [`我按你说的填好了：${brief.platform} · ${spec.ratio} · ${brief.duration}s · ${tpl ? tpl.name : brief.template}。`]
-    if (spec.unsupported) lines.push(`你问 ${spec.asked}，${tpl.name} 没做这个画幅，这条按 ${spec.ratio} 出；要 ${spec.asked} 我另排一版布局，时间线不用重剪。`)
-    lines.push(templateLine(brief))
-    if (brief.assumed && brief.assumed.length) lines.push('我替你定的：' + brief.assumed.join('、') + '。')
-    if (brief.corrected && brief.corrected.length) {
-      const show = brief.corrected.slice(0, 2).join('；')
-      lines.push('模型读岔了，我按你的原话算：' + show + (brief.corrected.length > 2 ? ` 等 ${brief.corrected.length} 处` : '') + '。')
-    }
-    if (meta && meta.skipped && meta.skipped !== 'off') lines.push(`（模型没接上：${meta.skipped}，这版是规则填的）`)
-    lines.push('看一眼，没问题就点开始。')
-    return lines.join('\n')
-  }
-
   async awaitConfirm(text) {
-    if (/^开始|确认|开工|go/i.test(String(text || '').trim())) return this.confirm({})
-    this.group.say('producer', '卡在上面，改哪个字段直接说，或者说「开始」。')
-    return { phase: 'confirm' }
+    const s = String(text || '').trim()
+    if (/^开始|确认|开工|go/i.test(s)) return this.confirm({})
+    // 「先去改改」这类：让它按用户的原话重新读一遍字段
+    return this.intake(s + '（用户在看确认卡，要改字段）')
   }
 
-  /** 确认卡落地 → 定 Goal → 派活。 */
+  /** 确认卡落地 → 定 Goal → 派活。派活顺序由制片人自己定，阶段只用来兜底。 */
   async confirm(values = {}) {
     const brief = { ...(this.group.meta.brief || {}), ...cleanValues(values) }
     if (!brief.template) brief.template = 'subtitle-only'
@@ -111,49 +104,37 @@ export class Orchestrator {
     const tpl = templateById(brief.template)
     const spec = specOf(tpl, brief.ratio)
     if (spec.unsupported) {
-      this.group.say('producer', `${tpl.name} 还没做 ${spec.asked}，这条按 ${spec.ratio} 出。\n要 ${spec.asked} 我另排一版布局，时间线不用重剪。`)
       brief.ratio = spec.ratio
+      this.group.note(tpl.name + ' 还没做 ' + spec.asked + '，这条按 ' + spec.ratio + ' 出。要 ' + spec.asked + ' 得另排一版布局，时间线不用重剪。')
     }
-    this.group.say('producer',
-      `定了。\n目标：${brief.platform}，${brief.duration}s，${tpl ? tpl.name + '（' + spec.ratio + '，' + spec.width + '×' + spec.height + '）' : brief.template}，${brief.hasScript ? '按稿' : '没稿直接口播'}。\n阶段：剪辑 → 包装 → 质检 → 交付。${brief.hasScript ? '' : '没有稿子，我让剪辑直接听素材，不给你排逐字稿校对。'}`)
     this.group.emit({ type: 'goal', goal: { platform: brief.platform, ratio: spec.ratio, duration: brief.duration, template: brief.template, stages: ['剪辑', '包装', '质检', '交付'] } })
+    this.group.note(`开工。目标 ${brief.platform} · ${spec.ratio} · ${brief.duration}s · ${tpl ? tpl.name : brief.template} · ${brief.hasScript ? '按稿' : '没稿直接口播'}。`)
 
     await this.dispatch(brief)
     return { phase: this.group.meta.phase, brief }
   }
 
+  /** 派活：不是按固定顺序调三个 handler，是让制片人自己决定派给谁、验收不过再派一次 */
   async dispatch(brief) {
-    const state = {}
+    this.state = {}
+    const d = new Director(this.group, { brief, state: this.state })
+    this.director = d
     try {
       this.group.setPhase('cutting')
-      await this.runner.run({ bot: 'cutter', title: '转写与剪辑决策', run: ctx => runCut({ ...ctx, brief, state }) })
+      const r = await d.producerTurn(dispatchTask(brief, this.group))
 
-      // 主 bot 的验收职责：先核对目标能不能达到，再决定让不让下游开工
-      const target = Number(brief.duration) || 0
-      const actual = state.plan.outDuration
-      let effectiveTarget = target
-      if (target && Math.abs(actual - target) > target * TARGET_TOLERANCE) {
-        effectiveTarget = 0
-        const short = actual < target
-        this.group.say('producer', short
-          ? `到不了 ${target}s。素材 ${state.source.duration.toFixed(1)}s，剪完 ${actual.toFixed(1)}s，差 ${(target - actual).toFixed(1)}s。\n要凑到 ${target}s 得把语速压到 ${(state.plan.keptSeconds / target).toFixed(2)}×，声音会发闷，我不做这个决定。这条按 ${actual.toFixed(1)}s 交；你补素材我重剪，不额外收费也不占你时间。`
-          : `超了 ${target}s，现在是 ${actual.toFixed(1)}s。\n平台对超时长的限流是真的，我再压一档还是就这样？先说清楚，我按你说的办。`)
-        brief.met = { target, actual, ok: false }
-      } else {
-        brief.met = { target, actual, ok: true }
+      // 硬门：模型忘了走完流程，规则把真实情况摆到群里，不许静默收工
+      if (!this.state.report) {
+        this.group.setPhase('blocked')
+        this.group.note('这轮没跑到质检，不算交付。要我按现状硬交，你说一声。')
+        return { phase: 'blocked', reason: 'no-qc', said: r.said }
       }
-
-      this.group.setPhase('packing')
-      await this.runner.run({ bot: 'packer', title: '出片', run: ctx => runPack({ ...ctx, brief, state }) })
-
-      this.group.setPhase('qc')
-      const job = await this.runner.run({ bot: 'qc', title: '质检', run: ctx => runQc({ ...ctx, brief: { ...brief, duration: effectiveTarget }, state }) })
-
-      await this.deliver(state, job)
+      await this.deliver(this.state)
+      return { phase: 'delivered', said: r.said, used: r.used }
     } catch (err) {
       const stuckAt = this.group.meta.phase
       this.group.setPhase('blocked')
-      this.group.say('producer', `卡在「${stuckAt}」：${err.message}。\n我看过再给你方案，不用你动手。`)
+      this.group.note('卡在「' + stuckAt + '」：' + err.message + '。我看过再给方案，不用你动手。')
       throw err
     }
   }
@@ -169,118 +150,93 @@ export class Orchestrator {
       { key: 'report', label: '质检报告', file: a.report },
       { key: 'audit', label: '抽帧', file: a.audit },
     ].filter(i => i.file)
-
     const report = state.report
-    const fix = state.fixReport
     this.group.emit({ type: 'deliver', items, report: report ? { passed: report.passed, checks: report.checks.length } : null })
-    this.group.say('producer',
-      `交付。\n` + items.map(i => `· ${i.label}：${i.file.split(/[\\/]/).pop()}`).join('\n') +
-      `\n封面和发布文案归包装和运营，这条先不占你时间。` +
-      `\n要改哪句直接说「把『划走』改成『溜走』」，我改完只重跑那一处。` +
-      (fix && fix.stats && fix.stats.changed ? `字幕里的错字改了 ${fix.stats.changed} 处，清单在错字清单里。` : '') +
-      (fix && fix.pending.length ? `还有 ${fix.pending.length} 个词我没把握，没动它，也在清单里——发布前扫一眼那几个字。` : '') +
-      (report && report.passed ? '质检全过。' : report ? `质检有 ${report.failed.length} 项没过，看报告。` : ''))
+
+    // 差额写进系统层：模型说不说是它的事，事实在这里，藏不住
+    const brief = this.group.meta.brief || {}
+    const target = Number(brief.duration) || 0
+    const actual = state.plan ? Number(state.plan.outDuration) : null
+    if (target && actual && Math.abs(actual - target) > target * TARGET_TOLERANCE) {
+      this.group.note(`目标 ${target}s，成片 ${actual.toFixed(1)}s，差 ${Math.abs(actual - target).toFixed(1)}s。`)
+    }
+    if (report && !report.passed) {
+      this.group.note('质检 ' + report.checks.length + ' 项里有 ' + report.checks.filter(c => !c.ok).length + ' 项没过，逐项在报告里。')
+    }
     this.group.setPhase('delivered')
   }
 
   /**
-   * 交付之后说一句改动：变成 scene 的改动，只重渲那一处。
-   * 只改字的文本，词数和时间码由 revise.mjs 内部断言；渲染走模板的分段缓存。
+   * 交付之后说一句改动。
+   * 解析「把X改成Y」用规则（稳定、快），改字和重出用管线，说的话由模型说。
    */
   async revise(text) {
     const s = String(text || '').trim()
-    const pipe = loadPipeline(this.group)
-    if (!pipe) {
-      this.group.say('producer', '这条没有可改的时间线（剪辑那一步没留下状态）。\n素材再拖进来，我整条重走一遍。')
-      return { phase: this.group.meta.phase, error: 'no-pipeline' }
-    }
+    const d = new Director(this.group, { brief: this.group.meta.brief || {}, state: this.state })
+    this.director = d
     const parsed = parseEdit(s)
     if (!parsed) {
-      const scene = loadScene(this.group) || { bigs: [] }
-      const list = (scene.bigs || []).map(b => '· 第 ' + b.index + ' 章（' + b.f0 + '–' + b.f1 + 's）：' + b.text).join('\n')
-      this.group.say('producer', '改哪句？照这个样子说，我改完只重跑那一处：\n把「划走」改成「溜走」' + (list ? '\n\n现在是这 ' + scene.bigs.length + ' 章：\n' + list : ''))
+      const pipeNote = '要改哪句这么说：把「划走」改成「溜走」，我改完只重跑那一处。'
+      this.group.note(pipeNote)
       return { phase: 'delivered', ask: 'edit' }
     }
+
     if (parsed.kind === 'rerun') {
-      this.group.say('producer', '重跑。没改字的话画面一帧都不会变，直接复用母版。')
-      return this.repack(pipe, '重跑')
+      const r = await d.repack('重跑')
+      await d.utter('producer', '用户没改字，只让你重跑一版。你已经让包装重出、质检复查过了，把结果告诉他：画面变没变、渲染多少秒、质检几项过。一两个短句。', { reason: '重跑', packer: r.packer, qc: r.qc, qcOk: r.qcOk })
+      return { phase: this.group.meta.phase, reason: 'rerun', said: r }
     }
 
-    const scene = loadScene(this.group)
-    const located = locate(pipe.transcript.words, parsed.from, { plan: pipe.plan, scene, chapter: parsed.chapter })
-    if (!located.ok) {
-      this.group.say('producer', located.reason + '。' + (located.hint ? '\n' + located.hint : '') + '\n时间线一个字没动。')
-      return { phase: 'delivered', error: 'not-found' }
+    const edited = await d.revise({ from: parsed.from, to: parsed.to, chapter: parsed.chapter || null })
+    if (!edited.ok) {
+      await d.utter('producer', '用户要改一句，但改不成：' + edited.error + (edited.hint ? '（' + edited.hint + '）' : '') + '。如实告诉他，别自己编原因，也别动时间线。两三句。', { from: parsed.from, to: parsed.to, ok: false })
+      return { phase: this.group.meta.phase, error: edited.error }
     }
-
-    let edit
-    try {
-      edit = applyEdit({ words: pipe.transcript.words, segments: pipe.transcript.segments, match: located.match, to: parsed.to })
-      assertUntouched(pipe.transcript.words, edit.words, { changed: edit.changed })
-    } catch (err) {
-      this.group.say('producer', '这句我不敢改：' + err.message + '\n时间码是剪辑定的，不会为了改字动它。')
-      return { phase: 'delivered', error: 'unsafe-edit' }
-    }
-
-    const brief = pipe.brief || {}
-    const next = {
-      ...pipe,
-      transcript: { ...pipe.transcript, words: edit.words, segments: edit.segments },
-      captions: buildCaptions(edit.words, pipe.plan, { maxChars: brief.maxChars || 14 }),
-    }
-    savePipeline(this.group, next)
-
-    const m = located.match
-    const show = t => String(t).replace(/[，。！？、；：,.!?;:…—~·\s]+$/u, '')
-    const where = (m.chapter ? '第 ' + m.chapter + ' 章' : '') + (m.film !== null ? '（' + m.film + 's）' : '')
-    this.group.say('producer',
-      where + '那句：' + edit.changed.map(c => '「' + show(c.from) + '」→「' + show(c.to) + '」').join('、') +
-      '。\n只动了 ' + edit.changed.length + ' 个词，词数和每个词的起止时间码都没动——时间线是剪辑定的，那句话改不了它。\n包装按改动重出，只重渲这一处。')
-
-    return this.repack(next, '改一句')
-  }
-
-  /** 用同一份时间线重出：画面没变就复用母版，变了就只重渲变化的那一段。 */
-  async repack(pipe, reason) {
-    const brief = pipe.brief || {}
-    // 字幕从词表重算：断句/断行规则改过之后，旧卡片就是错的（stale 的派生物不能当源头）
-    const captions = buildCaptions(pipe.transcript.words, pipe.plan, { maxChars: brief.maxChars || 14 })
-    const state = {
-      transcript: pipe.transcript,
-      plan: pipe.plan,
-      captions,
-      fixReport: pipe.fixReport || null,
-      source: pipe.source || null,
-    }
-    try {
-      this.group.setPhase('packing')
-      await this.runner.run({ bot: 'packer', title: reason + ' · 重出', run: ctx => runPack({ ...ctx, brief, state }) })
-      this.group.setPhase('qc')
-      await this.runner.run({ bot: 'qc', title: reason + ' · 重检', run: ctx => runQc({ ...ctx, brief: qcBrief(brief, pipe.plan), state }) })
-      await this.deliver(state)
-      return { phase: 'delivered', reason, decision: state.decision || null }
-    } catch (err) {
-      this.group.setPhase('blocked')
-      this.group.say('producer', '重出卡住了：' + err.message + '\n我看过再给你方案，不用你动手。')
-      throw err
-    }
+    this.state = d.state
+    const r = await d.repack('改一句')
+    await d.utter('producer', [
+      '用户这句话你已经改完了：把「' + parsed.from + '」改成「' + parsed.to + '」。',
+      '改了 ' + edited.changed + ' 个词，词数 ' + edited.words + ' 没变，每个词的起止时间码一个没动。',
+      '包装已经按改动重出，质检也复查过了。',
+      '把结果告诉他：改了哪一处、只重渲了受影响的部分、质检几项过。三五句，不要复述时间码。',
+    ].join('\n'), { changed: edited.changed, words: edited.words, chapter: edited.chapter, filmSec: edited.filmSec, qc: r.qc, packer: r.packer })
+    return { phase: this.group.meta.phase, reason: '改一句', edited }
   }
 
   async busy() {
-    this.group.say('producer', '在跑，跑完我报。\n要改的话现在说，我记进这版。')
+    this.group.note('在跑，跑完我报。要改的话现在说，我记进这版。')
     return { phase: this.group.meta.phase }
   }
 }
 
-/**
- * 目标时长没达到时，质检不拿那个达不到的数字当标准（拍板过程在 dispatch 里写明）。
- * 这里按当前时间线重算一遍，不读存下来的 met——重出之后那字段可能是旧的。
- */
-function qcBrief(brief = {}, plan = null) {
-  const target = Number(brief.duration) || 0
-  const actual = plan ? Number(plan.outDuration) : null
-  const ok = !target || !actual ? true : Math.abs(actual - target) <= target * TARGET_TOLERANCE
-  return { ...brief, duration: ok ? target : 0 }
+/** 读到需求之后要它说的话：为什么是这个模板、替用户定了什么、模型读岔了什么 */
+function briefTask(brief, meta, spec, tpl) {
+  const L = [
+    '用户刚给了需求和素材，你已经读完了。现在要在群里跟他说清楚，然后让他点「开始」。',
+    '他的原话你自己组织，不要改他的意思。字段：平台 ' + brief.platform + '，时长 ' + brief.duration + 's，画幅 ' + spec.ratio + '（' + spec.width + '×' + spec.height + '），模板 ' + (tpl ? tpl.name : brief.template) + '，' + (brief.hasScript ? '有稿' : '没稿直接口播') + '。',
+  ]
+  const tl = templateLine(brief)
+  if (tl) L.push('模板理由可以提一句：' + tl)
+  if (brief.assumed && brief.assumed.length) L.push('你替他定了：' + brief.assumed.join('、') + '——要明说，别当成他说的。')
+  if (brief.corrected && brief.corrected.length) L.push('模型读岔了这几处，你按他的原话算：' + brief.corrected.slice(0, 3).join('；') + '——也要明说。')
+  if (meta && meta.skipped && meta.skipped !== 'off') L.push('注意：读需求那次模型没接上（' + meta.skipped + '），这些字段是规则填的，必须说清楚，不许装成 AI 读出来的。')
+  L.push('三到五句，说完让他确认。字段卡上已经有了，别复述清单。')
+  return L.join('\n')
+}
+
+/** 开工任务书：目标 + 验收标准 + 你自己的职责边界 */
+function dispatchTask(brief, group) {
+  const tpl = templateById(brief.template)
+  const spec = specOf(tpl, brief.ratio)
+  return [
+    '用户点了开始，现在按确认卡执行。',
+    '目标：' + brief.platform + '，' + brief.duration + 's，' + (tpl ? tpl.name : brief.template) + '（' + spec.ratio + '，' + spec.width + '×' + spec.height + '），' + (brief.hasScript ? '按稿' : '没稿直接口播'),
+    '流程是你派活：剪辑先干（转写对齐、错字、气口、字幕），包装再出片，质检最后查。质检没过你要决定返工还是如实交付。',
+    '验收标准：成片时长对得上目标（对不上就报差多少、代价是什么）；质检每一项都有证据；错字和低置信词如实报出来。',
+    '每一步都要你亲自派，不许跳过质检就交付。干完用 finish_delivery 交付。',
+    '同一件事最多派两次。对方明确说「做不到」，就别再派，改成如实报差额和代价——硬凑是错的。',
+    '特别记住：剪辑剪完多长，是素材决定的。质检如果说「时长短了」，那不是剪辑没干好，重剪只会更短。这种情况直接如实报差额，或者让用户补素材，不许把剪辑再派一遍。',
+  ].join('\n')
 }
 
 function cleanValues(v = {}) {

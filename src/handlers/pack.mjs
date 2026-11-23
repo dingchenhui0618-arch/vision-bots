@@ -18,7 +18,7 @@ async function loadTemplate(id) {
   return import(pathToFileURL(entry).href)
 }
 
-export async function runPack({ group, job, log, artifact, brief, state }) {
+export async function runPack({ group, job, log, artifact, brief, state, narrate = true }) {
   if (!state.plan) throw new Error('剪辑还没交时间线')
   const input = group.meta.assets[0]
   const tpl = templateById(group.meta.template) || templateById('subtitle-only')
@@ -26,7 +26,7 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
   const work = join(group.dir, 'work', job.id)
   if (spec.unsupported) {
     log('「' + tpl.name + '」没有 ' + brief.ratio + '，按 ' + spec.ratio + ' 出片')
-    group.say('packer', '「' + tpl.name + '」还没做 ' + brief.ratio + '，这条按 ' + spec.ratio + '（' + spec.width + '×' + spec.height + '）出。要 ' + brief.ratio + ' 我另排一版布局。', { job: job.id })
+    if (narrate) group.say('packer', '「' + tpl.name + '」还没做 ' + brief.ratio + '，这条按 ' + spec.ratio + '（' + spec.width + '×' + spec.height + '）出。要 ' + brief.ratio + ' 我另排一版布局。', { job: job.id })
   }
   mkdirSync(work, { recursive: true })
 
@@ -34,7 +34,7 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
   const builder = mod && (mod.buildPptBase || mod.build)
   if (!builder) {
     log('模板「' + tpl.name + '」没有渲染器，先用纯字幕出片')
-    group.say('packer', '「' + tpl.name + '」的引擎还没做，这条先按纯字幕出片，时间线不用动。', { job: job.id })
+    if (narrate) group.say('packer', '「' + tpl.name + '」的引擎还没做，这条先按纯字幕出片，时间线不用动。', { job: job.id })
   }
 
   let built = null
@@ -101,7 +101,7 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
   state.preview = preview
   state.renderSeconds = renderSeconds
 
-  group.say('packer',
+  if (narrate) group.say('packer',
     '出片了：' + tpl.name + '，' + spec.width + '×' + spec.height + '，' + state.plan.outDuration.toFixed(1) + 's，渲染 ' + renderSeconds.toFixed(1) + 's。' +
     (state.scene && state.scene.bigs ? '\n' + state.scene.bigs.length + ' 章大字，逐字落在音节上；光轨一条到底，音效跟着动作走。' : '') +
     (state.scene && state.scene.chapters ? '\n分 ' + state.scene.chapters.length + ' 章，小节标题取的是原话，没有改写。' : '') +
@@ -117,5 +117,17 @@ export async function runPack({ group, job, log, artifact, brief, state }) {
       : ''),
     { job: job.id })
 
-  return { video: out, preview, renderSeconds, engine }
+  const narrative = {
+    template: tpl.name, templateId: tpl.id,
+    width: spec.width, height: spec.height, ratio: spec.ratio,
+    outSec: Number(state.plan.outDuration.toFixed(1)),
+    renderSec: Number(renderSeconds.toFixed(1)),
+    encodeSec: state.encodeSeconds != null ? Number(Number(state.encodeSeconds).toFixed(1)) : null,
+    mode: state.decision ? state.decision.mode : 'full',
+    frames: state.scene ? state.scene.frames : null,
+    sections: state.scene && state.scene.sections ? state.scene.sections.length : null,
+    chapters: state.scene && state.scene.chapters ? state.scene.chapters.length : null,
+    engine,
+  }
+  return { video: out, preview, renderSeconds, engine, narrative }
 }

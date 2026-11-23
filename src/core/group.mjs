@@ -78,6 +78,12 @@ export class Group {
 
   user(text, extra = {}) { return this.emit({ type: 'user', text, ...extra }) }
 
+  /**
+   * 系统提示：状态机说的话（要素材、卡在哪、存盘成败）走这里。
+   * bot 的每一句话都必须来自模型——模板句不许冒充 bot 发言。
+   */
+  note(text, extra = {}) { return this.emit({ type: 'note', text: String(text), ...extra }) }
+
   addAssets(paths) {
     const added = []
     for (const src of paths) {

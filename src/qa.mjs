@@ -56,7 +56,7 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
 
   if (targetDuration) {
     const delta = duration - targetDuration
-    add('target', Math.abs(delta) <= targetDuration * TARGET_TOLERANCE, `目标 ${targetDuration}s，实际 ${duration.toFixed(2)}s（差 ${delta.toFixed(1)}s）`, { delta })
+    add('target', Math.abs(delta) <= targetDuration * TARGET_TOLERANCE, `目标 ${targetDuration}s，实际 ${duration.toFixed(2)}s（差 ${delta.toFixed(1)}s）`, { delta: Number(delta.toFixed(2)) })
   }
 
   if (audio) {

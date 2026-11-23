@@ -178,7 +178,7 @@ export async function reviewText({ words = [], captions = null, sections = [], b
   const { kept, dropped } = groundIssues({ issues: raw, cards, sections })
   const verified = await verifyHomophones({ issues: kept, words, terms: terms || { terms: [] } })
   const blocks = verified.filter(i => i.severity === 'block')
-  log('语义审读：模型报 ' + raw.length + ' 条，接地 ' + kept.length + ' 条，采信 ' + blocks.length + ' 条，丢弃 ' + dropped.length + ' 条')
+  log('语义审读：报了 ' + raw.length + ' 处，站得住 ' + kept.length + ' 处，采信 ' + blocks.length + ' 处' + (dropped.length ? '，另有 ' + dropped.length + ' 处引用对不上原文被退回' : ''))
 
   return {
     ok: true,

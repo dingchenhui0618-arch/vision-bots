@@ -126,6 +126,10 @@ function renderEvent(e) {
     return '<div class="card"><div class="card-head"><b>' + esc(e.card.title) + '</b><span>' + esc(e.card.subtitle || '') + '</span></div>' +
       '<div class="card-rows">' + rows + '</div>' + why + '<div class="card-actions">' + actions + '</div></div>'
   }
+  // 系统提示：状态机说的话。bot 的发言必须来自模型，这类消息不挂 bot 头像
+  if (e.type === 'note') {
+    return '<div class="line"><span class="st">·</span><span>' + esc(e.text) + '</span></div>'
+  }
   // 临时状态（「在读需求」这类）：同一个 bot 后面已经说话了就收起来，别留在时间线里
   if (e.type === 'progress') {
     if (e.transient && (state.group ? state.group.events : []).some(x => x.type === 'bot' && x.bot === e.bot && x.ts > e.ts)) return ''

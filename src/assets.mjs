@@ -272,7 +272,7 @@ export function botRoster() {
     order: b.order,
     role: b.role,
     voice: b.voice,
-    model: b.model,
+    model: b.model === 'same' ? '同一个模型 · 独立会话' : b.model,
     tools: b.tools || [],
     templates: (b.templates || []).map(id => {
       const t = TEMPLATES.find(x => x.id === id)
