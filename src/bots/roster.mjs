@@ -59,7 +59,7 @@ export const BOTS = [
     ],
     tools: ['render_film', 'describe_templates'],
     skills: ['frame-render', 'caption-card', 'cover-layout'],
-    templates: ['ppt-base', 'lighttrail', 'subtitle-only'],
+    templates: ['ppt-base', 'lighttrail', 'zheguang', 'subtitle-only'],
     outputs: ['scene.json', '成片'],
   },
   {
@@ -119,6 +119,17 @@ export const TEMPLATES = [
     ratios: { '3:4': { width: 1080, height: 1440 }, '9:16': { width: 1080, height: 1920 } },
     spec: { duration: [45, 90], fps: 30 },
     note: '逐帧渲染，词级锚点，密度高',
+  },
+  {
+    id: 'zheguang',
+    name: '折光',
+    bot: 'packer',
+    status: 'ready',
+    engine: 'canvas',
+    ratio: '9:16',
+    ratios: { '9:16': { width: 1080, height: 1920 }, '3:4': { width: 1080, height: 1440 } },
+    spec: { duration: [20, 90], fps: 30 },
+    note: '页码 HUD、六种版式轮换、图形块（标签墙/刻度卡/对勾卡/红条），密度最高',
   },
 ]
 

@@ -13,6 +13,8 @@ import { buildCaptions, toSRT } from '../captions.mjs'
 import { correct, loadTerms, hotwordPrompt, applyToSegments } from '../asr-fix.mjs'
 import { sectionsOf } from '../sections.mjs'
 import { titleSentences } from '../headlines.mjs'
+import { pageSkeleton } from '../pages.mjs'
+import { planPages } from '../shots.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
 
@@ -156,6 +158,20 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     group.emit({ type: 'progress', bot: 'cutter', text: '大字定了 ' + adopted.length + ' / ' + sents.length + ' 句（模型），其余按原文摘句', transient: true })
   }
 
+  // 分镜：这一段用哪种版式、章节名叫什么、要不要加图形块 —— 剪辑提案，规则校验（src/shots.mjs）。
+  // 只对画布模板做（有 big 布局的才算「有设计」），PPT 底座那种章节卡按契约用原话，不需要。
+  if (budget && captions.cards.length) {
+    group.emit({ type: 'progress', bot: 'cutter', text: '剪辑在排分镜：哪几秒让位给字、哪句做成全屏字卡…', transient: true })
+    const skel = pageSkeleton({ segments, plan, cards: captions.cards.map(c => ({ text: c.text, start: c.start, end: c.end })), duration: plan.outDuration, hotwords: (terms && terms.hotwords) || [] })
+    const sp = await planPages({ pages: skel, log })
+    state.shots = sp
+    brief.shots = sp
+    const used = sp.pages.filter(p => p.shot !== 'full').length
+    const blocks = sp.pages.filter(p => p.block).length
+    log('分镜落定：' + sp.pages.length + ' 页，' + used + ' 页换版式，图形块 ' + blocks + ' 个' + (sp.problems && sp.problems.length ? '；打回 ' + sp.problems.length + ' 条' : ''))
+    group.emit({ type: 'progress', bot: 'cutter', text: '分镜定了 ' + sp.pages.length + ' 页：' + used + ' 页换版式、' + blocks + ' 个图形块', transient: true })
+  }
+
   // 交付之后「改一句」要基于这一份：词、句、时间线、字幕卡全在，不用重跑转写。
   // 只存状态，不存媒体；素材路径还在 group.json 里，渲染时按它取帧。
   writeFileSync(join(group.dir, 'pipeline.json'), JSON.stringify({
@@ -168,6 +184,8 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     captions,
     transcript: { words, segments },
     fixReport,
+    shots: state.shots || null,
+    sentenceTitles: state.sentenceTitles || null,
   }), 'utf8')
 
   const fixed = fixReport.applied

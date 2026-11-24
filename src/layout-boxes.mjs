@@ -19,6 +19,47 @@ export function layoutBoxes({ scene, template }) {
   const SUB = L.sub || { bottom: Math.round(h * 0.12), size: 44, padX: 38, padY: 20 }
   const LABEL = L.label || { top: 44, side: 44 }
 
+  // ── 无光轨的模板（折光）：版式按 scene.shots 走，盒子按每段真实版式算 ──
+  if (!L.rail) {
+    const TY = template.type || {}
+    const SUB2 = {
+      bottom: (L.sub && L.sub.bottom) || 236,
+      size: TY.sub || 42,
+      padX: (L.sub && L.sub.padX) || 28,
+      padY: (L.sub && L.sub.padY) || 15,
+    }
+    const items = []
+    const shots = scene.shots || [{ f0: 0, f1: scene.duration, kind: 'full' }]
+    const shotAt = (t) => shots.find(s => t >= s.f0 && t < s.f1) || shots[0]
+    // 大字：按版式给不同的底边（和 film.js 的 bigBottom 一致）
+    for (const b of scene.bigs || []) {
+      const shot = shotAt(b.f0)
+      const lines = Math.max(1, (b.lines && b.lines.length) || 1)
+      const size = (b.lines && Math.max(...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))) ? Math.max(TY.bigMin || 62, Math.min(TY.big || 96, Math.floor((w - L.big.left - L.big.right) / Math.max(...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))))) : (TY.big || 96)
+      const bh = lines * size * ((L.big && L.big.lineGap) || 1.06)
+      const bottom = shot.kind === 'frame' ? h * 0.80 : shot.kind === 'corner' ? h * 0.50 : h * 0.71
+      const x = (L.big && L.big.left) || 62
+      const maxW = shot.kind === 'corner' ? w * 0.55 : w - x - ((L.big && L.big.right) || 150)
+      items.push({ tag: 'big', x, y: Math.round(bottom - bh), w: Math.round(maxW), h: Math.round(bh), t0: b.f0, t1: b.f1 })
+    }
+    // 字幕：和 film.js 同一个字宽公式
+    for (const s of scene.subs || []) {
+      const em = [...String(s.text)].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)
+      const pw = Math.min(w - 96, Math.round(em * SUB2.size + SUB2.padX * 2))
+      const ph = Math.round(SUB2.size * 1.28 + SUB2.padY * 2)
+      items.push({ tag: 'sub', x: Math.round((w - pw) / 2), y: Math.round(h - SUB2.bottom - ph), w: pw, h: ph, t0: s.f0, t1: s.f1 })
+    }
+    // 图形块：按种类给保守的整块范围
+    for (const b of scene.blocks || []) {
+      if (b.kind === 'check') items.push({ tag: 'block:check', x: 56, y: Math.round(h * 0.775) - 84, w: Math.min(w - 112, 620), h: 84, t0: b.f0, t1: b.f1 })
+      else if (b.kind === 'banner') items.push({ tag: 'block:banner', x: 0, y: Math.round(h * 0.42), w, h: Math.round(h * 0.16), t0: b.f0, t1: b.f1 })
+      else if (b.kind === 'gauge') items.push({ tag: 'block:gauge', x: w - 56 - 430, y: Math.round(h * 0.575), w: 430, h: 210, t0: b.f0, t1: b.f1 })
+      else if (b.kind === 'tagwall') items.push({ tag: 'block:tag', x: 0, y: Math.round(h * 0.10), w, h: Math.round(h * 0.62), t0: b.f0, t1: b.f1 })
+      else if (b.kind === 'avatar') items.push({ tag: 'block:avatar', x: 56, y: Math.round(h * 0.32), w: 560, h: 132, t0: b.f0, t1: b.f1 })
+    }
+    return { ok: true, items, layout: { mode: 'zheguang', bigBottom: Math.round(h * 0.71), subTop: Math.round(h - SUB2.bottom - 90), shots: shots.length } }
+  }
+
   // 轨道：和 film.js 同一套让位规则（有头部实测才让，没有就用模板值）
   const head = scene.person && scene.person.headBand && scene.person.headBand.ok ? scene.person.headBand : null
   const SUB_H = Math.round(SUB.size * 1.18) + SUB.padY * 2

@@ -77,6 +77,7 @@ export function ruleRatio(text) {
 
 export function ruleTemplate(text) {
   const s = String(text || '')
+  if (/折光/.test(s)) return 'zheguang'
   if (/光轨/.test(s)) return 'lighttrail'
   if (/ppt|PPT|底座/.test(s)) return 'ppt-base'
   return null

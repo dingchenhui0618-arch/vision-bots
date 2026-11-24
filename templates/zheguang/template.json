@@ -1,0 +1,163 @@
+{
+  "id": "zheguang",
+  "name": "折光",
+  "engine": "canvas",
+  "ratio": "9:16",
+  "ratios": [
+    "9:16",
+    "3:4"
+  ],
+  "spec": {
+    "fps": 30,
+    "duration": [
+      20,
+      90
+    ]
+  },
+  "palette": {
+    "void": "#0B0B0C",
+    "paper": "#F4F2EC",
+    "lime": "#D8FF3E",
+    "green": "#35E07A",
+    "yellow": "#F5E13C",
+    "red": "#E23A2C",
+    "ash": "#8C8B85"
+  },
+  "type": {
+    "brand": 21,
+    "page": 22,
+    "eyebrow": 21,
+    "chapterNum": 84,
+    "chapterTitle": 54,
+    "big": 96,
+    "bigMin": 62,
+    "sub": 42,
+    "subSmall": 34,
+    "block": 26,
+    "blockSmall": 20
+  },
+  "layouts": {
+    "9:16": {
+      "size": [
+        1080,
+        1920
+      ],
+      "margin": 56,
+      "hud": {
+        "y": 92,
+        "h": 42
+      },
+      "chapter": {
+        "y": 300,
+        "gap": 26
+      },
+      "big": {
+        "left": 62,
+        "right": 150,
+        "y": 0.46,
+        "lineGap": 1.06,
+        "maxLines": 3,
+        "lineChars": 7
+      },
+      "sub": {
+        "bottom": 236,
+        "padX": 28,
+        "padY": 15,
+        "radius": 14
+      },
+      "frame": {
+        "w": 0.46,
+        "y": 0.1
+      },
+      "corner": {
+        "w": 0.4,
+        "top": 0.1
+      },
+      "outro": {
+        "w": 0.46
+      },
+      "progress": {
+        "y": 1852,
+        "h": 2
+      },
+      "safe": {
+        "right": 150,
+        "bottom": 236
+      },
+      "band": {
+        "top": 0.62
+      },
+      "label": {
+        "top": 56,
+        "side": 56,
+        "footer": "top",
+        "inset": 56
+      }
+    },
+    "3:4": {
+      "size": [
+        1080,
+        1440
+      ],
+      "margin": 48,
+      "hud": {
+        "y": 74,
+        "h": 38
+      },
+      "chapter": {
+        "y": 232,
+        "gap": 22
+      },
+      "big": {
+        "left": 54,
+        "right": 120,
+        "y": 0.44,
+        "lineGap": 1.06,
+        "maxLines": 3,
+        "lineChars": 7
+      },
+      "sub": {
+        "bottom": 176,
+        "padX": 26,
+        "padY": 14,
+        "radius": 12
+      },
+      "frame": {
+        "w": 0.46,
+        "y": 0.09
+      },
+      "corner": {
+        "w": 0.4,
+        "top": 0.09
+      },
+      "outro": {
+        "w": 0.46
+      },
+      "progress": {
+        "y": 1388,
+        "h": 2
+      },
+      "safe": {
+        "right": 120,
+        "bottom": 176
+      },
+      "band": {
+        "top": 0.58
+      },
+      "label": {
+        "top": 44,
+        "side": 44,
+        "footer": "top",
+        "inset": 44
+      }
+    }
+  },
+  "notes": {
+    "chrome": "常驻三件：左上页码（P. 01 / 08）、右上品牌胶囊（● 主题 + 时间码）、底部细进度线。和参考片同构，不加多余装饰。",
+    "big": "大字是语义强调卡，不是逐句字幕：一行一条、可逐行上屏；关键词用黄/荧光绿高亮或红底反白，字必须来自本页原话",
+    "sub": "底部字幕压在深色圆角块里，比正文小一号；关键词在同一行里换色，不改字",
+    "shot": "版式六种：满幅 / 竖框居中 / 右上小窗 / 全屏字卡 / 章节卡 / 结尾画中画；段落边界必换，页面内不再抖",
+    "safe": "9:16 右侧 150px、底部 236px 是平台 UI 安全区，页码与品牌都排在安全区内"
+  },
+  "note": "折光：页码 + 品牌胶囊 + 细进度线的 HUD，六种版式轮换，图形块（标签墙 / 刻度卡 / 药丸列表 / 对勾卡 / 名片卡 / 数据线 / 红条）压在实拍上"
+}

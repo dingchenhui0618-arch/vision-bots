@@ -3,7 +3,7 @@
  * 两种引擎：ffmpeg（ASS 烧字幕 / 构图）和 canvas（逐帧渲染，光轨）。
  */
 import { join } from 'node:path'
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { renderCut, renderStill } from '../render.mjs'
 import { toASS, toSRT } from '../captions.mjs'
@@ -18,7 +18,31 @@ async function loadTemplate(id) {
   return import(pathToFileURL(entry).href)
 }
 
+/**
+ * 进程重启、或者换一轮派人之后，state 是空的，但 pipeline.json 里有整条时间线。
+ * 以前这里直接抛「剪辑还没交时间线」，于是包装在续跑时永远读不到盘上的时间线
+ * （自测07 实测：同一个群里剪辑明明已经交了 66.9s，包装两次都报读不到）。
+ * 现在缺什么就从 pipeline.json 补什么；补不出来才算真没交。
+ */
+function hydrate(group, state, brief) {
+  if (state.plan && state.transcript && state.captions) return
+  const file = join(group.dir, 'pipeline.json')
+  if (!existsSync(file)) return
+  try {
+    const pipe = JSON.parse(readFileSync(file, 'utf8'))
+    if (!state.plan && pipe.plan) state.plan = pipe.plan
+    if (!state.transcript && pipe.transcript) state.transcript = pipe.transcript
+    if (!state.captions && pipe.captions) state.captions = pipe.captions
+    if (!state.shots && pipe.shots) state.shots = pipe.shots
+    if (!state.sentenceTitles && pipe.sentenceTitles) state.sentenceTitles = pipe.sentenceTitles
+    if (!state.fixReport && pipe.fixReport) state.fixReport = pipe.fixReport
+    if (!state.source && pipe.source) state.source = pipe.source
+    if ((!brief || !brief.shots) && pipe.brief && pipe.brief.shots) { brief.shots = pipe.brief.shots }
+  } catch { /* 盘上的时间线坏了就按真没交处理 */ }
+}
+
 export async function runPack({ group, job, log, artifact, brief, state, narrate = true }) {
+  hydrate(group, state, brief)
   if (!state.plan) throw new Error('剪辑还没交时间线')
   const input = group.meta.assets[0]
   const tpl = templateById(group.meta.template) || templateById('subtitle-only')
@@ -39,13 +63,15 @@ export async function runPack({ group, job, log, artifact, brief, state, narrate
 
   let built = null
   if (builder) {
-    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief: { ...brief, ratio: spec.ratio, sentenceTitles: state.sentenceTitles || brief.sentenceTitles || null }, spec, captions: state.captions })
+    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief: { ...brief, ratio: spec.ratio, sentenceTitles: state.sentenceTitles || brief.sentenceTitles || null, shots: state.shots || brief.shots || null }, spec, captions: state.captions, shots: state.shots || brief.shots || null })
     if (built.scene) {
       const scenePath = join(work, 'scene.json')
       writeFileSync(scenePath, JSON.stringify(built.scene, null, 2), 'utf8')
       artifact('scene', scenePath)
       state.scene = built.scene
-      log(tpl.name + '：' + (built.scene.bigs ? built.scene.bigs.length + ' 条大字' : (built.scene.chapters || []).length + ' 章') + '，' + (built.scene.ratio || spec.ratio) + ' ' + spec.width + '×' + spec.height)
+      log(tpl.name + '：' + (built.scene.bigs ? built.scene.bigs.length + ' 条大字' : (built.scene.chapters || []).length + ' 章') +
+      (built.scene.shots ? '、' + built.scene.shots.length + ' 段版式、' + (built.scene.blocks || []).length + ' 个图形块' : '') +
+      '，' + (built.scene.ratio || spec.ratio) + ' ' + spec.width + '×' + spec.height)
     }
   }
 
@@ -112,7 +138,7 @@ export async function runPack({ group, job, log, artifact, brief, state, narrate
 
   if (narrate) group.say('packer',
     '出片了：' + tpl.name + '，' + spec.width + '×' + spec.height + '，' + state.plan.outDuration.toFixed(1) + 's，渲染 ' + renderSeconds.toFixed(1) + 's。' +
-    (state.scene && state.scene.bigs ? '\n' + state.scene.bigs.length + ' 条大字，一句一条跟着口播换；光轨一条到底，音效跟着动作走。' : '') +
+    (state.scene && state.scene.bigs ? '\n' + state.scene.bigs.length + ' 条大字，一句一条跟着口播换。' + (tpl.id === 'lighttrail' ? '光轨一条到底，音效跟着动作走。' : tpl.id === 'zheguang' ? '版式 ' + (state.scene.shots ? state.scene.shots.length : 0) + ' 段、图形块 ' + (state.scene.blocks ? state.scene.blocks.length : 0) + ' 个、' + (state.scene.pages ? state.scene.pages.length : 0) + ' 页。' : '') : '') +
     (state.scene && state.scene.chapters ? '\n分 ' + state.scene.chapters.length + ' 章，小节标题取的是原话，没有改写。' : '') +
     (state.decision && state.decision.mode === 'patch'
       ? '\n只是改了那一处：' + state.decision.reason + '，其余帧从母版切出来拼回去，渲染 ' + renderSeconds.toFixed(1) + 's。'
