@@ -73,11 +73,17 @@ export async function createFilm({ media }) {
 
   // ── 段落大字的排版：先定行，再由字宽定字号，整句不截断 ──
   const BIGTYPES = S.bigs.map((b, bi) => {
-    let lineChars = BIG.lineChars
-    const parts = b.words && b.words.length ? b.words : [...b.text]
-    let lines = splitLines(parts, lineChars)
-    while (lines.length > BIG.maxLines && lineChars < 15) { lineChars += 1; lines = splitLines(parts, lineChars) }
-    fixLineStart(lines)
+    // 断行由数据层算好（src/segment.mjs，和 PPT 底座同一套规则）；没有才回落到本地切
+    let lines
+    if (Array.isArray(b.lines) && b.lines.length) {
+      lines = b.lines.slice()
+    } else {
+      let lineChars = BIG.lineChars
+      const parts = b.words && b.words.length ? b.words : [...b.text]
+      lines = splitLines(parts, lineChars)
+      while (lines.length > BIG.maxLines && lineChars < 15) { lineChars += 1; lines = splitLines(parts, lineChars) }
+      fixLineStart(lines)
+    }
     const cw = lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0))
     const longest = Math.max(1, ...cw)
     const availW = w - BIG.left - BIG.right

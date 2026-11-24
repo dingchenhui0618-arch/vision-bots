@@ -4,7 +4,7 @@
  */
 import { makeMapper } from '../../src/plan.mjs'
 import { mergeSentences, CHAPTER_MAX } from '../../src/chapters.mjs'
-import { segment } from '../../src/segment.mjs'
+import { segment, wrapWords } from '../../src/segment.mjs'
 // 段落推导和剪辑共用一份：剪辑给段落起标题、这里把标题画上屏，索引错一位大字就挂错段
 import { sentencesOf, sectionsOf, applyTitles } from '../../src/sections.mjs'
 
@@ -88,6 +88,16 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
   // 这里不做任何改写校验——校验在 section-titles.mjs 里做完，带 ok:false 的根本贴不进来。
   const titled = applyTitles(sectionsOf({ segments, plan }), brief.sectionTitles)
   const sections = titled.sections
+  // 大字断行在数据层算完，和 PPT 底座共用 src/segment.mjs 的规则：
+  // 刚好装下 + 各行均衡 + 末行太短从上一行借一个词 + 行首禁则。
+  // 渲染器不再自己按字数硬切——两套规则各切各的，实测切出过「会做内容的人 / 少」这种单字孤行。
+  const bigL = L.big || { lineChars: 6, maxLines: 2 }
+  const bigLines = (text) => {
+    let per = bigL.lineChars || 6
+    let out = wrapWords(text, per)
+    while (out.length > (bigL.maxLines || 2) && per < 15) { per += 1; out = wrapWords(text, per) }
+    return out
+  }
   const bigs = sections.map((sec) => ({
     index: sec.index,
     text: sec.text,
@@ -96,7 +106,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     f0: round(sec.start),
     // 大字挂到这一段结束为止，不按字数提前撤（早退会留下只闻其声、不见其字的空档）
     f1: round(sec.end),
-    lines: sec.lines,
+    lines: bigLines(sec.text),
   }))
 
   // ── 字幕：一句一张，压在底部 pill 里，逐句换；词级落点一起带上 ──
