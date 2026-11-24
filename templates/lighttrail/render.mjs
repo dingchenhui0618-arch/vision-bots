@@ -4,8 +4,10 @@
  *
  * 分段缓存：母版放在群目录的 cache/ 下，下次改一句只重渲那一章覆盖的帧，
  * 其余帧从母版里切出来无损拼回去（src/render-cache.mjs）。
+ *
+ * 每次起渲染器都过看门狗（src/watchdog.mjs）：无头 Chrome 真挂在第 1830 帧过，
+ * 进程在、日志不动，挂了 12 分钟。静默或产物不再长大就杀树重跑，不等人发现。
  */
-import { spawn } from 'node:child_process'
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, renameSync, rmSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -15,6 +17,7 @@ import { synthCues, peaksFromPCM } from '../../src/sfx.mjs'
 import { hashOf, planPatch, spliceMaster } from '../../src/render-cache.mjs'
 import { encodeFilm } from '../../src/encode-film.mjs'
 import { subjectBand, grabSourcePairs } from '../../src/frame-audit.mjs'
+import { runGuarded, STALL_MS } from '../../src/watchdog.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const RENDERER = join(HERE, '..', '..', 'vendor', 'lighttrail', 'tools', 'render.mjs')
@@ -23,11 +26,18 @@ const FILM = join(HERE, 'film.js')
 /** 渲染任意帧区间（闭区间）。patch 与整条渲染走同一条路，参数一模一样。 */
 export async function renderFrames({ work, mediaDir, size, fps, from, to, out, log = () => {} }) {
   const { fonts, chrome } = assertCanvasTools()
-  await run(process.execPath, [
-    RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
-    '--mode', 'frames', '--from', String(from), '--to', String(to), '--out', out,
-    '--size', size[0] + 'x' + size[1], '--samples', '4', '--fonts', fonts, '--chrome', chrome,
-  ], { log })
+  await runGuarded({
+    cmd: process.execPath,
+    args: [
+      RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
+      '--mode', 'frames', '--from', String(from), '--to', String(to), '--out', out,
+      '--size', size[0] + 'x' + size[1], '--samples', '4', '--fonts', fonts, '--chrome', chrome,
+    ],
+    label: '逐帧渲染 ' + from + '–' + to + '（' + (to - from + 1) + ' 帧）',
+    log, env: toolEnv(), stallMs: STALL_MS, retries: 1,
+    // 母版在长大就说明帧还在来；卡死时这一份是半截的，重跑前必须删掉
+    progressFiles: [out], clean: [out],
+  })
   return out
 }
 
@@ -70,11 +80,17 @@ export async function qaBoxes({ work, mediaDir, size, frames, fps, out, log = ()
 }
 
 function runQa(work, mediaDir, size, frames, fps, out, step, fonts, chrome, log) {
-  return run(process.execPath, [
-    RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
-    '--mode', 'qa', '--from', '0', '--to', String(frames - 1), '--q-step', String(step),
-    '--out', out, '--size', size[0] + 'x' + size[1], '--fonts', fonts, '--chrome', chrome,
-  ], { log })
+  // 采样每 0.4s 一帧打一行 JSON，没有进度日志；靠文件在长大判活，宽容度给到 3 分钟
+  return runGuarded({
+    cmd: process.execPath,
+    args: [
+      RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
+      '--mode', 'qa', '--from', '0', '--to', String(frames - 1), '--q-step', String(step),
+      '--out', out, '--size', size[0] + 'x' + size[1], '--fonts', fonts, '--chrome', chrome,
+    ],
+    label: '版式采样', log, env: toolEnv(), stallMs: Math.max(STALL_MS, 180_000), retries: 1,
+    progressFiles: [out], clean: [out],
+  })
 }
 
 export async function renderLighttrail({ input, plan, scene, work, out, log = () => {}, stills = null, force = false, cacheDir = null }) {
@@ -177,11 +193,16 @@ export async function renderLighttrail({ input, plan, scene, work, out, log = ()
   if (stills) {
     log('逐帧渲染静帧 ' + stills.length + ' 张（' + width + '×' + height + '@' + fps + '，光轨引擎）')
     const shotDir = join(work, 'stills')
-    await run(process.execPath, [
-      RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
-      '--mode', 'stills', '--stills', stills.map(Number).join(','), '--out-dir', shotDir,
-      '--size', width + 'x' + height, '--samples', '4', '--fonts', fonts, '--chrome', chrome,
-    ], { log })
+    await runGuarded({
+      cmd: process.execPath,
+      args: [
+        RENDERER, '--film', FILM, '--project', work, '--media', mediaDir,
+        '--mode', 'stills', '--stills', stills.map(Number).join(','), '--out-dir', shotDir,
+        '--size', width + 'x' + height, '--samples', '4', '--fonts', fonts, '--chrome', chrome,
+      ],
+      label: '静帧渲染 ' + stills.length + ' 张', log, env: toolEnv(),
+      stallMs: Math.max(STALL_MS, 180_000), retries: 1,
+    })
     renderSeconds = (Date.now() - tRender) / 1000
     log('静帧完成：' + renderSeconds.toFixed(1) + 's')
     return { stills: shotDir, renderSeconds, frames: scene.frames, decision }
@@ -271,15 +292,7 @@ function audioGraph(plan) {
   return parts.join(';')
 }
 
-export function run(cmd, args, { log = () => {} } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LIGHTTRAIL_FFMPEG: FFMPEG } })
-    let err = ''
-    p.stdout.on('data', (d) => {
-      for (const line of d.toString().split(/\r?\n/)) if (line.trim()) log('  ' + line.trim())
-    })
-    p.stderr.on('data', (d) => { err += d.toString() })
-    p.on('error', reject)
-    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(err.trim().slice(-600) || (cmd + ' 退出 ' + code)))))
-  })
+/** 渲染器自己找 ffmpeg：本机 ffmpeg 不在 PATH 上，每次起子进程都得把路径带过去。 */
+function toolEnv() {
+  return { ...process.env, LIGHTTRAIL_FFMPEG: FFMPEG }
 }
