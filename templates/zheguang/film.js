@@ -125,15 +125,17 @@ export async function createFilm({ media }) {
       // 小窗/竖框页的底本来就是压暗的实拍，再叠顶/底压光只会越压越黑
       // （自测08 里三成画面近黑，一半原因在这儿）。只保一条给字幕用的底光。
       const wash = c.createLinearGradient(0, h * 0.62, 0, h)
-      wash.addColorStop(0, R(P.void, 0)); wash.addColorStop(1, R(P.void, 0.42))
+      wash.addColorStop(0, R(P.void, 0)); wash.addColorStop(1, R(P.void, 0.20))
       c.fillStyle = wash; c.fillRect(0, h * 0.62, w, h * 0.38)
       return
     }
+    // 压光原本是「字要压得住」——但自测17 量出来压过头了：同一条素材，参考片把 130.7 压到 114.3
+    // （−13%），我们压到 94.6（−28%），成片整体发闷。字有阴影、字幕有黑底 pill，不需要把下半屏压黑。
     const top = c.createLinearGradient(0, 0, 0, h * 0.22)
-    top.addColorStop(0, R(P.void, 0.55)); top.addColorStop(1, R(P.void, 0))
+    top.addColorStop(0, R(P.void, 0.22)); top.addColorStop(1, R(P.void, 0))
     c.fillStyle = top; c.fillRect(0, 0, w, h * 0.22)
     const bot = c.createLinearGradient(0, h * 0.52, 0, h)
-    bot.addColorStop(0, R(P.void, 0)); bot.addColorStop(0.55, R(P.void, 0.38)); bot.addColorStop(1, R(P.void, 0.72))
+    bot.addColorStop(0, R(P.void, 0)); bot.addColorStop(0.55, R(P.void, 0.10)); bot.addColorStop(1, R(P.void, 0.30))
     c.fillStyle = bot; c.fillRect(0, h * 0.52, w, h * 0.48)
   }
 
@@ -143,60 +145,13 @@ export async function createFilm({ media }) {
     cornerTicks(c, M, Math.round(h * 0.085), w - M * 2, Math.round(h * 0.50), 22, R(P.paper, 0.22), 2)
   }
 
-  /**
-   * 背景巨字：参考片开场那半个出画的「技术」。满幅页 0.10–0.50h 这块一直是空的，
-   * 折光在那儿压一层巨大的半出画字当底纹。字只取这一条大字自己的关键词，不新增任何内容；
-   * 透明度压到 0.10，每页只出一条，当纹理不当信息（所以不进质检盒子统计，见 docs/WHY.md）。
-   */
-  let SEG = null
-  /** 巨字取哪个词：优先大字的高亮词，否则这一行里最长的 2–3 字词块。
-   *  用浏览器自带的 Intl.Segmenter（和 src/segment.mjs 同一套 ICU 分词），不另引依赖，
-   *  也不许自己按字数硬截——截出来会是「一周的」这种半句。 */
-  function bleedWord(b) {
-    const hot = bare(b.hot || '')
-    if (hot.length >= 2) return [...hot].slice(0, 3).join('')
-    const line = bare((b.lines && b.lines[0]) || b.text || '')
-    if (!line) return ''
-    try {
-      if (!SEG) SEG = new Intl.Segmenter('zh', { granularity: 'word' })
-      const ws = [...SEG.segment(line)].map(x => x.segment).filter(x => /^[\u4e00-\u9fa5]{2,3}$/.test(x))
-      if (ws.length) return ws.sort((a, c) => c.length - a.length || line.indexOf(a) - line.indexOf(c))[0]
-    } catch (e) { /* 没有 ICU 就算了 */ }
-    return ''
-  }
-
-  function backWord(c, t, shot) {
-    if (shot.kind !== 'full') return
-    const b = (S.bigs || []).find(x => t >= x.f0 && t < x.f1)
-    if (!b) return
-    const page = pageAt(t)
-    if (!page || t < page.start + 1.6) return
-    // 每页只出一次（参考片也是开场压一次巨字，不是每条大字都压）。
-    // 试过每条大字都压：满屏都在渗字，读起来像糊了一层。
-    if ((S.bigs || []).some(x => x.page === b.page && x.f0 < b.f0 - 0.01)) return
-    const word = bleedWord(b)
-    if (word.length < 2) return
-    const k = E.outCubic(clamp(seg(t, b.f0, b.f0 + 0.55)))
-    if (k <= 0.01) return
-    const size = Math.round(w * (word.length >= 3 ? 0.26 : 0.34))
-    c.save()
-    c.globalAlpha *= k
-    c.font = font(size, F.sans, 900)
-    c.textAlign = 'left'
-    c.textBaseline = 'middle'
-    // 深灰单色、不加描边：参考片的巨字是「压在墙上的暗字」，不是发光的水印。
-    // 加过一版描边，1080 宽上直接糊成几块灰砖，比不画还脏。
-    // 位置压到 0.20h：抬到 0.155h 会迎头撞上右上角那枚品牌胶囊。
-    c.fillStyle = R(P.void, 0.20)
-    c.fillText(word, w * 0.46, h * 0.20 + (1 - k) * 22)
-    c.restore()
-  }
-
   // ───────── HUD：页码 / 品牌胶囊 / 进度线 ─────────
+  // mm:ss。以前是 hh:mm:ff，2 秒处显示「00:02:00」——观众读成两分钟。
+  // 参考片右上角是「· 26s」，只给分秒。帧号对观众没有意义，去掉。
   function timecode(t) {
-    const fr = Math.floor(t * FPS)
+    const s = Math.floor(t)
     const p = n => String(n).padStart(2, '0')
-    return p(Math.floor(fr / (FPS * 60))) + ':' + p(Math.floor(fr / FPS) % 60) + ':' + p(fr % FPS)
+    return p(Math.floor(s / 60)) + ':' + p(s % 60)
   }
 
   function chrome(c, t, dark = false) {
@@ -637,12 +592,34 @@ export async function createFilm({ media }) {
   }
 
   // ───────── 全屏字卡 / 结尾画中画 ─────────
-  function cardShot(c, t, shot) {
-    const b = (S.bigs || []).find(x => t >= x.f0 && t < x.f1)
+  function cardShot(c, t, shot, img) {
+    // 字卡的正文要撑满整个卡片时长：自测16 的 50.0–53.3s 那张卡里两条大字之间有空档，
+    // 空档处按「此刻有没有大字」取文本会取到空串——以前整屏荧光绿把这件事盖住了，
+    // 改成暗底之后就是一秒黑屏。这里改成取卡片窗口内的第一条/当前条大字。
+    const win = (S.bigs || []).filter(x => x.f1 > shot.f0 + 0.01 && x.f0 < shot.f1 - 0.01)
+    const b = win.find(x => t >= x.f0 && t < x.f1) || win[0] || null
     const page = pageAt(t)
-    c.fillStyle = R(P.lime, 1)
-    c.fillRect(0, 0, w, h)
-    cornerTicks(c, M, M, w - M * 2, h - M * 2, 26, R(P.void, 0.30), 3)
+    // 字卡是「让画面停下来听一句话」，不是整屏刷荧光绿。
+    // 自测16 量出来全片强调色占 9.29%、参考片只有 0.97%——99.4% 的那些帧全来自两张整屏绿卡，
+    // 它们同时是全片最亮的帧（Y=229，全片平均 106），把亮度波动拉到参考片的 1.49×。
+    // 改成暗底 + 纸白大字 + 一个绿词：强调色回到参考片的量级，也不再一屏闪白。
+    // 底色不用纯黑：把这一帧的本人压暗、虚化当底纹。纯黑卡片一下把全片平均亮度砸掉 19 级
+    // （106 → 86.8），而且 2–3 秒的黑屏在时间线上是「画面死了」；参考片的字卡背后始终还是这个人。
+    if (img && img.width) {
+      c.save()
+      // 0.40 是量出来的下限：调到 0.55 时字卡上的白字压在虚化后的人脸上只有 1.03:1（质检 32s 抓到）
+      c.filter = 'blur(24px) brightness(0.40) saturate(0.6)'
+      const s = Math.max(w / img.width, h / img.height) * 1.18
+      const dw = img.width * s, dh = img.height * s
+      c.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh)
+      c.restore()
+      c.fillStyle = R(P.void, 0.40)
+      c.fillRect(0, 0, w, h)
+    } else {
+      c.fillStyle = R(P.void, 1)
+      c.fillRect(0, 0, w, h)
+    }
+    cornerTicks(c, M, M, w - M * 2, h - M * 2, 26, R(P.paper, 0.20), 3)
     const text = b ? b.text : (page && page.title) || ''
     if (!text) return
     const lines = (b && b.lines && b.lines.length) ? b.lines : [text]
@@ -651,18 +628,24 @@ export async function createFilm({ media }) {
     const top = (h - lines.length * lh) / 2 - 40
     c.save()
     // 小字眉用页面标题（原话摘的），不是编出来的英文
+    // 小字眉和正文是同一句话时不画（自测16 的 32s 那屏上写了「知道的人会做的人」两遍，
+  // 看着像渲染重了）。
     const eye = page && page.title ? page.title : 'WHY'
-    txt(c, eye, M, top - 52, { size: TY.eyebrow + 2, family: F.disp, weight: 700, color: R(P.void, 0.52), spacing: 4 })
-    line(c, M, top - 34, M + 56, top - 34, R(P.void, 0.35), 3)
+    const dupEye = bare(eye).includes(bare(text)) || bare(text).includes(bare(eye))
+    if (!dupEye) {
+      txt(c, eye, M, top - 52, { size: TY.eyebrow + 2, family: F.disp, weight: 700, color: R(P.lime, 0.85), spacing: 4 })
+      line(c, M, top - 34, M + 56, top - 34, R(P.lime, 0.5), 3)
+    }
     c.textBaseline = 'alphabetic'
     lines.forEach((ln, i) => {
       const at = (b ? b.f0 : t) + i * 0.12
       const k = E.outExpo(clamp(seg(t, at, at + 0.40)))
       c.globalAlpha = k
-      c.fillStyle = R(P.void, 1)
-      c.font = font(size, F.sans, 900)
-      c.fillText(ln, M + (1 - k) * size * 0.12, top + i * lh + size * 0.88)
+      // 沿用大字的强调规则：一个词进荧光绿/红底，其余纸白；字卡不再整屏上色
+      drawRuns(c, ln, M + (1 - k) * size * 0.12, top + i * lh + size * 0.88, size, b ? b.style : 'plain', b ? b.hot : '', false)
     })
+    // 一条短绿线压住正文：卡片上除了大字什么都没有，空得像没画完（自测16 对比抽帧看到的）
+    line(c, M, top + lines.length * lh + 22, M + 74, top + lines.length * lh + 22, R(P.lime, 0.92), 4)
     c.restore()
     reg(M, top - 60, w - M * 2, lh * lines.length + 80, 'big')
   }
@@ -685,11 +668,10 @@ export async function createFilm({ media }) {
       const img = media.frame('person', srcIdx(f))
       c.fillStyle = R(P.void, 1)
       c.fillRect(0, 0, w, h)
-      if (shot.kind === 'card') cardShot(c, t, shot)
+      if (shot.kind === 'card') cardShot(c, t, shot, img)
       else {
         drawPerson(c, img, shot)
         scrim(c, shot, t)
-        backWord(c, t, shot)
         frameMarks(c, shot)
       }
       const onCard = shot.kind === 'card'
@@ -710,7 +692,8 @@ export async function createFilm({ media }) {
         }
         chapterCard(c, t)
       }
-      chrome(c, t, onCard)
+      // 字卡改成暗底之后，HUD 也回到亮墨（dark=true 只给亮底用）
+      chrome(c, t, false)
       if (onCard) return
       if (onOutro) {
         const page = pageAt(t)
@@ -724,7 +707,8 @@ export async function createFilm({ media }) {
       drawSub(c, t)
     },
     cues: () => S.cues,
-    post: () => ({ bloom: 0.20, grain: 0.020, vig: 0.30, ca: 0.8 }),
+    // vig 0.30 → 0.18：叠在上面那层压光之上，边缘再乘一次暗化，全片平均亮度被吃掉一大截
+  post: () => ({ bloom: 0.20, grain: 0.020, vig: 0.10, ca: 0.8 }),
     qa() { const b = QA.boxes; QA.boxes = []; return { boxes: b, layout: { shots: (S.shots || []).length, pages: (S.pages || []).length } } },
   }
 }
