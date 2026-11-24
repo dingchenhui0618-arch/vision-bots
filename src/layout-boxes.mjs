@@ -107,15 +107,12 @@ export function layoutBoxes({ scene, template }) {
         const edge = Math.max(Mg, (L.safe && L.safe.right) || 150)
         let cx = plate.x + plate.w + rr + 14
         let cy = plate.y + Math.round(plate.h * 0.42)
-        // 有红条/刻度卡/对勾卡占着板的上方时不盖上方的章（和 film.js 的 stamp() 同一条件）
-        const blocked = (scene.blocks || []).some(x => (x.kind === 'banner' || x.kind === 'gauge' || x.kind === 'check') && b.f0 >= x.f0 && b.f0 < x.f1)
-        // 红条在场的整段都不盖（和 film.js 的 stamp() 同一条件）：它整幅宽，章一定叠上去
-        if ((scene.blocks || []).some(x => x.kind === 'banner' && b.f0 + 0.18 < x.f1 && x.f0 < b.f1)) continue
+        // 红条/刻度卡/对勾卡占着那片空白时一律不盖（和 film.js 的 stamp() 同一条件：
+        // 按章的**整个存活区间**判，不是只看盖的那一瞬——自测26 那 5 帧叠压就是只看一瞬漏的）
+        const blocked = (scene.blocks || []).some(x => (x.kind === 'banner' || x.kind === 'gauge' || x.kind === 'check') && x.f1 > b.f0 + 0.18 && x.f0 < b.f1)
+        if (blocked) continue
         let skip = false
-        if (cx + rr > w - edge - 6) {
-          if (blocked) skip = true
-          else { cx = w - edge - rr - 6; cy = plate.y - rr - 18 }
-        }
+        if (cx + rr > w - edge - 6) { cx = w - edge - rr - 6; cy = plate.y - rr - 18 }
         if (!skip && cx - rr >= Mg && cx + rr <= w - Mg - 4 && cy - rr >= 92 + 150) {
           items.push({ tag: 'block:stamp', x: cx - rr - 10, y: cy - rr - 10, w: rr * 2 + 20, h: rr * 2 + 20, t0: b.f0 + 0.18, t1: b.f1, shot: shot.kind })
         }

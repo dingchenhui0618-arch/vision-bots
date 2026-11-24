@@ -165,5 +165,18 @@ console.log('\n[11] 听不出来 ≠ 字幕错了')
   ok(same[0].severity === 'warn' && /一字不差/.test(String(same[0].why)), '建议与原文相同的只记录')
 }
 
+console.log('\n[12] 「没解决」要分清：没听过 / 音频与字幕不一致（自测26）')
+{
+  const r = await qa(base({ asrFix: {
+    applied: [], rejected: [],
+    pending: [{ w: '大', at: 4.08, why: 'never-heard' }, { w: '街', at: 4.52, why: 'never-heard' }, { w: '卷', at: 62.5, why: 'audio-differs' }],
+    assertion: { wordCount: true, timingUntouched: true }, stats: { words: 248 },
+  } }))
+  const c = r.checks.find(x => x.id === 'asr_confidence')
+  ok(c && /没听过 2 个、音频与字幕不一致 1 个/.test(String(c.detail)), '两类分开计数写进 detail', c && c.detail)
+  ok(c && c.evidence && c.evidence.never === 2 && c.evidence.differs === 1, '证据里带两个数', JSON.stringify(c && c.evidence))
+  ok(c && c.ok === true, '3/248 = 1.2%，数量本身仍在门槛内 → 通过', c && c.detail)
+}
+
 console.log('\n' + (fail ? 'FAIL ' : 'PASS ') + pass + ' 条通过 / ' + fail + ' 条失败')
 process.exit(fail ? 1 : 0)

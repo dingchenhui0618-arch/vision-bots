@@ -6,7 +6,7 @@
  * 模型说「应该是知道怎么做」不算证据（自测13 实测那条建议是错的，音频里只有「会」），
  * 换一个更强的模型在同一段音频上听到「的人」才算——因为它听的是素材本身。
  */
-import { alignCrop, charDiff, planRepair, silentGaps, modelAvailable, relistenSentence, enabled, slotAnomaly, voteTexts, R, strip } from '../src/relisten.mjs'
+import { alignCrop, charDiff, planRepair, silentGaps, modelAvailable, relistenSentence, enabled, slotAnomaly, voteTexts, hanNumbers, R, strip } from '../src/relisten.mjs'
 import { lowConfidenceClusters } from '../src/asr-fix.mjs'
 import { phraseAround } from '../src/qa-semantic.mjs'
 
@@ -159,6 +159,20 @@ const v4 = voteTexts(['甲', '乙', '丙'])
 ok('三个窗口各读一样 → 不采信', v4.majorityOk === false, JSON.stringify(v4))
 const v5 = voteTexts(['卷', '卷', '卷'])
 ok('三个窗口全一致 → 采信，且只有一读', v5.majorityOk === true && v5.votes.length === 1, JSON.stringify(v5))
+
+// ── 采集预算（自测26）：可疑句一旦排队，就得听完；听不完必须明说 ──
+// 自测25 的血账：这支片子排了 10 句可疑句，预算只有 5 句，被挤掉的第 1 句就在成片开头——
+// 字幕「今天大街都在卷AI技术」，三个窗口全听成「今天大家…」，带错出厂。
+ok('采集预算够听完全片可疑句（≥10 句；原先是 5 句）', Number.isInteger(R.maxSpans) && R.maxSpans >= 10, 'maxSpans=' + R.maxSpans)
+ok('预算能被环境变量调（客户机器解码慢时可以压，压了要在报告里明说截断）', typeof R.maxSpans === 'number' && R.maxSpans > 0)
+
+
+// ── 数字写法归一（只用于比对）：whisper 把「一千」写成「1000」时，逐字比永远不等 ──
+ok('1000 → 一千', hanNumbers('花1000的时间') === '花一千的时间', hanNumbers('花1000的时间'))
+ok('10 → 十、120 → 一百二十、105 → 一百零五', hanNumbers('10') === '十' && hanNumbers('120') === '一百二十' && hanNumbers('105') === '一百零五', hanNumbers('120') + '/' + hanNumbers('105'))
+ok('汉字写的数字原样不动（一天不会被改成别的）', hanNumbers('要花一天的时间') === '要花一天的时间', hanNumbers('要花一天的时间'))
+ok('超过 4 位的数字不猜（留原样，免得比出假相等）', hanNumbers('10000') === '10000', hanNumbers('10000'))
+
 const total = pass + fails.length
 console.log(fails.length ? 'FAIL ' + fails.length + '/' + total : 'PASS ' + total + ' 条')
 for (const f of fails) console.log('  ✗ ' + f)

@@ -33,7 +33,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { chat, chatCached, LLM, taskCall, pairFor } from './llm.mjs'
-import { R as RELISTEN, alignCrop, charDiff, enabled as relistenEnabled, modelAvailable as relistenModel, planRepair, relistenSentence, silentGaps, slotAnomaly } from './relisten.mjs'
+import { R as RELISTEN, alignCrop, charDiff, enabled as relistenEnabled, hanNumbers, modelAvailable as relistenModel, planRepair, relistenSentence, silentGaps, slotAnomaly } from './relisten.mjs'
 
 /** execFile 不收 stdin，拼音查询要喂 JSON，所以自己开管道。 */
 function runStdin(cmd, args, input, { timeout = 120000, maxBuffer = 4 << 20 } = {}) {
@@ -911,8 +911,63 @@ export function lowConfidenceClusters(view, cfg = RELISTEN) {
  * 听音复核，并把能落地的改动落到 words 上。
  * 返回新的 current、记账 section、改动涉及的源时间区间（断言用）、净词数变化。
  */
+/**
+ * 音频否决：这几秒我们改过字，而音频读出来的正是**改之前**那句 → 那次改动不成立，退回原话。
+ * 为什么必须有这条（自测26 实测）：45.21–47.73s「一千→一天」是**两个文本模型一致同意**的
+ * （qian / tian 韵母声调同、声母不同），校验器照规矩放行；但 medium 六个窗口全读成「1000」（＝一千），
+ * 没有一个窗口读成「天」。两个文本模型的共识是文本证据，替代不了音频证据——
+ * 这条通道既然能改字，就必须能被音频退回来，否则「音频才是事实」只是单向的。
+ * 硬约束：只退等字数的改动（词数、每个词的起止一个都不动），退完必须逐字等于音频（数字写法允许差）。
+ */
+/** 两段话只差一个字（漏听／多听／听错一个字）。差多了说明这条窗口本身不可信，不能拿来否决。 */
+export function nearEqual(a, b) {
+  const A = [...String(a || '')]
+  const B = [...String(b || '')]
+  if (Math.abs(A.length - B.length) > 1) return false
+  if (A.length === B.length) {
+    let d = 0
+    for (let i = 0; i < A.length; i++) if (A[i] !== B[i]) d++
+    return d <= 1
+  }
+  const [S, L] = A.length < B.length ? [A, B] : [B, A]
+  let i = 0
+  let j = 0
+  let skipped = false
+  while (i < S.length && j < L.length) {
+    if (S[i] === L[j]) { i++; j++; continue }
+    if (skipped) return false
+    skipped = true
+    j++
+  }
+  return true
+}
+
+export function vetoPlan({ current = [], ids = [], audio = '' }) {
+  const core = i => splitAffixes(current[i].w).core
+  const core0 = i => splitAffixes(current[i].w0 || current[i].w).core
+  const now = ids.map(core).join('')
+  const orig = ids.map(core0).join('')
+  if (now === orig) return { ok: false, why: '这段没被改过' }
+  const changed = ids.filter(i => current[i].w0 && current[i].w0 !== current[i].w && current[i].src !== 'relisten')
+  if (!changed.length) return { ok: false, why: '改过的不是文字层（或这处已由音频定过）' }
+  if ([...orig].length !== [...now].length) return { ok: false, why: '退回来会改字数（' + [...orig].length + '→' + [...now].length + '），时间码会跟着动' }
+  // 音频读数允许一个字的噪声：实测「我现在要花一千的时间」这句，medium 三个窗口都漏听了一个「要」。
+  // 差一个字以上就不认这条读数（不是「退不回」，而是这窗口本身就不可信，宁可什么都不做）。
+  if (!nearEqual(hanNumbers(orig), hanNumbers(audio))) return { ok: false, why: '音频和这句差了一个字以上，这条读数不可信' }
+  // 逐词核对：音频里得听得出**改之前**那个字，而且听不出**改之后**那个字。
+  const A = hanNumbers(audio)
+  const proof = []
+  for (const i of changed) {
+    const o = hanNumbers(core0(i))
+    const n = hanNumbers(core(i))
+    if (!A.includes(o) || (n !== o && A.includes(n))) return { ok: false, why: '音频里没有「' + o + '」这个改之前的字', word: core0(i) }
+    proof.push({ i, from: core(i), to: core0(i) })
+  }
+  return { ok: true, ids: changed, proof, orig, backText: orig, why: '音频读的是改动之前的原话' }
+}
+
 async function relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords = '', hints = [], phon = [], log }) {
-  const base = { model: RELISTEN.model, ran: true, candidates: 0, spans: [], applied: 0, phonProposals: phon.length, phonApplied: 0 }
+  const base = { model: RELISTEN.model, ran: true, candidates: 0, spans: [], applied: 0, vetoed: 0, phonProposals: phon.length, phonApplied: 0 }
   const startLen = current.length
   const off = (why, detail) => {
     if (phon.length) log('听音复核没跑（' + why + '）：' + phon.length + ' 处只能靠听音频的改法（' + phon.map(p => p.from + '→' + p.to).join('、') + '）没被确认，一律不改')
@@ -1008,6 +1063,8 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
   const pickedCands = [...hintCands, ...phonCands, ...auditCands.slice(0, RELISTEN.maxSpans)]
   const section = {
     ...base, candidates: hintCands.length + auditCands.length + phonCands.length, hints: hintCands.length,
+    suspicious: auditCands.length,
+    truncated: auditCands.length > RELISTEN.maxSpans,
     notListened: Math.max(0, auditCands.length - RELISTEN.maxSpans),
     notListenedTexts: auditCands.slice(RELISTEN.maxSpans, RELISTEN.maxSpans + 3).map(c => c.text.slice(0, 14)),
     phon: { proposals: phon.length, candidates: phonCands.length, notes: phonNotes },
@@ -1015,6 +1072,10 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
   }
   if (!pickedCands.length) {
     return off('nothing-suspicious', '既没有质检线索，也没有扎堆的低置信词（4 个词里 ≥2 个 p<' + RELISTEN.lowP + '）或吞了静音的词槽，没有值得重听的地方')
+  }
+  if (section.truncated) {
+    log('听音复核：可疑句 ' + auditCands.length + ' 句，预算 ' + RELISTEN.maxSpans + ' 句，还有 ' + section.notListened +
+      ' 句没听——没听的句子仍算「没解决的怀疑」，报告里单独计数（不许拿「听过的那几句都没问题」当成全片没问题）')
   }
 
   const ranges = []
@@ -1065,6 +1126,26 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       // 强耳朵逐字读过、和字幕一样：这句话里的词不算「没把握」了
       if (r.tier === 'strong') confirmed.push([t0 - 1e-6, t1 + 1e-6])
       log('听音复核：' + span.join('–') + 's 音频与字幕逐字一致（「' + r.text + '」），这句没有吞字')
+      continue
+    }
+    // 音频否决（放在预算检查之前）：这段是我们自己改过的，而音频读的是改之前那句 → 撤回。
+    // 撤回不受「加/删字预算」限制：它不是新改动，是把我们造成的改动退回去。
+    const vp = vetoPlan({ current, ids: v.ws.map(x => x.i), audio: r.text })
+    if (vp.ok) {
+      const idset = new Set(vp.ids)
+      const next = current.map((w, i) => idset.has(i) ? { ...w, w: w.w0, src: 'relisten-veto', fixed: false } : w)
+      const backNow = v.ws.map(x => splitAffixes(next[x.i].w).core).join('')
+      // 退回之后这段必须正好等于「改之前那句」。音频那边允许多一个字／少一个字的读数噪声（vp.ok 已核过），
+      // 这里不再拿音频逐字比：先前就是这一步比太死（medium 漏听一个「要」），否决被当成「退不干净」放过去了。
+      if (backNow === vp.orig) {
+        current = next
+        ranges.push([t0 - 1e-6, t1 + 1e-6])
+        section.vetoed += 1
+        section.spans.push({ span, agree: true, veto: true, text: r.text, mine: v.text, orig: vp.orig, applied: true, op: 'revert' })
+        log('听音复核：' + span.join('–') + 's 音频是「' + r.text + '」，和**改之前**那句「' + vp.orig + '」一致 → 这处是文字层自己改错了，退回原话（时间码不动）')
+        continue
+      }
+      reject(span, r, v, '这处改过的字没退干净（' + '退回后是「' + backNow + '」，原话是「' + vp.orig + '」），不动')
       continue
     }
     if (diff.error) { reject(span, r, v, diff.error); continue }
@@ -1168,6 +1249,30 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
 /**
  * 主入口。返回 {words, report}。
  */
+/**
+ * 「还没解决的怀疑」＝ 低置信、又没被音频确认过的词。分两类，因为能做的事不同：
+ *   never-heard   这句从来没被强耳朵听过 → 该去听（预算曾是它唯一的天花板）
+ *   audio-differs 听过了、音频和字幕不一致，但改法过不了约束 → 需要人来定
+ *
+ * 为什么要把这两类分开（自测25 的血账）：原来的报告只写「没把握 15/248 = 6.0%」，
+ * 那 15 个字全落在 10 句从没被听过的句子里，而流水线既不因此去听、也不因此停下——
+ * 这个数字只是装饰。其中一句就是成片开头：「今天大街都在卷AI技术」，
+ * 强耳朵三个窗口全听成「今天大家…」，带错出厂，质检 19/19 也没拦住。
+ */
+export function openQuestions({ current = [], appliedIdx = new Set(), audioIdx = new Set(), heardRanges = [], openRanges = [], lowP = LOW_P }) {
+  const inside = (w, ranges) => ranges.some(r => Array.isArray(r) && w.start >= r[0] && w.end <= r[1] + 1e-6)
+  const out = []
+  for (let i = 0; i < current.length; i++) {
+    const w = current[i]
+    if (!(typeof w.p === 'number' && w.p < lowP)) continue
+    if (appliedIdx.has(i) || audioIdx.has(i)) continue
+    // 强耳朵逐字读过、和字幕一样 → 这不是怀疑，是已核对过的事实
+    if (inside(w, heardRanges)) continue
+    out.push({ i, at: +w.start.toFixed(2), w: w.w, p: +Number(w.p).toFixed(3), why: inside(w, openRanges) ? 'audio-differs' : 'never-heard' })
+  }
+  return out
+}
+
 export async function correct({ words, terms, log = () => {}, askModel = true, segments = null, media = null, envelope = null, relistenDir = null, hints = [] }) {
   const t0 = Date.now()
 
@@ -1413,12 +1518,11 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
   for (const a of report.applied) for (let k = 0; k < (a.n || 1); k++) appliedIdx.add(a.i + k)
   const audioIdx = new Set(current.map((w, i) => (w.src === 'relisten' ? i : -1)).filter(i => i >= 0))
   const heardRanges = [...(aud.ranges || []), ...(aud.confirmed || [])]
-  const heard = w => heardRanges.some(r => w.start >= r[0] && w.end <= r[1] + 1e-6)
-  report.pending = current
-    .map((w, i) => ({ i, at: +w.start.toFixed(2), w: w.w, p: w.p, heard: heard(w) }))
-    // 听音复核改过的词、以及强耳朵逐字读过且与字幕一致的词，都不再算「没把握」
-    .filter(x => typeof x.p === 'number' && x.p < LOW_P && !appliedIdx.has(x.i) && !audioIdx.has(x.i) && !x.heard)
-    .map(({ heard: _h, ...rest }) => rest)
+  // 听过了、但音频和字幕对不上、又落不了地的那些区间：它们也是「没解决」，只是原因不同
+  const openRanges = ((aud.section && aud.section.spans) || [])
+    .filter(s => Array.isArray(s.span) && (s.agree === false || s.rejected))
+    .map(s => s.span)
+  report.pending = openQuestions({ current, appliedIdx, audioIdx, heardRanges, openRanges })
 
   // 硬约束改两条，都比原来更严：
   //   · 改动那句**外面**的词，起止一个字节都不许动（原来要求全片逐词相等；
@@ -1453,6 +1557,12 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     changed: report.applied.length,
     rejected: report.rejected.length,
     pending: report.pending.length,
+    // 没解决的两类分开计数：没听过（该去听）／听过但音频和字幕不一致（要人定）
+    pendingNever: report.pending.filter(x => x.why === 'never-heard').length,
+    pendingDisagree: report.pending.filter(x => x.why === 'audio-differs').length,
+    vetoed: (report.relisten && report.relisten.vetoed) || 0,
+    suspicious: (report.relisten && report.relisten.suspicious) || 0,
+    unheard: (report.relisten && report.relisten.notListened) || 0,
     spans: report.applied.filter(a => (a.n || 1) > 1).length,
     dual: report.applied.filter(a => /双模型一致/.test(String(a.verified || ''))).length,
     deleted: report.applied.reduce((n, a) => n + (a.deleted || 0), 0),
@@ -1465,6 +1575,6 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     ms: Date.now() - t0,
   }
   const aiAccepted = report.applied.length - g.hits.length
-  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 第二意见 ${report.dual && report.dual.ok ? report.dual.need + ' 待证/' + report.dual.agreed + ' 一致' : '未用'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}、双模型 ${report.stats.dual}） · 听音复核 ${report.relisten && report.relisten.ran ? (report.relisten.candidates + ' 句待听/' + report.relisten.applied + ' 处落地') : '未跑'}${report.stats.phon ? '（含只差一个元音 ' + report.stats.phonApplied + '/' + report.stats.phon + '）' : ''} · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
+  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 第二意见 ${report.dual && report.dual.ok ? report.dual.need + ' 待证/' + report.dual.agreed + ' 一致' : '未用'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}、双模型 ${report.stats.dual}） · 听音复核 ${report.relisten && report.relisten.ran ? ((report.relisten.suspicious || 0) + ' 句可疑/' + report.relisten.applied + ' 处落地' + (report.stats.unheard ? '/' + report.stats.unheard + ' 句没听' : '') + (report.stats.vetoed ? '/否决 ' + report.stats.vetoed + ' 处' : '')) : '未跑'}${report.stats.phon ? '（含只差一个元音 ' + report.stats.phonApplied + '/' + report.stats.phon + '）' : ''} · 打回 ${report.rejected.length} · 没解决 ${report.pending.length}（没听过 ${report.stats.pendingNever}、音频不一致 ${report.stats.pendingDisagree}）`)
   return { words: current, report }
 }

@@ -35,6 +35,31 @@ const HF = join(homedir(), '.cache', 'huggingface', 'hub')
 const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu
 export const strip = s => String(s ?? '').replace(PUNCT, '')
 
+// ── 数字写法归一（只用于比对，不改文本）──
+// whisper 有时把「一千」写成阿拉伯数字「1000」：句子里同一个数字，两种写法逐字比就永远不等。
+// 自测26 实测：45.21–47.73s 六个窗口全读成「我现在要花1000的时间」，而原话是「要花一千的时间」。
+// 只在**比对**时归一（阿拉伯 → 汉字），落地/字幕一律用原写法。
+const HAN = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+const UNIT = ['', '十', '百', '千']
+export function hanNumber(n) {
+  const s = String(n)
+  if (!/^\d+$/.test(s) || s.length > 4) return s
+  let out = ''
+  let zero = false
+  for (let i = 0; i < s.length; i++) {
+    const d = Number(s[i])
+    const pos = s.length - 1 - i
+    if (d === 0) { zero = Boolean(out); continue }
+    if (zero) { out += HAN[0]; zero = false }
+    out += (d === 1 && pos === 1 && !out ? '' : HAN[d]) + UNIT[pos]
+  }
+  return out || HAN[0]
+}
+export function hanNumbers(s) {
+  // 只归一「独立的一段数字」（1–4 位）：5 位以上的数我们不确定念法，留着原样，免得比出假相等
+  return String(s ?? '').replace(/(?<!\d)(\d{1,4})(?!\d)/g, m => hanNumber(m))
+}
+
 /** 听音复核的口径，集中一处，测试与实现共用。 */
 export const R = {
   // 强耳朵：比 small 更强，可以在**有结构性证据（词槽吞了静音）**之外独立授权改字
@@ -57,7 +82,11 @@ export const R = {
   lowP: 0.65,
   lowWindow: 4,
   lowNeeded: 2,
-  maxSpans: 5,
+  // 采集预算：一集里「ASR 自己卡过」的句子有多少就听多少（16 句 ≈ 48 条窗口解码，约 3 分钟）。
+  // 原来是 5 句，代价是自测25 实测过的：这支片子排了 10 句可疑句，只听前 5 句，
+  // 被挤掉的第 1 句就在成片开头——字幕「今天大街都在卷AI技术」，三个窗口全听成「今天大家…」，
+  // 一个确凿的错字带着 6% 的「没把握」一起出厂。听不过来时必须明说截断了多少，不许静默。
+  maxSpans: Number(process.env.VISION_BOTS_RELISTEN_SPANS) || 16,
   // 加字：新字落进静音缝隙，缝隙要够长（按每字 0.10s 估）
   gapMin: 0.28,
   charSec: 0.10,

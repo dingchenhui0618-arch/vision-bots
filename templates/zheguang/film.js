@@ -292,16 +292,16 @@ export async function createFilm({ media }) {
     const hot = bare(b.hot || '')
     if (hot.length < 2 || hot.length > 3) return
     // 红条整幅宽，章压在板右边会和它叠在一起（自测23 质检在 15 帧上抓到 block:stamp × block:banner）。
-    // 章是装饰、块是内容：块在场的那几秒不盖，宁可这一条没有章。
-    if (blockAt(t).some(x => x.kind === 'banner')) return
+    // 刻度卡/对勾卡占着板上方那片空白时也一样（自测26 抓到 5 帧 block:stamp × block:gauge）。
+    // 章是装饰、块是内容：按**章的整个存活区间**判，区间里只要有一帧有块，这一条就不盖——
+    // 只看「盖的这一刻」会漏掉「章先出现 0.2 秒、刻度卡后出现」这种，两个撞在同一片空白上。
+    if ((S.blocks || []).some(x => (x.kind === 'banner' || x.kind === 'gauge' || x.kind === 'check') && x.f1 > t && x.f0 < b.f1)) return
     const r = Math.round(Math.min(96, Math.max(62, size * 0.44)))
     const edge = Math.max(M, (L.safe && L.safe.right) || 150)
     let cx = plate.x + plate.w + r + 14
     let cy = plate.y + Math.round(plate.h * 0.42)
     if (cx + r > w - edge - 6) {
       // 板占满整行时右边塞不下：退一步盖在板的上方右侧（满幅页那一片是空的，还在头部区以下）。
-      // 但那一片会被红条/刻度卡/对勾卡占着——有块在的时候不盖，宁可这一条没有章。
-      if (blockAt(t).some(x => x.kind === 'banner' || x.kind === 'gauge' || x.kind === 'check')) return
       cx = w - edge - r - 6
       cy = plate.y - r - 18
     }

@@ -161,11 +161,17 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
     const totalWords = stats.words || stats.total || 0
     const ratio = totalWords ? pending.length / totalWords : 0
     const okRatio = totalWords ? ratio <= BAR.confidence : false
+    // 没解决的怀疑分两类，能做的事不同：没听过（该去听）／听过了但音频和字幕不一致（要人定）。
+    // 自测25 之前这里只写「没把握 15/248 = 6.0%」，而那 15 个字全在从没被听过的句子里——
+    // 数字看着像风险度量，其实没有对应动作，最后带着「今天大街→今天大家」这个错字交付。
+    const never = pending.filter(p => p.why === 'never-heard').length
+    const differs = pending.filter(p => p.why === 'audio-differs').length
+    const split = never + differs ? `（没听过 ${never} 个、音频与字幕不一致 ${differs} 个）` : ''
     add('asr_confidence', safe && okRatio,
-      `改字 ${applied.length} 处${kindText ? `（${kindText}）` : ''}，打回 ${rejected.length} 处，没把握 ${pending.length}${totalWords ? `/${totalWords} 词 = ${(ratio * 100).toFixed(1)}%（上限 ${(BAR.confidence * 100).toFixed(0)}%）` : ''}` +
+      `改字 ${applied.length} 处${kindText ? `（${kindText}）` : ''}，打回 ${rejected.length} 处，没解决 ${pending.length}${totalWords ? `/${totalWords} 词 = ${(ratio * 100).toFixed(1)}%（上限 ${(BAR.confidence * 100).toFixed(0)}%）` : ''}` +
       (pending.length ? `：${pending.slice(0, 5).map(p => `「${p.w}」@${p.at}s`).join('、')}${pending.length > 5 ? ' 等' : ''}` : '') +
-      `；词数 ${assertion.wordCount ? '未变' : '变了'}，时间码 ${assertion.timingUntouched ? '未动' : '被动了'}`,
-      { applied, rejected, pending, assertion, ratio: Number(ratio.toFixed(4)), bar: BAR.confidence })
+      `${split}；词数 ${assertion.wordCount ? '未变' : '变了'}，时间码 ${assertion.timingUntouched ? '未动' : '被动了'}`,
+      { applied, rejected, pending, assertion, ratio: Number(ratio.toFixed(4)), bar: BAR.confidence, never, differs })
   }
 
   // 段落节奏：用户 2026-11-23 明确否掉"22 章切太碎"，这里把它变成硬门槛。

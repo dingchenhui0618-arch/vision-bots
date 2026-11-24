@@ -2,7 +2,7 @@
  * 错字治理的自检：术语表、模型提案的校验器、句子回流、硬断言。
  * 模型提案用固定样本喂进来，不联网；拼音校验在本机有 uv 时额外验一遍。
  */
-import { applyTerms, applyToSegments, mergeAsciiRuns, breaksWord, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, phoneticOf, phonOnly, oneCharSwap, loadTerms, LEN_NUDGE } from '../src/asr-fix.mjs'
+import { applyTerms, applyToSegments, mergeAsciiRuns, breaksWord, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, phoneticOf, phonOnly, oneCharSwap, loadTerms, LEN_NUDGE, openQuestions, vetoPlan, nearEqual } from '../src/asr-fix.mjs'
 
 let pass = 0
 const fails = []
@@ -306,6 +306,58 @@ ok('听音闸门 · 只差一个字 → 认', Boolean(gate) && gate.from === '�
 ok('听音闸门 · 差两个字 → 不认（那是另一次转写）', oneCharSwap('别再去捡技术了', '别再该卷技术了') === null)
 ok('听音闸门 · 字数不同 → 不认', oneCharSwap('别再去捡技术了', '别再卷技术') === null)
 ok('听音闸门 · 完全一致 → 不认（提案不成立）', oneCharSwap('别再去捡技术了', '别再去捡技术了') === null)
+
+// ── 20. 「没解决」的两种：没听过 / 听过了但音频和字幕不一致（自测26）──
+// 自测25 的报告只写「没把握 15/248 = 6.0%」，那 15 个字全在 10 句从没被听过的句子里：
+// 数字看着像风险度量，实际没有对应动作，最后带着「今天大街→今天大家」交付。
+const oqWords = [
+  { w: '甲', start: 0.0, end: 0.3, p: 0.2 },
+  { w: '乙', start: 0.3, end: 0.6, p: 0.95 },
+  { w: '丙', start: 0.6, end: 0.9, p: 0.3 },
+  { w: '丁', start: 0.9, end: 1.2, p: 0.1 },
+]
+const oq = openQuestions({ current: oqWords, heardRanges: [[0, 0.6]], openRanges: [[0.6, 0.9]] })
+ok('强耳朵逐字读过且一致 → 不再算怀疑', !oq.some(x => x.w === '甲'), JSON.stringify(oq))
+ok('高置信词不进来', !oq.some(x => x.w === '乙'), JSON.stringify(oq))
+ok('听过了、音频和字幕不一致 → 记成 audio-differs', oq.some(x => x.w === '丙' && x.why === 'audio-differs'), JSON.stringify(oq))
+ok('从没听过 → 记成 never-heard（这才该去听）', oq.some(x => x.w === '丁' && x.why === 'never-heard'), JSON.stringify(oq))
+ok('已改过 / 听音改过的词不再列为怀疑', openQuestions({ current: oqWords, appliedIdx: new Set([3]), audioIdx: new Set([2]), heardRanges: [[0, 0.6]], openRanges: [[0.6, 0.9]] }).length === 0)
+ok('两类混在一份名单里也能分开数', oq.filter(x => x.why === 'never-heard').length === 1 && oq.filter(x => x.why === 'audio-differs').length === 1, JSON.stringify(oq))
+
+// ── 21. 音频否决：我们改过的字，音频读的是改之前那句 → 退回去（自测26）──
+// 实测 45.21–47.73s：「一千→一天」是两个文本模型一致同意的，medium 六个窗口却全读成「1000」（＝一千）。
+// 两个文本模型的共识不是音频证据；这条通道能改字，就必须能被音频退回来。
+const VPW = (w, w0, src) => ({ w, w0, src, start: 0, end: 0.3, p: 0.9 })
+const vp1 = vetoPlan({
+  current: [VPW('我', null), VPW('现在', null), VPW('要', null), VPW('花', null), VPW('一', null), VPW('天', '千', 'span'), VPW('的', null), VPW('时间', null)],
+  ids: [0, 1, 2, 3, 4, 5, 6, 7],
+  audio: '我现在要花1000的时间',
+})
+ok('音频读的是改之前那句（数字写法不同也算）→ 判定可以退回', vp1.ok === true, JSON.stringify(vp1))
+ok('退回来是原话「要花一千的时间」，字数没变', vp1.ok && vp1.orig === '我现在要花一千的时间' && vp1.ids.length === 1 && vp1.ids[0] === 5, JSON.stringify(vp1))
+const vp2 = vetoPlan({
+  current: [VPW('大家用'), VPW('GPT', 'GDP', 'span'), VPW('用'), VPW('Claude'), VPW('用'), VPW('Codex'), VPW('这些工具')],
+  ids: [0, 1, 2, 3, 4, 5, 6],
+  audio: '大家用GDPCodexCodex这些工具',
+})
+ok('音频读得乱、和原话对不上 → 不退（不能拿一个烂窗口撤掉术语修正）', vp2.ok === false, JSON.stringify(vp2))
+const vp3 = vetoPlan({ current: [VPW('甲'), VPW('乙', '乙'), VPW('丙')], ids: [0, 1, 2], audio: '甲乙丙' })
+ok('这段没被改过 → 不适用否决', vp3.ok === false && /没被改过/.test(vp3.why), JSON.stringify(vp3))
+const vp4 = vetoPlan({ current: [VPW('甲'), VPW('乙', '乙'), VPW('丙', '丁', 'relisten')], ids: [0, 1, 2], audio: '甲乙丙' })
+ok('改字是听音复核定的 → 不许用否决把它翻回去', vp4.ok === false, JSON.stringify(vp4))
+const vp5 = vetoPlan({ current: [VPW('甲'), VPW('乙', '乙丙'), VPW('丁')], ids: [0, 1, 2], audio: '甲乙丙丁' })
+ok('退回来会改字数 → 不退（时间码会跟着动）', vp5.ok === false && /改字数/.test(vp5.why), JSON.stringify(vp5))
+// 真实形态：medium 三个窗口都漏听了一个「要」——差一个字是读数噪声，不是「退不回」
+const qianCur = [VPW('我'), VPW('现在'), VPW('要'), VPW('花'), VPW('一'), VPW('天', '千', 'span'), VPW('的'), VPW('时间')]
+const QIDS = [0, 1, 2, 3, 4, 5, 6, 7]
+const vp6 = vetoPlan({ current: qianCur, ids: QIDS, audio: '我现在花1000的时间' })
+ok('音频漏听一个字（要）仍能判定否决', vp6.ok === true, JSON.stringify(vp6))
+const vp7 = vetoPlan({ current: qianCur, ids: QIDS, audio: '我现在要花一天的时间' })
+ok('音频读的就是我们改成的「天」→ 不否决（不能拿它给自己的改动背书）', vp7.ok === false, JSON.stringify(vp7))
+const vp8 = vetoPlan({ current: qianCur, ids: QIDS, audio: '我现在要花一千的时间' })
+ok('汉字写法的原话也能判', vp8.ok === true, JSON.stringify(vp8))
+ok('差一个字以上就不认这条读数', vetoPlan({ current: qianCur, ids: QIDS, audio: '现在花1000时间' }).ok === false)
+ok('nearEqual：差一个字 true，差得多 false', nearEqual('我现在要花一千的时间', '我现在花一千的时间') === true && nearEqual('我现在要花一千的时间', '我现在花一千') === false)
 
 const total = pass + fails.length
 if (fails.length) {

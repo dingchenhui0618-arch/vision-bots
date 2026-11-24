@@ -375,7 +375,7 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
       : '\n没有需要改的错字。') +
     (fixReport.rejected.length ? `\n模型提的 ${fixReport.rejected.length} 处改法没通过校验，退回了：` + fixReport.rejected.slice(0, 2).map(r => `「${r.from}」→「${r.to}」${r.why}`).join('、') + '。' : '') +
     (pending.length
-      ? `\n还有 ${pending.length} 个词识别把握不高：${pending.slice(0, 4).map(w => `「${w.w}」@${w.at}s`).join('、')}${pending.length > 4 ? ' 等' : ''}，没把握就不动它，全部列在错字清单里。`
+      ? `\n还有 ${pending.length} 个词识别把握不高（没听过 ${pending.filter(w => w.why === 'never-heard').length} 个、音频与字幕不一致 ${pending.filter(w => w.why === 'audio-differs').length} 个）：${pending.slice(0, 4).map(w => `「${w.w}」@${w.at}s`).join('、')}${pending.length > 4 ? ' 等' : ''}，没把握就不动它，全部列在错字清单里。`
       : '\n低置信词都处理干净了。'),
     { job: job.id })
 
