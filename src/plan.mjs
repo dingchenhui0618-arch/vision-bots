@@ -43,7 +43,7 @@ const textOf = w => String(w && w.w != null ? w.w : (w && w.text) || '')
 const bare = s => String(s || '').replace(PUNCT, '')
 
 /** 词的时间戳兜底：两种字段名都认（历史数据里有 start/end 和 s/e）。 */
-function norm(words) {
+export function normWords(words) {
   // i 必须是「过滤、排序之后」的下标：删除表里记的是区间下标，保留表是按 i 过滤的。
   // 一边用下标、一边用 i，只要先被过滤掉一个词（空词、零时长），后面全体错位一格——
   // 真素材上就是这么把重复句前一个词「容」删掉、刀口切进它中间的。
@@ -237,7 +237,7 @@ function refineCut(A, B, lo, hi, g, opts) {
 
 export function buildPlan(words, mediaDuration, options = {}) {
   const o = { ...DEFAULT_PLAN, ...options, gap: { ...DEFAULT_PLAN.gap, ...(options.gap || {}) }, seam: { ...DEFAULT_PLAN.seam, ...(options.seam || {}) } }
-  const ws = norm(words)
+  const ws = normWords(words)
   if (!ws.length) throw new Error('没有识别到任何词')
 
   // ── 1) 删除表：显式指定的（口误，外部给）+ 能自动认的（重复、口头语）
@@ -254,6 +254,20 @@ export function buildPlan(words, mediaDuration, options = {}) {
   if (o.dedupe.enabled) for (const d of findRepeats(ws, o.dedupe, taken)) { dels.push(d); taken.add(d.i0) }
   if (o.restart.enabled) for (const d of findRestarts(ws, o.restart, taken)) { dels.push(d); taken.add(d.i0) }
   if (o.filler.enabled) for (const d of findFillers(ws, o.filler, taken)) dels.push(d)
+  // 整句删：区间是对**归一化词下标**说的，由 prune.mjs 算好（它和这里用同一个 normWords）。
+  // 为什么不按文本匹配：整句删的文本里可能跨过前面已经删掉的词（「只有别人看到你 | 看到你的产品」），
+  // 拼出来的串和词序列对不上，按文本找会**静默**找不到——那正是「说要删、其实没删」的来源。
+  for (const r of options.ranges || []) {
+    const a = Number(r && r.i0), b = Number(r && r.i1)
+    if (!Number.isInteger(a) || !Number.isInteger(b) || a < 0 || b >= ws.length || b < a) {
+      throw new Error('整句删的区间不合法：' + JSON.stringify(r) + '（词数 ' + ws.length + '）')
+    }
+    let overlap = false
+    for (let i = a; i <= b; i++) if (taken.has(ws[i].i)) { overlap = true; break }
+    if (overlap) continue // 已经按别的理由删掉了：并集，不重复记账
+    dels.push({ i0: a, i1: b, reason: r.reason || 'content', text: ws.slice(a, b + 1).map(w => w.w).join(''), from: ws[a].start })
+    for (let i = a; i <= b; i++) taken.add(ws[i].i)
+  }
   const deletions = protect(ws, dels).sort((a, b) => a.i0 - b.i0)
 
   // 删过头就不是剪辑了：超了上限就按理由退（先退口头语）
@@ -320,6 +334,9 @@ export function buildPlan(words, mediaDuration, options = {}) {
       text: d.text,
       from: round3(d.from),
       chars: bare(d.text).length,
+      // 归一化词下标：整句删要在上一版结果上再算一轮（prune.mjs 靠它知道哪些词已经删了）
+      i0: d.i0,
+      i1: d.i1,
     })),
     deletedChars,
     deletedSec,

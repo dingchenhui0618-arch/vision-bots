@@ -15,6 +15,7 @@ import { sectionsOf } from '../sections.mjs'
 import { titleSentences } from '../headlines.mjs'
 import { pageSkeleton } from '../pages.mjs'
 import { planPages } from '../shots.mjs'
+import { planPrune } from '../prune.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
 
@@ -180,7 +181,7 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   // 剪辑的所有口径来自它自己的配置（config/bots/cutter.json），不是散在代码里的常量。
   // 只有用户明确说的东西（语速）才算覆盖。
   const cutParams = paramsOf('cutter')
-  const plan = buildPlan(words, info.duration, {
+  const planOpts = {
     pauseThreshold: brief.pauseThreshold ?? cutParams.pauseThreshold,
     keepHead: cutParams.keepHead,
     keepTail: cutParams.keepTail,
@@ -194,8 +195,56 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     maxDeleteShare: cutParams.maxDeleteShare,
     envelope,
     speed: brief.speed ?? 1,
-  })
-  const delLabel = { repeat: '重复', filler: '口头语', mistake: '口误' }
+  }
+  let plan = buildPlan(words, info.duration, planOpts)
+
+  // ── 内容预算：目标时长真正进剪辑决策 ──
+  // 以前到这一步就结束了：删完气口是多少就交多少。用户要 60 秒、拿到 66.5 秒，
+  // 根因不是素材，是 buildPlan 里根本没有 target。这里补「整句删」：
+  // 模型提案哪几句是铺垫/重复，规则挡住不许删的（钩子、落点、主张、唯一数字），
+  // 然后按「离目标最近」选一组删掉，重算一版保留区间。
+  const pruneParams = { ...(cutParams.prune || {}) }
+  const targetSec = Number(brief.duration) || 0
+  let prune = null
+  if (targetSec && pruneParams.enabled !== false) {
+    const tol = Number(pruneParams.tolerance) || 0.02
+    const rounds = Math.max(1, Math.min(3, Number(pruneParams.maxRounds) || 2))
+    const fit = d => d <= targetSec * (1 + tol)
+    const before = Number(plan.outDuration.toFixed(2))
+    let cur = plan
+    const applied = []   // 累积的整句删：第二轮只能往第一轮上加，不能把第一轮删过的句子又放回去
+    const all = []
+    let last = null
+    for (let k = 0; k < rounds; k++) {
+      if (fit(cur.outDuration)) {
+        if (k === 0) log('选句删：成片 ' + cur.outDuration.toFixed(2) + 's 已经在目标 ' + targetSec + 's 以内，不删内容')
+        break
+      }
+      if (k === 0) group.emit({ type: 'progress', bot: 'cutter', text: '剪辑在挑整句删：成片 ' + cur.outDuration.toFixed(1) + 's，目标 ' + targetSec + 's', transient: true })
+      const pr = await planPrune({ segments, words, plan: cur, target: targetSec, terms, params: pruneParams, log })
+      if (pr) last = pr
+      if (!pr || !pr.picks || !pr.picks.length) break
+      const ranges = pr.picks.map(x => ({ i0: Number(x.i0), i1: Number(x.i1), reason: 'content', text: x.text }))
+      const bad = ranges.find(r => !Number.isInteger(r.i0) || !Number.isInteger(r.i1))
+      if (bad) throw new Error('整句删丢了词下标：' + JSON.stringify(bad) + '（prune 返回的 picks 必须有 i0/i1）')
+      applied.push(...ranges)
+      all.push(...pr.picks)
+      cur = buildPlan(words, info.duration, { ...planOpts, ranges: applied })
+      log('选句删第 ' + (k + 1) + ' 轮：删 ' + applied.length + ' 句后成片 ' + cur.outDuration.toFixed(2) + 's（目标 ' + targetSec + 's）')
+      if (fit(cur.outDuration)) break
+    }
+    prune = last
+      ? { ...last, before, after: Number(cur.outDuration.toFixed(2)), picks: all, rounds: applied.length ? (last.rounds || 1) : 0 }
+      : null
+    if (prune) {
+      prune.delta = Number((cur.outDuration - targetSec).toFixed(2))
+      prune.hit = fit(cur.outDuration)
+      // 删完还是不达标、而上一轮说「可删的都删完了」，才算真删不动（质检靠这一条放过超时）
+      prune.exhausted = !prune.hit && Boolean(last && last.exhausted)
+      plan = cur
+    }
+  }
+  const delLabel = { repeat: '重复', filler: '口头语', mistake: '口误', content: '整句删' }
   if (plan.deletions.length) {
     const by = Object.entries(plan.byReason).map(([k, n]) => (delLabel[k] || k) + ' ' + n).join(' / ')
     log('删词 ' + plan.deletions.length + ' 处（' + by + '），' + plan.deletedChars + ' 字、约 ' + plan.deletedSec + 's：' +
@@ -203,7 +252,25 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   }
   const captions = buildCaptions(words, plan, { maxChars: brief.maxChars ?? 14 })
 
+  // 内容预算的结论挂到 plan 上：质检要用它判断「超时」是真删不动，还是根本没试
+  if (prune) {
+    plan.prune = {
+      target: targetSec,
+      before: prune.before,
+      after: prune.after,
+      cuts: (prune.picks || []).length,
+      hit: Boolean(prune.hit),
+      exhausted: Boolean(prune.exhausted),
+      widened: Boolean(prune.widened),
+      texts: (prune.picks || []).map(x => x.text),
+      model: prune.model ? (prune.model.model || prune.model.skipped || null) : null,
+    }
+  }
   writeFileSync(join(work, 'plan.json'), JSON.stringify(plan, null, 1), 'utf8')
+  if (prune) {
+    writeFileSync(join(work, 'prune.json'), JSON.stringify(prune, null, 1), 'utf8')
+    artifact('prune', join(work, 'prune.json'), { cuts: (prune.picks || []).length, after: plan.outDuration })
+  }
   writeFileSync(join(work, 'subs.srt'), toSRT(captions.cards), 'utf8')
   artifact('timeline', join(work, 'plan.json'), { duration: plan.outDuration })
   artifact('subs', join(work, 'subs.srt'))
@@ -272,6 +339,11 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     `读完了：${info.duration.toFixed(1)}s 素材，${words.length} 个词，剪掉 ${plan.cutSeconds.toFixed(1)}s（${plan.removedPauses} 个长停顿` +
     (plan.deletions.length ? ` + ${plan.deletions.length} 处删词：` + Object.entries(plan.byReason).map(([k, n]) => (delLabel[k] || k) + ' ' + n).join('、') : '') +
     `），成片 ${plan.outDuration.toFixed(1)}s，${plan.keep.length} 段。` +
+    (prune && prune.picks && prune.picks.length
+      ? `\n为了让片子进 ${targetSec}s，我整句删了 ${prune.picks.length} 句（${prune.before.toFixed(1)}s → ${plan.outDuration.toFixed(1)}s）：` +
+        prune.picks.map(x => `「${x.text.slice(0, 12)}」${x.why ? '（' + x.why + '）' : ''}`).join('、') + '。' +
+        (prune.hit ? '' : `\n删完还是 ${plan.outDuration.toFixed(1)}s，差 ${(plan.outDuration - targetSec).toFixed(1)}s——能删的整句都删完了，再删就伤到观点。`)
+      : '') +
     (fixed.length
       ? `\n错字改了 ${fixed.length} 处：` + fixed.slice(0, 3).map(f => `「${f.from}」→「${f.to}」@${f.at}s（${KIND_LABEL[f.kind] || f.kind}，${f.verified || '命中术语表'}）`).join('、') + (fixed.length > 3 ? ' 等' : '') + '。'
       : '\n没有需要改的错字。') +
@@ -290,6 +362,17 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     gapSec: brief.duration ? Number((Number(brief.duration) - plan.outDuration).toFixed(1)) : null,
     cutSec: Number(plan.cutSeconds.toFixed(1)),
     pauses: plan.removedPauses,
+    prune: prune && prune.picks && prune.picks.length
+      ? {
+        cuts: prune.picks.length,
+        sec: Number(prune.picks.reduce((n, x) => n + (Number(x.dur) || 0), 0).toFixed(1)),
+        hit: Boolean(prune.hit),
+        texts: prune.picks.map(x => x.text.slice(0, 14)),
+        why: prune.picks.map(x => x.why || ''),
+        refused: prune.refusedCount || 0,
+        exhausted: Boolean(prune.exhausted),
+      }
+      : null,
     segments: plan.keep.length,
     deletions: plan.deletions.length,
     deletedChars: plan.deletedChars,

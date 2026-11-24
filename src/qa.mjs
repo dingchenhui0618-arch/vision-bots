@@ -4,7 +4,12 @@ import { judgeSemantic } from './qa-semantic.mjs'
 
 // 目标时长允许多少差：制片人拍板和质检用同一个数，不许一处 15%、一处 12%——
 // 那会出现「制片人说达标了、质检查出没达标」，用户不知道该信谁（2026-11-20 实测踩到）。
-export const TARGET_TOLERANCE = 0.12
+//
+// 自测16 起从 12% 收到 6%：剪辑现在有「整句删」这一档，能把片子真正剪到目标上
+// （自测16 实测 65.6s → 61.1s，目标 60s）。门槛不收，就等于允许交一条超 11% 的片子还说达标。
+// 到不了的时候不硬扣分，但要两个条件之一成立、并且写明原因（见下面的 target 检查）：
+// 能删的整句都删完了（prune.exhausted），或者素材本来就比目标短。
+export const TARGET_TOLERANCE = 0.06
 
 // 门槛全部写在这里，改门槛就是改产品承诺，别散在代码各处。
 export const BAR = {
@@ -56,7 +61,34 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
 
   if (targetDuration) {
     const delta = duration - targetDuration
-    add('target', Math.abs(delta) <= targetDuration * TARGET_TOLERANCE, `目标 ${targetDuration}s，实际 ${duration.toFixed(2)}s（差 ${delta.toFixed(1)}s）`, { delta: Number(delta.toFixed(2)) })
+    const prune = plan.prune || null
+    const tight = Math.abs(delta) <= targetDuration * TARGET_TOLERANCE
+    // 超时：只有「能删的整句都删完了」才算情有可原；否则就是剪得不够
+    const exhausted = Boolean(prune && prune.exhausted)
+    // 短于目标：素材本来就比目标短才算情有可原（不是剪辑删过头——整句删最多只允许低于目标 3%）
+    const shortSource = (plan.sourceDuration || 0) < targetDuration * 0.98
+    const ok = tight || (delta > 0 ? exhausted : shortSource)
+    const why = tight ? '' : (delta > 0
+      ? (exhausted ? '（能删的整句都删完了）' : '（还有整句可删，没删够）')
+      : (shortSource ? '（素材本身就比目标短）' : '（删过头了）'))
+    add('target', ok, `目标 ${targetDuration}s，实际 ${duration.toFixed(2)}s（差 ${delta.toFixed(1)}s）` + why, {
+      delta: Number(delta.toFixed(2)),
+      prune: prune ? { cuts: prune.cuts, before: prune.before, exhausted } : null,
+    })
+  }
+
+  // 整句删的对账：说要删的句子，成片字幕里必须一句都读不到。
+  // 不然「让片子进 60 秒」会变成一句空话——文字删了、画面上还留着。
+  const contentCuts = (plan.deletions || []).filter(d => d.reason === 'content')
+  if (contentCuts.length) {
+    const strip = s => String(s || '').replace(/[，。！？、；：,.!?;:""''（）()《》…—~·s]/gu, '')
+    const said = strip((captions && captions.cards || []).map(c => c.text).join(''))
+    const leaked = contentCuts.filter(d => said.includes(strip(d.text)))
+    add('prune', leaked.length === 0,
+      leaked.length
+        ? `整句删 ${contentCuts.length} 句，其中 ${leaked.length} 句还能在字幕里读到`
+        : `整句删 ${contentCuts.length} 句，成片字幕里一句都不剩`,
+      { cuts: contentCuts.map(d => String(d.text).slice(0, 16)) })
   }
 
   if (audio) {

@@ -72,7 +72,11 @@ export async function createFilm({ media }) {
   }
 
   // ── 段落大字的排版：先定行，再由字宽定字号，整句不截断 ──
-  const BIGTYPES = S.bigs.map((b, bi) => {
+  // 老 scene（分段缓存上线之前的母版）没有 subs / bigs 字段。引擎不能因此崩掉：
+// 缺就按空数组画——画面里少一层，不是渲染失败（自测16 跑 check-patch 时踩到：
+// 默认群的旧母版 scene 缺 subs，headless Chrome 直接抛 findIndex of undefined）。
+const SUBS = Array.isArray(S.subs) ? S.subs : []
+const BIGTYPES = (S.bigs || []).map((b, bi) => {
     // 断行由数据层算好（src/segment.mjs，和 PPT 底座同一套规则）；没有才回落到本地切
     let lines
     if (Array.isArray(b.lines) && b.lines.length) {
@@ -194,11 +198,11 @@ export async function createFilm({ media }) {
   // ── 字幕：一句话一张，压在底部 pill 里，可读性由 pill 保证 ──
   // 同一时刻只画一张：字幕卡首尾相接，交叉淡入会让两张叠在一起（实测糊成「圈真正的机会…」）
   function subline(c, t) {
-    const idx = S.subs.findIndex(s => t >= s.f0 && t < s.f1)
-    const cur = idx >= 0 ? S.subs[idx] : null
+    const idx = SUBS.findIndex(s => t >= s.f0 && t < s.f1)
+    const cur = idx >= 0 ? SUBS[idx] : null
     if (!cur) return
     const first = idx === 0 ? 1 - seg(t, cur.f0, cur.f0 + 0.12) : 1
-    const last = idx === S.subs.length - 1 ? 1 - seg(t, cur.f1 - 0.12, cur.f1) : 1
+    const last = idx === SUBS.length - 1 ? 1 - seg(t, cur.f1 - 0.12, cur.f1) : 1
     const a = Math.min(first, last)
     if (a <= 0.01) return
     // 和这一段的大字重复时不画：一段话在屏幕上只出现一次，别一句变两句

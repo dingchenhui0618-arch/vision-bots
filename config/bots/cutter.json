@@ -1,6 +1,6 @@
 {
   "_note": "每个 bot 一份配置。改谁只碰谁：这里动的是「剪辑」这个 bot 自己的模型、采样和参数，其他三个 bot 不受影响。",
-  "_why": "剪辑的所有判断口径都在 params 里：剪辑点阈值、停机目标、去重与口头语规则。改剪辑的口味只改这个文件，不用碰代码和别的 bot。",
+  "_why": "剪辑的所有判断口径都在 params 里：剪辑点阈值、停机目标、去重与口头语规则、整句删（内容预算）。改剪辑的口味只改这个文件，不用碰代码和别的 bot。",
   "model": "smart",
   "temperature": 0,
   "maxTokens": 700,
@@ -14,6 +14,18 @@
     "leadIn": 0.15,
     "tailOut": 0.3,
     "maxDeleteShare": 0.3,
+    "prune": {
+      "enabled": true,
+      "tolerance": 0.02,
+      "underSlack": 0.03,
+      "maxSentences": 0.3,
+      "maxChars": 0.25,
+      "maxConsecutive": 2,
+      "minSentenceSec": 0.7,
+      "protectTail": 2,
+      "maxCandidates": 12,
+      "maxRounds": 2
+    },
     "gap": {
       "period": 0.3,
       "comma": 0.22,

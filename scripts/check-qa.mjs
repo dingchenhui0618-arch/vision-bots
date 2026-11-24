@@ -147,7 +147,8 @@ console.log('\n[10] 门槛常量与容差')
 {
   ok(BAR.sections[0] === 4 && BAR.sections[1] === 14, '段落区间 4–14')
   ok(BAR.confidence === 0.08, '低置信上限 8%')
-  ok(TARGET_TOLERANCE === 0.12, '目标时长容差 12%')
+  // 自测16 起收到 6%：剪辑有了整句删，能把片子真正剪到目标上；再放 12% 等于允许交超 7 秒的片子
+  ok(TARGET_TOLERANCE === 0.06, '目标时长容差 6%（自测16 起，剪辑能整句删了）')
   ok(BAR.zone.bodyTop === 0.56, '文字只在下半区（56% 以下）')
 }
 
