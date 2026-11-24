@@ -183,7 +183,12 @@ export class Orchestrator {
 
     if (parsed.kind === 'rerun') {
       const r = await d.repack('重跑')
-      await d.utter('producer', '用户没改字，只让你重跑一版。你已经让包装重出、质检复查过了，把结果告诉他：画面变没变、渲染多少秒、质检几项过。一两个短句。', { reason: '重跑', packer: r.packer, qc: r.qc, qcOk: r.qcOk })
+      await d.utter('producer', [
+        '用户没改字，只让你重跑一版。',
+        packLine(r),
+        qcLine(r),
+        '把结果告诉他：片子换没换、质检几项过。一两个短句。它没出片就说没出片，不许说已经重出。',
+      ].join('\n'), { reason: '重跑', packer: r.packer, qc: r.qc, qcOk: r.qcOk, packed: r.packed, qcPassed: r.qcPassed })
       return { phase: this.group.meta.phase, reason: 'rerun', said: r }
     }
 
@@ -197,9 +202,10 @@ export class Orchestrator {
     await d.utter('producer', [
       '用户这句话你已经改完了：把「' + parsed.from + '」改成「' + parsed.to + '」。',
       '改了 ' + edited.changed + ' 个词，词数 ' + edited.words + ' 没变，每个词的起止时间码一个没动。',
-      '包装已经按改动重出，质检也复查过了。',
+      packLine(r),
+      qcLine(r),
       '把结果告诉他：改了哪一处、只重渲了受影响的部分、质检几项过。三五句，不要复述时间码。',
-    ].join('\n'), { changed: edited.changed, words: edited.words, chapter: edited.chapter, filmSec: edited.filmSec, qc: r.qc, packer: r.packer })
+    ].join('\n'), { changed: edited.changed, words: edited.words, chapter: edited.chapter, filmSec: edited.filmSec, qc: r.qc, packer: r.packer, packed: r.packed, qcPassed: r.qcPassed })
     return { phase: this.group.meta.phase, reason: '改一句', edited }
   }
 
@@ -207,6 +213,18 @@ export class Orchestrator {
     this.group.note('在跑，跑完我报。要改的话现在说，我记进这版。')
     return { phase: this.group.meta.phase }
   }
+}
+
+/** 包装这一步的事实：它说没说出片不算，成片文件换没换才算 */
+function packLine(r) {
+  if (r.packed) return '包装这一步的成片文件确实换了（引擎按文件大小和时间核过），' + (r.fallback ? r.fallback + '。' : '') + '只重渲了改动命中的那几帧。'
+  return '包装这一步没有出新成片文件（' + (r.fallback || '引擎兜底也没换文件') + '），你要如实说这一版没重出。'
+}
+
+/** 质检：pressed 是报告本身，不是 bot 这轮跑没跑通 */
+function qcLine(r) {
+  if (!r.qcPassed) return '质检报告这一版有不通过项，逐项在报告里，不许说「几项全过」。'
+  return '质检报告这一版全部通过。'
 }
 
 /** 读到需求之后要它说的话：为什么是这个模板、替用户定了什么、模型读岔了什么 */

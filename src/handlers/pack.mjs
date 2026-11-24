@@ -93,6 +93,12 @@ export async function runPack({ group, job, log, artifact, brief, state, narrate
   }
 
   artifact('video', out, { template: tpl.id, duration: state.plan.outDuration })
+  // 重跑/改一句走的是包这一层，时间线不重新登记的话，界面右侧还挂着上一版的时长和段数
+  try {
+    const planFile = join(work, 'plan.json')
+    writeFileSync(planFile, JSON.stringify(state.plan, null, 2))
+    artifact('timeline', planFile, { duration: state.plan.outDuration })
+  } catch { /* 登记失败不影响出片 */ }
   const preview = join(group.dir, 'out', 'preview.jpg')
   await renderStill(out, Math.min(1.2, state.plan.outDuration / 3), preview)
   artifact('preview', preview)

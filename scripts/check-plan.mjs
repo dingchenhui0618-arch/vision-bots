@@ -160,6 +160,25 @@ const fillerCfg = { enabled: true, minGapSec: 0.12, words: ['嗯', '啊'], marke
   }
 }
 
+// ── 16. 词表里混了被丢掉的词（空词/零时长）时，删除表不许错位
+//     真素材上就是这么错的：一边用区间下标、一边用 i，先过滤掉一个词，后面全体偏一格，
+//     结果把重复句前一个词删掉、刀口切进它中间，字幕于是成了「但是AI来去做内」。
+{
+  const { words, total } = make(['我们', '今天', '聊', '剪', '辑', '我们', '今天', '聊', '剪', '辑', '好'])
+  // 在第 2 个词后插一个零时长的噪声词（whisper 会给这种词），它会被 norm 丢掉
+  const dirty = [...words.slice(0, 2), { w: '…', start: words[2].start, end: words[2].start }, ...words.slice(2)]
+  const p = buildPlan(dirty, total, { dedupe: { enabled: true, minWords: 3, minChars: 4, maxGapSec: 0.8 }, filler: { enabled: false } })
+  const del = p.deletions.filter(d => d.reason === 'repeat')
+  ok(del.length === 1, '混入会被丢掉词时仍然认出重复', JSON.stringify(p.deletions))
+  ok(del[0] && del[0].text === '我们今天聊剪辑', '删的仍是整段原话，不多一个字', del[0] && del[0].text)
+  // 前一遍的最后一个词「辑」必须完整保留：刀口不许切进它的尾巴
+  const firstLast = words[4]
+  const seam = p.cuts.find(c => c.reason === 'delete')
+  ok(Boolean(seam) && seam.from >= firstLast.end - 0.001, '刀口不切进前一遍的最后一个词', 'cut ' + JSON.stringify(seam) + ' vs 词尾 ' + firstLast.end)
+  const caps = buildCaptions(dirty, p).cards.map(c => c.text).join('')
+  ok(caps.includes('我们今天聊剪辑'), '字幕里第一次说的那句是完整的', caps)
+}
+
 console.log('')
 if (fail) { console.log('FAIL  ' + pass + ' 条通过，' + fail + ' 条不通过'); process.exit(1) }
 console.log('PASS  ' + pass + ' 条全过（重复 / 口头语 / 口误 / 停机分级 / 能量接缝 / 不切词 / 不丢字）')

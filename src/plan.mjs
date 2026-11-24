@@ -42,10 +42,14 @@ const bare = s => String(s || '').replace(PUNCT, '')
 
 /** 词的时间戳兜底：两种字段名都认（历史数据里有 start/end 和 s/e）。 */
 function norm(words) {
+  // i 必须是「过滤、排序之后」的下标：删除表里记的是区间下标，保留表是按 i 过滤的。
+  // 一边用下标、一边用 i，只要先被过滤掉一个词（空词、零时长），后面全体错位一格——
+  // 真素材上就是这么把重复句前一个词「容」删掉、刀口切进它中间的。
   return (words || [])
-    .map((w, i) => ({ i, w: textOf(w), start: Number(w.start ?? w.s), end: Number(w.end ?? w.e) }))
+    .map(w => ({ w: textOf(w), start: Number(w.start ?? w.s), end: Number(w.end ?? w.e) }))
     .filter(w => w.w && Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start)
     .sort((a, b) => a.start - b.start)
+    .map((w, i) => ({ ...w, i }))
 }
 
 /** 在词序列里找一段原话（连续词拼起来等于 text），near 用来区分重复出现的同一句。 */

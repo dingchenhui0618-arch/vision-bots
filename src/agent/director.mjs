@@ -8,6 +8,7 @@
  * 主 bot 派活走 dispatch_to：小 bot 自己跑一轮 → 它说的话回流给主 bot 当结论。
  * 主 bot 判断能不能验收，不能就再派一次。这就是「协调分配」。
  */
+import { statSync } from 'node:fs'
 import { byId } from '../bots/roster.mjs'
 import { Runner } from '../core/runner.mjs'
 import { runCut } from '../handlers/cut.mjs'
@@ -219,7 +220,7 @@ export class Director {
     }
   }
 
-  /** 用同一份时间线重出 */
+  /** 用同一份时间线重出：包装先干；它没真出片，引擎自己补，别把「已重出」当事实 */
   async repack(reason = '重跑') {
     const pipe = this._pipe || loadPipeline(this.group)
     if (!pipe) return { ok: false, error: '没有时间线可复用，得先剪辑。' }
@@ -232,9 +233,35 @@ export class Director {
     state.fixReport = pipe.fixReport || null
     state.source = pipe.source || null
     this.state = state
+    const before = stampFilm(this.group)
     const rank = await this.runBot('packer', '按现有时间线' + reason + '，别动时间线')
+
+    // 包装这一轮可能只回话、没调出片工具（模型会滑过去）。成片文件没变就是没出片：
+    // 出片是确定性引擎的活，它没干就引擎自己补，绝不能让群里说「已经重出」而片子没动。
+    let fallback = null
+    if (stampFilm(this.group) === before) {
+      this.group.emit({ type: 'progress', bot: 'packer', transient: true, text: '包装这轮没出片，引擎按现有时间线自己补一遍。' })
+      await this.runHandler('packer', '出片（引擎兜底）', () => this.currentJob('packer'), ctx =>
+        this.handlers.pack({ ...ctx, brief, state, narrate: false }))
+      fallback = stampFilm(this.group) === before ? '包装没出片，引擎兜底也没出新文件' : '包装没调出片工具，引擎补了一遍'
+    }
+    const packed = stampFilm(this.group) !== before
+    // 质检要查的片子就是这版成片：包装没把 state.video 带过来时，按群里的成片补上，
+    // 否则质检工具只能报「没有成片可查」，验不了就等于没验。
+    if (!this.state.video) this.state.video = (this.group.meta.artifacts || {}).video || null
     const q = await this.runBot('qc', '重出后复查成片')
-    return { ok: Boolean(rank.ok), reason, packer: rank.said, qc: q.said, qcOk: q.ok }
+    // 它可能一句话都不查就下结论（还会把上次的结论当这次的结果）。查片是确定性引擎的活：
+    // 这一轮没调工具就当没验，引擎自己跑，报告照实写。
+    if (!(q.tools || []).length) {
+      this.group.emit({ type: 'progress', bot: 'qc', transient: true, text: '质检这轮没查片，引擎自己验一遍。' })
+      await this.runHandler('qc', '质检（引擎兜底）', () => this.currentJob('qc'), ctx =>
+        this.handlers.qc({ ...ctx, brief, state: this.state, narrate: false }))
+    }
+    return {
+      ok: Boolean(rank.ok), reason, packer: rank.said, qc: q.said, qcOk: q.ok,
+      packed, fallback,
+      qcPassed: Boolean(this.state.report && this.state.report.passed),
+    }
   }
 
   /** 交付前的硬门：质检没跑过不许交，交过了不许重复交 */
@@ -245,5 +272,17 @@ export class Director {
     this.state.deliverNote = String(note || '')
     const failed = this.state.report.checks.filter(c => !c.ok).map(c => c.id)
     return { ok: true, passed: Boolean(this.state.report.passed), failed, checks: this.state.report.checks.length, note: this.state.deliverNote }
+  }
+}
+
+/** 成片的身份：大小 + mtime。重出前后一样就是片子没换，别的话都不能当证据。 */
+function stampFilm(group) {
+  const f = (group.meta.artifacts || {}).video
+  if (!f) return null
+  try {
+    const s = statSync(f)
+    return s.size + ':' + Math.round(s.mtimeMs)
+  } catch {
+    return null
   }
 }
