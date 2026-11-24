@@ -50,10 +50,15 @@ for (const tpl of TEMPLATES) {
   }
 
   if (engine === 'canvas') {
-    for (const k of PALETTE) if (!t.palette || !t.palette[k]) bad(tpl.id, '配色缺 ' + k)
+    // 每个画布模板的「设计契约」不一样：光轨有 track/palette 这一套，折光没有轨道。
+    // 模板在 template.json 里用 features 声明自己有哪些部件，缺的部位由它决定要不要查。
+    const F = t.features || {}
+    const needPalette = Array.isArray(F.palette) && F.palette.length ? F.palette : PALETTE
+    for (const k of needPalette) if (!t.palette || !t.palette[k]) bad(tpl.id, '配色缺 ' + k)
+    const needLayout = Array.isArray(F.layoutKeys) && F.layoutKeys.length ? F.layoutKeys : ['rail', 'band', 'big', 'label']
     for (const r of layouts) {
       const L = t.layouts[r]
-      for (const k of ['rail', 'band', 'big', 'label']) if (!L[k]) bad(tpl.id, r + ' 布局缺 ' + k)
+      for (const k of needLayout) if (!L[k]) bad(tpl.id, r + ' 布局缺 ' + k)
       if (L.rail && (L.rail.x + L.rail.right) >= L.size[0]) bad(tpl.id, r + ' 光轨宽度算出负数')
       if (L.big && (L.big.left + L.big.right) >= L.size[0]) bad(tpl.id, r + ' 大字可用宽度算出负数')
     }
