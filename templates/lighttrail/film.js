@@ -156,13 +156,14 @@ export async function createFilm({ media }) {
     }
   }
 
-  // ── 段落大字：一段一句，整段常驻，静置不抖 ──
-  // 同一时刻只画当前这一段：相邻两段各自淡入会在同一基线上叠成两行假标题（"如果你也是"+"捡内容生产力"）
+  // ── 大字：一句一条，区间就是那张字幕卡的区间（2026-11-24 起跟着口播换）──
+  // 同一时刻只画一条：相邻两条各自淡入会在同一基线上叠成两行假标题（"如果你也是"+"捡内容生产力"）
   function bigType(c, b, t) {
-    if (t < b.f0 - 0.12 || t >= b.f1) return
-    const appear = E.outCubic(clamp(seg(t, b.f0 - 0.12, b.f0 + 0.04)))
-    const alpha = appear
-    if (alpha <= 0.002) return
+    // 大字跟着口播换：到了这一句开口的那一刻就换上去，不做淡入。
+    // 淡入要在句首前 0.12s 起画，上一句的大字还没撤——两张叠在一起正是以前修掉的那个 bug
+    // （「一句话在屏幕上出现两次」）。换字本身是硬切，和底部字幕 pill 同一种节奏。
+    if (t < b.f0 || t >= b.f1) return
+    const alpha = 1
 
     const size = b.size
     const lh = size * BIG.lineGap
@@ -201,7 +202,7 @@ export async function createFilm({ media }) {
     const a = Math.min(first, last)
     if (a <= 0.01) return
     // 和这一段的大字重复时不画：一段话在屏幕上只出现一次，别一句变两句
-    const curBig = BIGTYPES.find(b => t >= b.f0 - 0.12 && t <= b.f1 + FADE)
+    const curBig = BIGTYPES.find(b => t >= b.f0 && t < b.f1)
     if (curBig && sameText(cur.text, curBig.text)) return
     const size = SUB.size
     const pw = Math.min(w - 48, Math.round(textEm(cur.text) * size + SUB.padX * 2))
@@ -286,15 +287,15 @@ export async function createFilm({ media }) {
 const chWidth = ch => (/[\x00-\xff]/.test(ch) ? 0.56 : 1)
 const textEm = str => [...String(str)].reduce((n, ch) => n + chWidth(ch), 0)
 
-/** 两句是不是同一句（字幕和大字撞车时用；只比字，不改写）。 */
+/**
+ * 两句是不是同一句（字幕和大字撞车时用；只比字，不改写）。
+ * 只认「完全一样」：现在大字是这一句的压缩词，几乎总是这句字幕的子串，
+ * 按「包含」判撞车会把正常句子的字幕整条吞掉（2026-11-24 改成句级大字后实测）。
+ */
 function sameText(a, b) {
-  const A = String(a || '').replace(/[\s，。！？、；：,.!?;:""''…—~·]/g, '')
-  const B = String(b || '').replace(/[\s，。！？、；:,.!?;:""''…—~·]/g, '')
-  if (!A || !B) return false
-  if (A === B) return true
-  // 不只是前缀：一句包住另一句也算撞车（实测「AI模型做AI工具的」和「做AI工具的」同时在屏上）
-  if (Math.min(A.length, B.length) >= 4 && (A.includes(B) || B.includes(A))) return true
-  return (A.startsWith(B) || B.startsWith(A)) && Math.min(A.length, B.length) >= 4
+  const norm = x => String(x || '').replace(/[\s，。！？、；：,.!?;:""''…—~·]/g, '')
+  const A = norm(a), B = norm(b)
+  return Boolean(A && B && A === B)
 }
 
 // 行首禁则：和 src/segment.mjs 同一份字表。单字助词不许起行，并回上一行。

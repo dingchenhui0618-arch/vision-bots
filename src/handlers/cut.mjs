@@ -12,7 +12,7 @@ import { paramsOf } from '../bots/config.mjs'
 import { buildCaptions, toSRT } from '../captions.mjs'
 import { correct, loadTerms, hotwordPrompt, applyToSegments } from '../asr-fix.mjs'
 import { sectionsOf } from '../sections.mjs'
-import { titleSections } from '../section-titles.mjs'
+import { titleSentences } from '../headlines.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
 
@@ -137,21 +137,23 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   state.fixReport = fixReport
   state.lowConfidence = fixReport.pending
 
-  // 段落大字标题：模型提案，接地校验（字必须来自这一段自己说过的话）。
-  // 时间码还是时间码：模型只产出文本，段落边界仍由 mergeSections 决定。
+  // 句级大字：模型提案，接地校验（每个字都必须来自这一句自己）。
+  // 时间码还是时间码：模型只产出文本，句子边界仍由 whisper 的时间戳决定；
+  // 大字在句子开头换，所以画面上不会出现「说到下一句了、大字还停在上一句」。
   const secs = sectionsOf({ segments, plan })
+  // 大字的上屏单位 = 字幕卡：字幕换卡那一刻大字就换，两套边界不许各切各的
+  // （按 whisper 段切过一次，一段塞进 4 张卡、8.9 秒不换字，用户 2026-11-24 否掉）
+  const sents = captions.cards.map((c, i) => ({ index: i + 1, start: c.start, end: c.end, text: c.text }))
   const budget = bigBudget(group.meta.template || brief.template, brief.ratio)
-  if (budget && secs.length) {
-    group.emit({ type: 'progress', bot: 'cutter', text: '剪辑在给 ' + secs.length + ' 段起大字标题…', transient: true })
-    const t = await titleSections({ sections: secs, maxChars: budget, log })
-    state.sectionTitles = t.titles
-    brief.sectionTitles = t.titles
+  if (budget && sents.length) {
+    group.emit({ type: 'progress', bot: 'cutter', text: '剪辑在给 ' + sents.length + ' 张字幕卡起大字…', transient: true })
+    const t = await titleSentences({ sentences: sents, log })
+    state.sentenceTitles = t.titles
+    brief.sentenceTitles = t.titles
     state.titleStats = t.stats || null
     const adopted = t.titles.filter(x => x.source === 'model')
-    if (adopted.length) {
-      log('大字标题：' + adopted.map(x => x.index + '「' + x.text + '」').join(' '))
-      group.emit({ type: 'progress', bot: 'cutter', text: '大字标题定了 ' + adopted.length + ' / ' + secs.length + ' 段', transient: true })
-    }
+    log('句级大字：' + t.titles.map(x => x.index + '「' + x.text + '」').join(' '))
+    group.emit({ type: 'progress', bot: 'cutter', text: '大字定了 ' + adopted.length + ' / ' + sents.length + ' 句（模型），其余按原文摘句', transient: true })
   }
 
   // 交付之后「改一句」要基于这一份：词、句、时间线、字幕卡全在，不用重跑转写。

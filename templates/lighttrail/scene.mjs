@@ -5,8 +5,9 @@
 import { makeMapper } from '../../src/plan.mjs'
 import { mergeSentences, CHAPTER_MAX } from '../../src/chapters.mjs'
 import { segment, wrapWords } from '../../src/segment.mjs'
-// 段落推导和剪辑共用一份：剪辑给段落起标题、这里把标题画上屏，索引错一位大字就挂错段
-import { sentencesOf, sectionsOf, applyTitles } from '../../src/sections.mjs'
+// 段落推导只有一份：光轨刻度（01/10）用它；大字另有自己的单位（字幕卡，见下）
+import { sentencesOf, sectionsOf } from '../../src/sections.mjs'
+import { HEADLINE, insideSentence, checkHeadline, pickHeadline } from '../../src/headlines.mjs'
 
 const round = (n, k = 3) => Number(n.toFixed(k))
 
@@ -59,8 +60,8 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
   })).filter(c => c.text && c.f1 > c.f0)
 
   // ── 章节：取 ASR 整句，短句并进去，但并长了不并（和 PPT 底座同一套规则）──
-  const sentences = sentencesOf({ segments, plan })
-  const chapters = mergeSentences(sentences).map(c => ({ start: round(c.start), end: round(c.end), text: c.text }))
+  const sentenceList = sentencesOf({ segments, plan })
+  const chapters = mergeSentences(sentenceList).map(c => ({ start: round(c.start), end: round(c.end), text: c.text }))
   if (chapters.length < 2) {
     // 句子信息不可用（whisper 有时整段只回一个 segment）时退回到按卡片分组：
     // 攒到 CHAPTER_MAX 字就落一章，不再固定「两张一章」——那样会攒出三行墙和「这件事」这种孤儿章。
@@ -80,14 +81,11 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     chapters.splice(0, chapters.length, ...mergeSentences(chapters, { maxChars: CHAPTER_MAX, shortSec: 0 }))
   }
 
-  // ── 段落与大字：几秒一段，一段一句大字 ──
-  // 以前「一章 = 一句」，68 秒切 22 章，平均 3.1 秒换一次大字，观感是字幕在抖（用户 2026-11-23 否掉）。
-  // 现在大字跟着段落走，一句话那一级交给下面的字幕 pill。
-  // 用没合并过的整句做段落：pickTitle 才能挑到 6–12 字的钉子句（合并过的长句里挑不出短句）
-  // 大字文本：模型给过且过了接地校验就用模型的（source: 'model'），否则沿用原句。
-  // 这里不做任何改写校验——校验在 section-titles.mjs 里做完，带 ok:false 的根本贴不进来。
-  const titled = applyTitles(sectionsOf({ segments, plan }), brief.sectionTitles)
-  const sections = titled.sections
+  // ── 段落：只负责光轨刻度和 01/10 编号，不再决定大字什么时候换 ──
+  const sections = sectionsOf({ segments, plan })
+  // 大字的上屏单位 = 字幕卡：字幕换卡的那一刻大字跟着换。
+  // 以前按 whisper 段/concat 出的“句子”切，段里能塞进 4 张卡（8.9 秒），口播早进了下一句，
+  // 大字还挂在上一句的标题上（用户 2026-11-24 指出）。用卡片做单位，两边边界天然重合。
   // 大字断行在数据层算完，和 PPT 底座共用 src/segment.mjs 的规则：
   // 刚好装下 + 各行均衡 + 末行太短从上一行借一个词 + 行首禁则。
   // 渲染器不再自己按字数硬切——两套规则各切各的，实测切出过「会做内容的人 / 少」这种单字孤行。
@@ -98,16 +96,34 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     while (out.length > (bigL.maxLines || 2) && per < 15) { per += 1; out = wrapWords(text, per) }
     return out
   }
-  const bigs = sections.map((sec) => ({
-    index: sec.index,
-    text: sec.text,
-    // 词边界跟着内容走：画布引擎按它断行，不靠字数硬切（「视 / 频」那种切口）
-    words: segment(sec.text),
-    f0: round(sec.start),
-    // 大字挂到这一段结束为止，不按字数提前撤（早退会留下只闻其声、不见其字的空档）
-    f1: round(sec.end),
-    lines: bigLines(sec.text),
-  }))
+  // 大字区间 = 字幕卡区间：字幕换卡的同一帧大字一起换，一直挂到下一张卡开口。
+  // 以前挂在段落上（2–4 句、最长 16 秒），口播进了下一句大字还停在上一句，
+  // 用户 2026-11-24 明确否掉：「说到下一段了，字幕还在上一段」。
+  // 标题 100% 落在本卡（insideSentence），改一句之后标题里的字要是没了就当场退回原文摘句，
+  // 不靠重新跑一遍模型——那会让「说一句改一处」又变成整条重来。
+  const headTitles = new Map((brief.sentenceTitles || []).filter(t => t && t.ok === true).map(t => [Number(t.index), String(t.text || '')]))
+  const bigs = []
+  beats.forEach((s, i) => {
+    const next = beats[i + 1]
+    const f0 = round(s.f0)
+    // 区间就是这张卡自己的区间：字幕卡一消失大字也撤，绝不挂在静音里等下一句
+    const f1 = round(Math.min(next ? next.f0 : duration, Math.max(s.f1, s.f0 + 0.35)))
+    if (f1 - f0 < 0.05) return
+    // 一张字幕卡只说 1 秒就换字，观感是抖：这一句交给底部字幕 pill，大字宁缺也不拿上一张的凑
+    if ((next ? next.f0 : s.f1) - s.f0 < HEADLINE.minSec) return
+    const asked = headTitles.get(i + 1)
+    const text = asked && insideSentence(asked, s.text) && checkHeadline(asked, s.text).ok ? asked : pickHeadline(s.text)
+    if (!text) return
+    bigs.push({
+      index: bigs.length + 1,
+      text,
+      // 词边界跟着内容走：画布引擎按它断行，不靠字数硬切（「视 / 频」那种切口）
+      words: segment(text),
+      f0,
+      f1,
+      lines: bigLines(text),
+    })
+  })
 
   // ── 字幕：一句一张，压在底部 pill 里，逐句换；词级落点一起带上 ──
   const subs = beats.map(b => ({ text: b.text, f0: b.f0, f1: b.f1 }))

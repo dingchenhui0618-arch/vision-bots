@@ -39,13 +39,13 @@ export async function runPack({ group, job, log, artifact, brief, state, narrate
 
   let built = null
   if (builder) {
-    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief: { ...brief, ratio: spec.ratio, sectionTitles: state.sectionTitles || brief.sectionTitles || null }, spec, captions: state.captions })
+    built = builder({ words: state.transcript.words, segments: state.transcript.segments, plan: state.plan, brief: { ...brief, ratio: spec.ratio, sentenceTitles: state.sentenceTitles || brief.sentenceTitles || null }, spec, captions: state.captions })
     if (built.scene) {
       const scenePath = join(work, 'scene.json')
       writeFileSync(scenePath, JSON.stringify(built.scene, null, 2), 'utf8')
       artifact('scene', scenePath)
       state.scene = built.scene
-      log(tpl.name + '：' + (built.scene.chapters || built.scene.bigs || []).length + ' 章，' + (built.scene.ratio || spec.ratio) + ' ' + spec.width + '×' + spec.height)
+      log(tpl.name + '：' + (built.scene.bigs ? built.scene.bigs.length + ' 条大字' : (built.scene.chapters || []).length + ' 章') + '，' + (built.scene.ratio || spec.ratio) + ' ' + spec.width + '×' + spec.height)
     }
   }
 
@@ -93,6 +93,9 @@ export async function runPack({ group, job, log, artifact, brief, state, narrate
   }
 
   artifact('video', out, { template: tpl.id, duration: state.plan.outDuration })
+  // 成片换了，上一版的质检结论就作废：不清掉就会出现「片子是新的、报告是旧的」，
+  // 交付硬门只查 report 存不存在，于是拿旧报告放行新片子（2026-11-24 主流程里抓到）。
+  state.report = null
   // 重跑/改一句走的是包这一层，时间线不重新登记的话，界面右侧还挂着上一版的时长和段数
   try {
     const planFile = join(work, 'plan.json')
@@ -109,7 +112,7 @@ export async function runPack({ group, job, log, artifact, brief, state, narrate
 
   if (narrate) group.say('packer',
     '出片了：' + tpl.name + '，' + spec.width + '×' + spec.height + '，' + state.plan.outDuration.toFixed(1) + 's，渲染 ' + renderSeconds.toFixed(1) + 's。' +
-    (state.scene && state.scene.bigs ? '\n' + state.scene.bigs.length + ' 章大字，逐字落在音节上；光轨一条到底，音效跟着动作走。' : '') +
+    (state.scene && state.scene.bigs ? '\n' + state.scene.bigs.length + ' 条大字，一句一条跟着口播换；光轨一条到底，音效跟着动作走。' : '') +
     (state.scene && state.scene.chapters ? '\n分 ' + state.scene.chapters.length + ' 章，小节标题取的是原话，没有改写。' : '') +
     (state.decision && state.decision.mode === 'patch'
       ? '\n只是改了那一处：' + state.decision.reason + '，其余帧从母版切出来拼回去，渲染 ' + renderSeconds.toFixed(1) + 's。'

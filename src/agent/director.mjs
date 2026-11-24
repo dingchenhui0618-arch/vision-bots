@@ -111,6 +111,18 @@ export class Director {
       })
     } finally { this.depth-- }
 
+    // 质检这一轮只说了话、一次片都没查（模型没调 inspect_film）：不许把「没验」当成「验过」。
+    // 兜底放在 runBot 里，主流程和返工都走这一条路，不用每个调用点各写一份。
+    if (botId === 'qc' && !this.state.report) {
+      this.group.emit({ type: 'progress', bot: 'qc', job: out.id, transient: true, text: '质检这轮没查片，引擎自己验一遍。' })
+      try {
+        await this.runHandler('qc', '质检（引擎兜底）', () => this.currentJob('qc'), ctx =>
+          this.handlers.qc({ ...ctx, brief: this.brief, state: this.state, narrate: false }))
+      } catch (e) {
+        this.group.emit({ type: 'progress', bot: 'qc', job: out.id, transient: true, text: '引擎兜底的质检也失败了：' + String(e.message || e).slice(0, 120) })
+      }
+    }
+
     const r = out.result || {}
     if (r.text) this.group.say(botId, r.text, { job: out.id, tools: (r.used || []).map(u => u.name) })
     if (!r.ok) {

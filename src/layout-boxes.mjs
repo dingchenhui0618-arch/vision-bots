@@ -52,15 +52,14 @@ export function layoutBoxes({ scene, template }) {
     t0: 0.9, t1: scene.duration,
   })
   // 字幕：和 film.js 同一个字宽公式 → 盒子就是 pill 本身。
-  // 和这一段大字重复的字幕，渲染时是不画的（一段话只上一次屏），盒子也不能算进来，
+  // 和这条大字完全一样的字幕，渲染时是不画的（一句话只上一次屏），盒子也不能算进来，
   // 否则质检会在「没有 pill 的帧」上量对比度，凭空得到一个低分（实测踩到）。
+  // 和 film.js 同一套判据：只认完全一样。句级大字通常是字幕的子串，
+  // 按包含判会把正常句子的字幕盒子整条吞掉——质检就漏量了那几帧。
   const sameText = (a, b) => {
     const norm = (x) => String(x || '').replace(/[\s，。！？、；：,.!?;:""''…—~·]/g, '')
     const A = norm(a), B = norm(b)
-    if (!A || !B) return false
-    if (A === B) return true
-    if (Math.min(A.length, B.length) >= 4 && (A.includes(B) || B.includes(A))) return true
-    return (A.startsWith(B) || B.startsWith(A)) && Math.min(A.length, B.length) >= 4
+    return Boolean(A && B && A === B)
   }
   for (const s of scene.subs || []) {
     const sec = (scene.bigs || []).find(b => s.f0 >= b.f0 - 0.12 && s.f0 < b.f1)

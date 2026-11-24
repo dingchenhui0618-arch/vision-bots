@@ -65,7 +65,11 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
     semantic = await reviewText({
       words: (state.transcript && state.transcript.words) || [],
       captions: state.captions,
-      sections: (state.scene && state.scene.sections) || [],
+      // 不把 scene.sections 传给语义审读：段落文本来自 whisper 的整段句子，里面还带着
+      // 「已经剪掉的那一句」（删词只动 plan.keep，不动转写）。传进去模型就会报
+      // 「重复句：但是AI来去做内容」——片子里其实只剩一遍（2026-11-24 自测06 实测踩到）。
+      // 它该看的是交付字幕卡本身；大字是这些卡的压缩词，不构成新的文案来源。
+      sections: [],
       brief, terms: loadTerms(group.dir), log,
     })
   } catch (e) {

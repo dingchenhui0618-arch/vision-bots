@@ -160,5 +160,28 @@ console.log('\n[6] 派活层级')
   ok('层数太深直接停', !r.ok && String(r.error).includes('太深'))
 }
 
+// ── 7. 质检只说话不查片：引擎必须自己验；成片一换旧报告作废 ──
+console.log('\n[7] 质检兜底与报告作废')
+{
+  const g = group('质检兜底')
+  const state = {}
+  const d = new Director(g, { brief: { duration: 60, template: 'subtitle-only', ratio: '9:16' }, state })
+  let engineRuns = 0
+  d.handlers.qc = async () => { engineRuns++; state.report = { passed: true, checks: [{ id: 'x', ok: true }] }; return { ok: true } }
+  // 模型这一轮只说了「我先抽帧看片」，一次 inspect_film 都没调
+  d.chatFn = async () => ({ ok: true, content: '我先抽帧看片，把问题一次查全。', toolCalls: [] })
+  const r1 = await d.runBot('qc', '查片')
+  ok('质检没调工具时引擎自己跑一遍', engineRuns === 1 && Boolean(state.report), 'engineRuns=' + engineRuns)
+  ok('质检没查片也要给出结论（不装作查过了）', Boolean(r1) && state.report.passed === true)
+  const r2 = await d.runBot('qc', '再查一遍')
+  ok('报告还在就不重复跑引擎', engineRuns === 1, 'engineRuns=' + engineRuns)
+
+  // 成片一换，旧报告必须作废：源码级守卫（runPack 真的出片后再清，测不到就钉住顺序）
+  const packSrc = readFileSync(new URL('../src/handlers/pack.mjs', import.meta.url), 'utf8')
+  const at = packSrc.indexOf("artifact('video'")
+  const clear = packSrc.indexOf('state.report = null')
+  ok('出片之后立刻清掉旧质检报告（片子新、报告旧的组合不许存在）', at > 0 && clear > at)
+}
+
 console.log('\n' + (fail ? 'FAIL' : 'PASS') + '  ' + pass + ' passed, ' + fail + ' failed')
 process.exit(fail ? 1 : 0)
