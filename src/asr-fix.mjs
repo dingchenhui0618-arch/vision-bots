@@ -32,7 +32,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { chat, LLM } from './llm.mjs'
+import { chat, chatCached, LLM, taskCall, pairFor } from './llm.mjs'
 import { R as RELISTEN, alignCrop, charDiff, enabled as relistenEnabled, modelAvailable as relistenModel, planRepair, relistenSentence, silentGaps, slotAnomaly } from './relisten.mjs'
 
 /** execFile 不收 stdin，拼音查询要喂 JSON，所以自己开管道。 */
@@ -457,11 +457,28 @@ function locateInSentence(v, from) {
   return { a, b }
 }
 
-async function callSentenceReview(view, { model = LLM.models.fast } = {}) {
+/**
+ * 这一轮错字治理用哪只模型出提案、用哪只模型做第二意见。
+ *
+ * 提案跟着剪辑 bot 的配置走（换模型只改 config/bots/cutter.json——接 Opus 也只改这里，
+ * 以前这里硬写 fast，所以客户把剪辑换成什么模型，改字这一步都不动，等于白换）。
+ * 第二意见必须是**另一只**模型：同一只模型问两遍不构成第二条独立事实。
+ * 两只撞成同一只时 distinct:false，调用方跳过第二意见并照实说明。
+ *
+ * 温度不跟配置走：证据层的三遍（整句 / 逐词 / 字数回问）恒为 0。这不是口味，
+ * 是「同一个输入必须给同一批提案」的前提——温度一抖，同一段素材两次跑改的字就不一样。
+ */
+export function proposerCall() {
+  const p = taskCall('cutter', { maxTokens: 1200 })
+  return { ...p, ...pairFor(p.model, LLM.models) }
+}
+
+async function callSentenceReview(view, { model = null } = {}) {
   const lines = view.map((v, k) => `${k + 1}|${v.text}`).join('\n')
+  const c = proposerCall()
   const t0 = Date.now()
   try {
-    const r = await chat({ prompt: SENT_PROMPT(lines), maxTokens: 1200, model, temperature: 0 })
+    const r = await chatCached({ prompt: SENT_PROMPT(lines), maxTokens: 1200, model: model || c.primary, temperature: 0, timeoutMs: c.timeoutMs })
     if (!r.ok) return { skipped: r.skipped, detail: r.detail || null }
     const m = r.content.match(/\[[\s\S]*\]/)
     const proposals = m ? JSON.parse(m[0]) : []
@@ -702,7 +719,8 @@ export const FIXER_VERSION = createHash('sha1')
 async function callModel(wordList, { nudge = '' } = {}) {
   const t0 = Date.now()
   try {
-    const r = await chat({ prompt: PROMPT(wordList, nudge), maxTokens: 1200, model: LLM.models.fast, temperature: 0 })
+    const c = proposerCall()
+    const r = await chatCached({ prompt: PROMPT(wordList, nudge), maxTokens: 1200, model: c.primary, temperature: 0, timeoutMs: c.timeoutMs })
     if (!r.ok) return { skipped: r.skipped, detail: r.detail || null }
     const m = r.content.match(/\[[\s\S]*\]/)
     const proposals = m ? JSON.parse(m[0]) : []
@@ -1233,10 +1251,12 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
   }
 
   if (askModel && view && passNeed.length) {
-    if (LLM.models.smart === LLM.models.fast) {
-      report.dual = { skipped: 'single-model', detail: 'fast 和 smart 是同一个模型，凑不出第二意见' }
+    const pair = proposerCall()
+    report.models = { proposer: pair.primary, auditor: pair.auditor, distinct: pair.distinct }
+    if (!pair.distinct) {
+      report.dual = { skipped: 'single-model', detail: '提案模型和第二意见撞成同一只（' + pair.primary + '），凑不出第二意见' }
     } else {
-      const r1b = await callSentenceReview(view, { model: LLM.models.smart })
+      const r1b = await callSentenceReview(view, { model: pair.auditor })
       if (r1b.skipped) {
         report.dual = { skipped: r1b.skipped, detail: r1b.detail || null }
         log('第二意见：模型没接上（' + r1b.skipped + '），语义型错这轮不改')

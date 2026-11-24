@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { botConfig } from './bots/config.mjs'
+import { proposalKey, cacheRead, cacheWrite } from './proposal-cache.mjs'
 
 /**
  * 本机配置文件：config/llm.local.json（.gitignore 排除，密钥只落在这里和我们自己的环境变量）。
@@ -67,6 +68,51 @@ export function callProfile(botId) {
 /** 界面上显示用：这个 bot 实际连的是哪个模型。 */
 export function modelFor(botId) {
   return callProfile(botId).model
+}
+
+/**
+ * 产线里的一次模型调用用哪套参数。**分镜、大字、整句删、错字治理、语义审读都必须走这里。**
+ *
+ * 为什么要有它（自测 19–21 的根因之一）：四个 bot 的配置（config/bots/<id>.json）里写着
+ * 「剪辑 smart、温度 0」「包装 fast、温度 0、''同一个数不许报两遍''」，可真正产出片子的那几次
+ * 调用一直绕开这份配置：各自硬写 LLM.models.fast、不传温度。于是——
+ *   · 同一素材连跑五次，分镜 13/9/9/11/12 段、整句删时有时无（温度用了服务端默认，不是 0）；
+ *   · 客户把剪辑换成更强的模型（比如接 Opus）时，改字和选句这些真正决定成败的调用根本没换。
+ * 配置是声明，产线是执行；声明不落到执行上，就是两句空话。
+ *
+ * 语义（三条，别加第四条）：
+ *   · model / temperature 听 bot 配置——换模型、钉温度只改 config/bots/<id>.json；
+ *   · maxTokens / timeoutMs 由任务决定（调用点给了就用它的）：一次调用要多少 token 是输出格式
+ *     定的（24 张字幕卡压不进 700 token），超时是这一步愿意等多久（读需求只等 15 秒）。
+ *     调用点没给才用 bot 的配置。这两样跟着任务走，配置不会悄悄改掉某一步的预算和耐心；
+ *   · temperature = null 表示这个 bot 用服务端默认（producer.json 明确这么写：判断可以有点随机，
+ *     只有需要复现的地方才钉死）。
+ */
+export function taskCall(botId, { maxTokens = null, timeoutMs = null } = {}) {
+  const p = callProfile(botId)
+  const tok = Number(maxTokens) || Number(p.maxTokens) || 700
+  const to = Number(timeoutMs) || Number(p.timeoutMs) || LLM.timeoutMs
+  return {
+    bot: botId,
+    model: p.model,
+    temperature: p.temperature === undefined ? null : p.temperature,
+    maxTokens: tok,
+    timeoutMs: to,
+    source: p.source,
+  }
+}
+
+/**
+ * 证据对：第一只模型出提案，第二只模型逐字同意才算证据。
+ * 同一只模型问两遍不构成第二条独立事实，所以两个位置**必须是不同的模型**。
+ * 换模型（比如接 Opus）只换第一只，第二只自动退到另一档；两只一样时返回 distinct:false，
+ * 调用方据此跳过第二意见并照实说「凑不出第二意见」，绝不能拿同一只模型自己同意自己。
+ */
+export function pairFor(primary, models = LLM.models) {
+  const fast = models && models.fast
+  const smart = models && models.smart
+  const auditor = primary === smart ? fast : smart
+  return { primary, auditor, distinct: Boolean(auditor) && auditor !== primary }
 }
 
 /** 凭证：环境变量 > 本机配置文件 > codex 登录态。不入库、不打印。 */
@@ -175,6 +221,55 @@ export function extractJSON(text) {
     }
   }
   return null
+}
+
+/**
+ * 提案缓存：模型不保证可复现（同一输入连问两次会给出两套分镜——温度钉 0 也一样，
+ * 详见 src/proposal-cache.mjs 的头注），所以产线要「问过一次就记住」。
+ * 由 handler 在开跑前指定目录（groups/<id>/proposals）；没指定就退回直连模型。
+ */
+let PROPOSAL_DIR = null
+export function useProposalCache(dir) {
+  PROPOSAL_DIR = dir || null
+  return PROPOSAL_DIR
+}
+export function proposalCacheDir() {
+  return PROPOSAL_DIR
+}
+const cacheKeyFor = (opts, kind) => proposalKey({
+  prompt: opts.prompt || '', system: opts.system || '', messages: opts.messages || null,
+  model: opts.model || LLM.model, temperature: opts.temperature === undefined ? null : opts.temperature,
+  maxTokens: opts.maxTokens === undefined ? null : opts.maxTokens, kind,
+})
+
+/**
+ * 带缓存的纯文本调用（错字治理的提案走这条）：命中就交回上次那份原文，不再问模型。
+ * 返回值多一个 cached:true 和 askedAt（这份是哪天问出来的）。
+ */
+export async function chatCached(opts = {}) {
+  const key = cacheKeyFor(opts, 'text')
+  const hit = cacheRead(PROPOSAL_DIR, key)
+  if (hit && typeof hit.content === 'string') {
+    return { ok: true, content: hit.content, toolCalls: [], model: hit.model || opts.model || LLM.model, ms: 0, tokens: null, cached: true, askedAt: hit.at || null }
+  }
+  const r = await chat(opts)
+  if (r.ok) cacheWrite(PROPOSAL_DIR, key, { kind: 'text', content: r.content, model: r.model, askedAt: new Date().toISOString() })
+  return r
+}
+
+/**
+ * 带缓存的 JSON 调用（分镜 / 大字 / 整句删 / 语义审读走这条）。
+ * 只缓存解析成功的那份：模型输出坏了不记，下次还会重问。
+ */
+export async function chatJSONCached(opts = {}) {
+  const key = cacheKeyFor(opts, 'json')
+  const hit = cacheRead(PROPOSAL_DIR, key)
+  if (hit && hit.value && typeof hit.value === 'object') {
+    return { ok: true, value: hit.value, model: hit.model || opts.model || LLM.model, ms: 0, tokens: null, cached: true, askedAt: hit.at || null }
+  }
+  const r = await chatJSON(opts)
+  if (r.ok) cacheWrite(PROPOSAL_DIR, key, { kind: 'json', value: r.value, model: r.model, askedAt: new Date().toISOString() })
+  return r
 }
 
 /** 一次 JSON 调用：{ok, value, ms, tokens, model} 或 {ok:false, skipped}。value 解析不出来时 skipped='bad-json'。 */

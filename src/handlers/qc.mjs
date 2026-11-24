@@ -9,6 +9,7 @@ import { renderStill } from '../render.mjs'
 import { probe } from '../probe.mjs'
 import { reviewText } from '../qa-semantic.mjs'
 import { loadTerms } from '../asr-fix.mjs'
+import { useProposalCache } from '../llm.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
 
@@ -16,6 +17,8 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
   if (!state.video) throw new Error('没有成片可查')
   const dir = join(group.dir, 'work', job.id, 'frames')
   mkdirSync(dir, { recursive: true })
+  // 语义审读也走提案缓存：字幕没变就不该重问（同一份字幕两次审读可能一次报一次不报）
+  useProposalCache(join(group.dir, 'proposals'))
 
   const info = await probe(state.video)
   const dur = info.duration

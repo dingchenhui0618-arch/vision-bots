@@ -31,14 +31,48 @@ export function layoutBoxes({ scene, template }) {
     const items = []
     const shots = scene.shots || [{ f0: 0, f1: scene.duration, kind: 'full' }]
     const shotAt = (t) => shots.find(s => t >= s.f0 && t < s.f1) || shots[0]
-    // 大字：按版式给不同的底边（和 film.js 的 bigBottom 一致）
-    for (const b of scene.bigs || []) {
-      const shot = shotAt(b.f0)
+    const pagesOf = scene.pages || []
+    const pageAt = t => pagesOf.find(p => t >= p.start && t < p.end) || pagesOf[0] || null
+    // 页首 1.5 秒章节卡占场，大字不出场（和 film.js 的 drawBig 同一条）。
+    // 不认这条，盒子就会报一个画面上根本不存在的大字（自测22 第 492 帧的假报）。
+    const bigVisibleFrom = b => {
+      const pg = pageAt(b.f0)
+      return pg && pg.title ? Math.max(b.f0, pg.start + 1.5) : b.f0
+    }
+    // 刻度卡压着右边一块（0.575h 起、高 210）。大字的板从下往上长，短句子会被字号上限顶到 168px，
+    // 板顶正好插进卡底（自测22 第 545 帧：「越来越低 ↓」被板沿切掉）。和 film.js 的 bigGeom 同一口径：
+    // 有卡在场就把字号缩到板顶落在卡底 22px 以下。
+    const gaugeBottomDuring = (f0, f1) => {
+      let best = null
+      for (const g of scene.blocks || []) {
+        if (g.kind !== 'gauge') continue
+        if (g.f1 <= f0 || g.f0 >= f1) continue
+        const bot = h * 0.575 + 210
+        if (best === null || bot > best) best = bot
+      }
+      return best
+    }
+    // 一句大字的字号：内容定上限，刻度卡再压一道。画、让位、盒子三处都从这个口径走。
+    const bigSizeOf = (b, shot) => {
       const lines = Math.max(1, (b.lines && b.lines.length) || 1)
       const longest = Math.max(1, ...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))
       // 三行缩一档，和 film.js 的 fitBigSize 同一口径（不然盒子说 96、画面画 90，量出来的高度是假的）
       const capSize = lines >= 3 ? Math.min(TY.big || 96, 104) : (TY.big || 96)
-      const size = Math.max(TY.bigMin || 62, Math.min(capSize, Math.floor(((w - L.big.left - L.big.right) * 0.98) / longest)))
+      let size = Math.max(TY.bigMin || 62, Math.min(capSize, Math.floor(((w - L.big.left - L.big.right) * 0.98) / longest)))
+      const gBot = gaugeBottomDuring(bigVisibleFrom(b), b.f1)
+      if (gBot !== null) {
+        const bottom = shot.kind === 'frame' ? h * 0.80 : h * 0.775
+        const room = bottom - gBot - 22
+        const maxSize = Math.floor(room / (lines * ((L.big && L.big.lineGap) || 1.06) + 0.14))
+        size = Math.max(TY.bigMin || 62, Math.min(size, maxSize))
+      }
+      return size
+    }
+    // 大字：按版式给不同的底边（和 film.js 的 bigBottom 一致）
+    for (const b of scene.bigs || []) {
+      const shot = shotAt(b.f0)
+      const lines = Math.max(1, (b.lines && b.lines.length) || 1)
+      const size = bigSizeOf(b, shot)
       // 盒子量的是「墨迹」，不是行盒：film.js 把基线画在 top + i*lh + size*0.86 上，
       // 所以第一行字顶在 top + 0.14*size，最后一行字底在 top + (lines-1)*lh + 0.74*size。
       // 按行盒算会往下多出 30px 的空白，和大字上方的图形块量出 4px 的假重叠（自测 11 踩到）。
@@ -65,7 +99,7 @@ export function layoutBoxes({ scene, template }) {
         w: Math.min(maxW, Math.round(widest + padX * 2)),
         h: Math.round(lines * lh + padY * 2),
       }
-      items.push({ tag: 'big', x: plate.x, y: plate.y, w: plate.w, h: plate.h, t0: b.f0, t1: b.f1, shot: shot.kind })
+      items.push({ tag: 'big', x: plate.x, y: plate.y, w: plate.w, h: plate.h, t0: bigVisibleFrom(b), t1: b.f1, shot: shot.kind })
       // 印章：和 film.js 的 stamp() 同一套条件与位置（2–3 字的强调词才盖）
       const hotTxt = String(b.hot || '').replace(/[\s，。！？、；：,.!?;:""''…—~·\-]/g, '')
       if (hotTxt.length >= 2 && hotTxt.length <= 3) {
@@ -115,15 +149,24 @@ export function layoutBoxes({ scene, template }) {
 
     // 满幅页上大字就压在同一段（0.775h 往上长），对勾卡再画在 0.775h 就是字压字。
     // 和 film.js 的 checkCard 同一口径：有大字时卡让到大字上面（行盒顶 - 22px）。
-    const bigLineTopAt = (t) => {
-      const b = (scene.bigs || []).find(x => t >= x.f0 && t < x.f1)
-      if (!b) return null
-      const linesN = Math.max(1, (b.lines && b.lines.length) || 1)
-      const longest = Math.max(1, ...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))
-      const capSize = linesN >= 3 ? Math.min(TY.big || 96, 104) : (TY.big || 96)
-      const size = Math.max(TY.bigMin || 62, Math.min(capSize, Math.floor(((w - ((L.big && L.big.left) || 62) - ((L.big && L.big.right) || 150)) * 0.98) / longest)))
-      const lh = size * ((L.big && L.big.lineGap) || 1.06)
-      return h * 0.775 - linesN * lh
+    // 大字底板的上沿：**这段区间里最高那块板**。和 film.js 的 checkCard 同一口径——
+    // 以前这里按「区间起点那一帧」算，卡跨两句大字时会拿短的那句（size 106）去算，
+    // 报出 11px 重叠，而画面其实让开了（自测21 第 1104 帧：假失败）；反过来卡的位置
+    // 也会随着大字换句跳动。两处都改成「区间内最高那块板」，盒子和画面才是同一件事。
+    const bigPlateTop = (f0, f1) => {
+      let best = null
+      for (const b of scene.bigs || []) {
+        // 被章节卡压住那段不算：那 1.5 秒它没画出来
+        if (b.f1 <= Math.max(f0, bigVisibleFrom(b)) || b.f0 >= f1) continue
+        const shot = shotAt(b.f0)
+        const linesN = Math.max(1, (b.lines && b.lines.length) || 1)
+        const size = bigSizeOf(b, shot)
+        const lh = size * ((L.big && L.big.lineGap) || 1.06)
+        const bottom = shot.kind === 'frame' ? h * 0.80 : h * 0.775
+        const pt = Math.round(bottom - linesN * lh - Math.round(size * 0.14))
+        if (best === null || pt < best) best = pt
+      }
+      return best
     }
 
     // 图形块：按种类算真实范围（不是「整块保守区」）
@@ -132,7 +175,7 @@ export function layoutBoxes({ scene, template }) {
       if (b.kind === 'check') {
         let yb = sk === 'corner' ? h * 0.50 : sk === 'frame' ? h * 0.86 : h * 0.775
         // 对**所有**版式都让开大字（自测15：竖框页上大字也在下半区，卡 1484–1568px 压字）
-        const top = bigLineTopAt(b.f0)
+        const top = bigPlateTop(b.f0, b.f1)
         if (top !== null) yb = Math.max(h * 0.30, top - 22)
         // 卡底不许越过字幕顶（和 film.js 的 checkCard 同一口径）
         const subPh = Math.round((TY.sub || 42) * 1.28 + SUB2.padY * 2)

@@ -3,6 +3,7 @@
  * 模型说的话靠真素材跑片看，这里只验「规则有没有漏洞」——尤其兜底路径。
  */
 import { checkHeadline, pickHeadline, HEADLINE, onWordBoundary } from '../src/headlines.mjs'
+import { checkPageTitle } from '../src/pages.mjs'
 
 let pass = 0
 const fails = []
@@ -37,6 +38,24 @@ ok(!/^的/.test(p4) || p4.length < HEADLINE.minChars + 1, '兜底 · 连着的�
 // ── 3. 门槛常量 ──
 ok(HEADLINE.minChars === 2 && HEADLINE.maxChars === 8, '门槛 · 长度常量在位')
 ok(HEADLINE.badHead.test('的了着过地得'), '门槛 · 结构助词在 badHead 里')
+
+
+// ── 4. 章节名（page title）：起头/收尾都要在词边界，且不许跨卡片拼 ──
+// 自测22 交付的片子里有两条坏章节名：「力工具专注在做内容」（从「生产力工具」中间起头）、
+// 「大街都是在做AI模型」（把两张卡拼成一句原话没说过的话）。以前只查连续 + 不虚词起头，两条都能过。
+{
+  const cards2 = [{ text: '用AI来做生产力工具专注在做内容' }]
+  const p2src = cards2[0].text
+  ok(!checkPageTitle('力工具专注在做内容', p2src, cards2).ok, '章节名 · 从词中间起头拦下')
+  ok(/单字词起头|词中间/.test(checkPageTitle('力工具专注在做内容', p2src, cards2).why || ''), '章节名 · 理由说清是起头', checkPageTitle('力工具专注在做内容', p2src, cards2).why)
+  ok(checkPageTitle('生产力工具', p2src, cards2).ok, '章节名 · 整词标题放行', checkPageTitle('生产力工具', p2src, cards2).why || '')
+  ok(!checkPageTitle('机会是在OP', '真正的机会是在OPC结合内容').ok, '章节名 · 收在词中间拦下')
+  const cards = [{ text: '今天大街都在卷技术' }, { text: '大家在看都是模型' }]
+  const joined = cards.map(c => c.text).join('')
+  ok(!checkPageTitle('技术大家在看', joined, cards).ok, '章节名 · 跨两张卡拼的一句拦下', checkPageTitle('技术大家在看', joined, cards).why)
+  ok(checkPageTitle('大家在看都是模型', joined, cards).ok, '章节名 · 单张卡里的整句放行', checkPageTitle('大家在看都是模型', joined, cards).why || '')
+  ok(!/跨了两张卡/.test(checkPageTitle('技术大家在看', joined).why || ''), '章节名 · 不给卡片时不套「跨卡」这条（向后兼容）', checkPageTitle('技术大家在看', joined).why || '')
+}
 
 console.log(fails.length ? 'FAIL ' + fails.length + ' / ' + (pass + fails.length) : 'PASS ' + pass)
 if (fails.length) { for (const f of fails) console.log('  ✗ ' + f); process.exit(1) }

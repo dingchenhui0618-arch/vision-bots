@@ -16,6 +16,7 @@ import { titleSentences } from '../headlines.mjs'
 import { pageSkeleton } from '../pages.mjs'
 import { planPages } from '../shots.mjs'
 import { planPrune } from '../prune.mjs'
+import { useProposalCache } from '../llm.mjs'
 
 const TPL_ROOT = fileURLToPath(new URL('../../templates/', import.meta.url))
 
@@ -43,6 +44,10 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
 
   const work = join(group.dir, 'work', job.id)
   mkdirSync(work, { recursive: true })
+  // 提案缓存跟着群走，不跟着这次的任务目录：同一素材、同一需求重跑，
+  // 分镜 / 大字 / 整句删 / 改字都交回上次那份，不重新掷骰子。
+  // 模型同一输入两次会给两套结果（温度钉 0 也一样），「同一版片子」这件事只能靠这份缓存。
+  useProposalCache(join(group.dir, 'proposals'))
 
   const info = await probe(input)
   log(`素材 ${info.duration.toFixed(2)}s · ${info.width}×${info.height} · ${info.fps.toFixed(0)}fps · 音轨${info.hasAudio ? '有' : '无'}`)

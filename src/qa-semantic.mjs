@@ -9,7 +9,7 @@
  * 2. 每条问题必须带逐字引用（quote），引用不在交付文本里就算模型编的，直接不采信。
  * 3. 同音错字必须过硬校验（字数不变 + 拼音一致），验不过只降级成「疑似」，不当作确定错误。
  */
-import { chatJSON, LLM } from './llm.mjs'
+import { chatJSONCached, taskCall } from './llm.mjs'
 import { validate as validateFixes } from './asr-fix.mjs'
 import { relistenSentence, strip as stripAll } from './relisten.mjs'
 
@@ -152,7 +152,14 @@ export async function adjudicateByAudio({ issues = [], words = [], media = null,
   const out = []
   let used = 0
   for (const it of issues) {
-    if (it.severity !== 'block' || !it.quote || used >= cap) { out.push(it); continue }
+    if (it.severity !== 'block' || !it.quote) { out.push(it); continue }
+    // 次数用完 = 这条**没验过**。没验过的建议不能拦交付——和下面「听不出来不等于字幕错了」同一条原则。
+    // 自测22 实测：4 条语义建议、cap=2，第 3 条直接原样留着 block，于是「要…就能…句式杂糅」这种
+    // 语气建议变成了拦交付的理由，而它一次音频都没对过。
+    if (used >= cap) {
+      out.push({ ...it, severity: 'warn', why: it.why + '（这一轮听音复核只验 ' + cap + ' 处，这条没轮到验证，只记录，不拦交付）' })
+      continue
+    }
     // 「语句不通」但没给具体改法 = 一条意见，不是一条错误：即兴口播本来就常有不完整的句子，
     // 实测同一部片子连跑四轮，四轮报的是四句不同的「语句不通」，每条都没给改法。
     // 要拦，得拿出能核对的东西：给得出改法（而且改法得在音频里听得到），或者音频与字幕真的不一致。
@@ -167,7 +174,8 @@ export async function adjudicateByAudio({ issues = [], words = [], media = null,
       continue
     }
     const hit = tightRange(words, it.quote)
-    if (!hit) { out.push({ ...it, why: it.why + '（听音复核定位不到这句，没验）' }); continue }
+    // 定位不到 = 也没验过：同样不许拦交付
+    if (!hit) { out.push({ ...it, severity: 'warn', why: it.why + '（听音复核定位不到这句，没验，只记录）' }); continue }
     // 比对口径 = 引用本身（不扩），这样「都在做」的收尾字不会被算成不一致
     const r = await relistenSentence({ media, span: [words[hit.a].start, words[hit.b].end], cacheDir: relistenDir, expect: hit.text, log })
     used++
@@ -284,7 +292,7 @@ export function judgeSemantic(semantic, { cards = 0 } = {}) {
  * 一次语义审读。返回 {ok:true, issues, dropped, ...} 或 {ok:false, skipped}。
  * 判断合不合法由 groundIssues / verifyHomophones 负责，这里只负责把话说给模型。
  */
-export async function reviewText({ words = [], captions = null, sections = [], brief = {}, terms = null, log = () => {}, model = LLM.models.fast, media = null, relistenDir = null } = {}) {
+export async function reviewText({ words = [], captions = null, sections = [], brief = {}, terms = null, log = () => {}, model = null, media = null, relistenDir = null } = {}) {
   const cards = (captions && captions.cards) || []
   if (!cards.length) return { ok: false, skipped: 'no-captions' }
 
@@ -319,13 +327,17 @@ export async function reviewText({ words = [], captions = null, sections = [], b
   // 输出被截断时 extractJSON 会捞回半截（最典型的是只捞回 issues 数组），
   // 这种半成品不能当「读完了」也不能当「读全了」——抬一档预算重试一次，仍不行才如实报没查成。
   const budget0 = semanticBudget(cards)
-  let r = await chatJSON({ prompt, model, maxTokens: budget0, timeoutMs: SEMANTIC.timeoutMs, temperature: 0 })
+  // 走质检 bot 的配置（模型 + 温度钉 0）：换模型只改 config/bots/qc.json，
+  // 别在这里硬写 fast——自测 19 里「最可能抓到错字的那一层没跑成」就是这类硬写留下的坑。
+  const call = taskCall('qc', { maxTokens: budget0, timeoutMs: SEMANTIC.timeoutMs })
+  const opts = model ? { ...call, model } : call
+  let r = await chatJSONCached({ prompt, ...opts })
   let budget = budget0
   const salvaged = v => v === null || v === undefined || Array.isArray(v)
   if (salvaged(r.ok ? r.value : null)) {
     const budget1 = Math.min(SEMANTIC.tokensCap, Math.round(budget0 * SEMANTIC.retryFactor))
     log('语义审读：这次输出被截断（预算 ' + budget0 + ' token），抬到 ' + budget1 + ' 重试一次')
-    const r2 = await chatJSON({ prompt, model, maxTokens: budget1, timeoutMs: SEMANTIC.timeoutMs, temperature: 0 })
+    const r2 = await chatJSONCached({ prompt, ...opts, maxTokens: budget1 })
     budget = budget1
     if (!salvaged(r2.ok ? r2.value : null)) r = r2
     else if (!r.ok) r = r2

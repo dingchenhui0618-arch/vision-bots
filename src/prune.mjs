@@ -15,7 +15,7 @@
  * 模型挂了照样能剪：确定性价值排序兜底。整句删只动文本区间，时间码一个都不碰——
  * 刀口由 buildPlan 统一算，接缝照样落在最安静的地方。
  */
-import { chatJSON, LLM } from './llm.mjs'
+import { chatJSONCached, taskCall } from './llm.mjs'
 import { normWords } from './plan.mjs'
 
 const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu
@@ -367,7 +367,8 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
   // propose 是自检用的注入口：离线断言不许联网，也不该为了测个选择器去调模型
   const ask = (note, list) => (typeof propose === 'function'
     ? propose(list, note)
-    : chatJSON({ prompt: PROMPT({ target, current, need, list, note }), maxTokens: 760, model: LLM.models.fast }))
+    // 走剪辑 bot 的配置（模型、温度），不再硬写 fast / 不传温度：同一素材两次跑必须挑出同一批句子
+    : chatJSONCached({ prompt: PROMPT({ target, current, need, list, note }), ...taskCall('cutter', { maxTokens: 760 }) }))
 
   const modelYes = new Map()   // 模型点名可以删的句子（多轮累加）
   const modelWeak = new Map()  // 模型提了、但理由对不上句子的（降一档用）

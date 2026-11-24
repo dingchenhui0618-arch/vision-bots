@@ -7,7 +7,7 @@
  * 所以每条标题都要过接地检查——字必须来自这一段自己说过的话——结尾还得落在实词上。
  * 过不了的先让模型重写一次，还不行才退回原句（pickTitle 的结果），并在报告里写明哪几条是模型写的。
  */
-import { chatJSON, LLM } from './llm.mjs'
+import { chatJSONCached, taskCall } from './llm.mjs'
 
 export const TITLE = {
   minChars: 4,     // 少于 4 字撑不起大字，观感像标签
@@ -100,7 +100,7 @@ export async function titleSections({ sections, maxChars = TITLE.maxChars, log =
   if (!list.length) return { ok: false, skipped: 'no-sections', titles: [] }
 
   const input = list.map(s => ({ index: s.index, 秒: +((s.end - s.start)).toFixed(1), 原文: strip((s.lines || []).join('') || s.text) }))
-  const r = await chatJSON({ prompt: promptFor(input, maxChars), maxTokens: 1200, model: LLM.models.fast })
+  const r = await chatJSONCached({ prompt: promptFor(input, maxChars), ...taskCall('cutter', { maxTokens: 1200 }) })
   if (!r.ok) {
     log('段落标题：模型没接上（' + r.skipped + '），沿用原句')
     return { ok: false, skipped: r.skipped, detail: r.detail || null, titles: list.map(s => ({ index: s.index, text: s.text, source: 'rules' })), model: null }
@@ -121,7 +121,7 @@ export async function titleSections({ sections, maxChars = TITLE.maxChars, log =
       JSON.stringify(rejected.map((t, i) => ({ ...fixInput[i], 不合格: t.why, 上一版: t.asked })), null, 1),
       '只输出 JSON：{"titles":[{"index":1,"text":"6到8个字"}]}',
     ].join('\n')
-    const r2 = await chatJSON({ prompt: fixPrompt, maxTokens: 700, model: LLM.models.fast })
+    const r2 = await chatJSONCached({ prompt: fixPrompt, ...taskCall('cutter', { maxTokens: 700 }) })
     if (r2.ok) {
       const fixed = validateBatch(secs, Array.isArray(r2.value && r2.value.titles) ? r2.value.titles : [], maxChars, used)
       const byIndex = new Map(fixed.map(t => [t.index, t]))

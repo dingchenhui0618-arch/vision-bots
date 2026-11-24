@@ -24,8 +24,32 @@ export const STOP = new Set(['这个', '那个', '就是', '但是', '所以', '
   '这样', '那样', '一下', '一点', '还是', '然后', '而且', '只是', '这些', '那些', '都能', '做出', '看到', '只有',
   '这种', '那种', '是不是', '一句话'])
 
-/** 一条标题能不能挂在页上：3–10 字、连续取自本页原话、不虚词起头收尾。纯函数。 */
-export function checkPageTitle(text, source) {
+/** 词边界集合：第几个字符是「词的开头」。中文断词见 src/segment.mjs（ICU 分词 + 术语表热词）。 */
+function wordStarts(source) {
+  const s = bare(source)
+  const set = new Set([0])
+  const words = []
+  let acc = 0
+  for (const w of segment(s)) {
+    const len = bare(w).length
+    if (len) words.push({ at: acc, len })
+    acc += len
+    set.add(acc)
+  }
+  return { set, words, len: s.length }
+}
+
+/**
+ * 一条标题能不能挂在页上：3–10 字、连续取自本页原话、不虚词起头收尾、**起头和收尾都落在词边界上**。纯函数。
+ *
+ * 后两条是自测22 补的：交付片子里有两处章节名一眼是坏的——
+ *   「力工具专注在做内容」（从「生产力工具」中间起头，像半句话）
+ *   「大街都是在做AI模型」（从前一句「大街都在卷AI技术」的后半截接上后一句，拼出一句原话没说过的话）
+ * 以前只查「连续 + 不虚词起头」，这两条都能过。判据改成：
+ *   ① 起头/收尾必须是词边界（分词和断行用的是同一套，见 src/segment.mjs）；
+ *   ② 给了卡片列表时，标题必须落在**同一张卡片**里——跨两张卡拼起来的那不是一句话。
+ */
+export function checkPageTitle(text, source, cards = null) {
   const t = String(text || '')
   const n = bare(t).length
   if (!n) return { ok: false, why: '空标题' }
@@ -38,6 +62,32 @@ export function checkPageTitle(text, source) {
   if (!contiguous(t, source)) return { ok: false, why: '不是本页原话里连续的一段' }
   if (BAD_START.test(t)) return { ok: false, why: '虚词起头，像半句话' }
   if (BAD_END.test(t) || BAD_END_WORD.test(t)) return { ok: false, why: '结尾是半句话' }
+  // 起头/收尾要在词边界上：从「生产力工具」中间切出来的「力工具…」不是标题，是半句话
+  const src = bare(source)
+  const at = src.indexOf(bare(t))
+  if (at >= 0) {
+    const { set, words } = wordStarts(source)
+    if (!set.has(at)) return { ok: false, why: '从词中间起头（像半句话）' }
+    if (!set.has(at + bare(t).length)) return { ok: false, why: '收在词中间（像半句话）' }
+    // 起头那个词只有 1 个字、又不是这张卡的开头：多半是从一个词中间切出来的。
+    // ICU 把「生产力工具」切成 生产|力|工具，单看「力」算一个词，可它不是一个句子的开头——
+    // 自测22 的章节名「力工具专注在做内容」就是这么来的。
+    if (at > 0 && Array.isArray(cards) && cards.length) {
+      const first = words.find(w => w.at === at)
+      let cardStart = false
+      let acc = 0
+      for (const c of cards) {
+        if (acc === at) { cardStart = true; break }
+        acc += bare(c.text || c).length
+      }
+      if (first && first.len === 1 && !cardStart) return { ok: false, why: '从单字词起头（像从词中间切出来的）' }
+    }
+  }
+  // 跨卡片拼起来的不是一句话：「今天大街都在卷AI技术」+「满大街都是在做AI模型」≠「大街都是在做AI模型」
+  if (Array.isArray(cards) && cards.length) {
+    const inOne = cards.some(c => bare(c.text || c).includes(bare(t)))
+    if (!inOne) return { ok: false, why: '跨了两张卡拼成一句话' }
+  }
   return { ok: true, chars: n }
 }
 

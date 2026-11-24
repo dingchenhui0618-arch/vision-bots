@@ -3,7 +3,7 @@
  * 这里验的是「模型说的话能不能被采信」，模型本身的质量靠真素材跑片看。
  */
 import { checkTitle, validateBatch, TITLE } from '../src/section-titles.mjs'
-import { groundIssues, verifyHomophones, judgeSemantic, confirmsReading, KINDS, SEMANTIC, semanticBudget } from '../src/qa-semantic.mjs'
+import { groundIssues, verifyHomophones, judgeSemantic, confirmsReading, adjudicateByAudio, KINDS, SEMANTIC, semanticBudget } from '../src/qa-semantic.mjs'
 import { sectionsOf, applyTitles } from '../src/sections.mjs'
 import { mergeSections } from '../src/chapters.mjs'
 
@@ -124,6 +124,24 @@ ok(SEMANTIC.retryFactor > 1, '语义预算：截断后要能抬一档重试')
 // ── 8. 门槛常量不许被随手改小 ──
 ok(TITLE.minChars === 4 && TITLE.maxChars === 12 && TITLE.hardMax === 16, '门槛：标题长度常量在位')
 ok(TITLE.groundRatio >= 0.8, '门槛：接地比例不得低于 80%')
+
+
+// ── 9. 听音复核仲裁：没验过的建议不许拦交付 ──
+// 自测22 实测：4 条语义建议、仲裁上限 2 处，第 3 条直接原样留着 block——
+// 于是「要…就能…句式杂糅」这种语气建议成了拦交付的理由，而它一次音频都没对过。
+{
+  const issue = { kind: 'semantic', quote: '我现在要花一天的时间就能做出', to: '我现在花一天时间就能做出', why: '句式杂糅', severity: 'block' }
+  // 仲裁一进门就短路的情况（没素材 / 没词）保持原样，这条另有断言在 check-qa 里；
+  // 这里要验的是「有素材、但这一条轮不到验证」——cap 用完和定位不到都算没验。
+  const words1 = [{ w: '我', start: 0, end: 0.2 }]
+  const c0 = await adjudicateByAudio({ issues: [issue], words: words1, media: 'x.mp4', cap: 0 })
+  ok(c0[0].severity === 'warn', '仲裁 · 次数用完的建议降级为疑似，不许拦交付', c0[0].severity)
+  ok(/没轮到验证/.test(c0[0].why || ''), '仲裁 · 理由说清是没轮到验', c0[0].why)
+  const noHit = await adjudicateByAudio({ issues: [issue], words: words1, media: 'x.mp4', cap: 2 })
+  ok(noHit[0].severity === 'warn', '仲裁 · 定位不到原话的建议也不许拦交付', noHit[0].severity)
+  const done = await adjudicateByAudio({ issues: [{ ...issue, severity: 'warn' }], words: words1, media: 'x.mp4', cap: 2 })
+  ok(done[0].severity === 'warn', '仲裁 · 已经降级的原样留着', done[0].severity)
+}
 
 console.log(fails.length ? 'FAIL ' + fails.length + ' / ' + (pass + fails.length) : 'PASS ' + pass)
 if (fails.length) { for (const f of fails) console.log('  ✗ ' + f); process.exit(1) }

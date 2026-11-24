@@ -9,7 +9,7 @@
  *   · 全片有配额：card ≤ 2、frame ≤ 1、corner ≤ 3，超了就退回满幅并记账。
  * 模型挂了或全不合格，就退回确定性兜底（页标题摘句、版式按内容规则挑），片子照出。
  */
-import { chatJSON, LLM } from './llm.mjs'
+import { chatJSONCached, taskCall } from './llm.mjs'
 import { checkPageTitle, pickPageTitle, pickEyebrow, bare } from './pages.mjs'
 import { segment } from './segment.mjs'
 
@@ -71,7 +71,7 @@ export function validateProposal({ pages, proposal }) {
   const counts = { card: 0, frame: 0, corner: 0 }
   const out = pages.map(page => {
     const raw = byIndex.get(page.index) || {}
-    const title = checkPageTitle(raw.title, page.text)
+    const title = checkPageTitle(raw.title, page.text, page.cards)
     if (raw.title && !title.ok) problems.push('第 ' + page.index + ' 页标题「' + raw.title + '」：' + title.why)
 
     const eyebrowRaw = bare(raw.eyebrow).slice(0, 4)
@@ -209,7 +209,8 @@ export async function planPages({ pages, log = () => {} } = {}) {
     词: wordsOf(p.text),
   }))
   const score = v => v.pages.filter(p => p.shot !== 'full').length * 2 + v.pages.filter(p => p.block).length * 3 + v.pages.filter(p => p.source === 'model').length
-  const r = await chatJSON({ prompt: PROMPT(input), maxTokens: 2400, model: LLM.models.fast })
+  // 分镜是「内容判断」，按剪辑 bot 的配置走（模型 + 温度）；温度不定死，同一素材两次跑会给出两套版式
+  const r = await chatJSONCached({ prompt: PROMPT(input), ...taskCall('cutter', { maxTokens: 2400 }) })
   if (!r.ok) {
     log('分镜：模型没接上（' + r.skipped + '），按内容规则排版')
     return { ok: false, skipped: r.skipped, pages: fallback, problems: [], model: null }
@@ -218,7 +219,7 @@ export async function planPages({ pages, log = () => {} } = {}) {
   let raw = r.value
   let attempts = 1
   if (v.problems.length) {
-    const r2 = await chatJSON({ prompt: PROMPT(input, v.problems), maxTokens: 2400, model: LLM.models.fast })
+    const r2 = await chatJSONCached({ prompt: PROMPT(input, v.problems), ...taskCall('cutter', { maxTokens: 2400 }) })
     attempts = 2
     if (r2.ok) {
       const v2 = validateProposal({ pages: list, proposal: r2.value })

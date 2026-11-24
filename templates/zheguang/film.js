@@ -228,6 +228,51 @@ export async function createFilm({ media }) {
     return Math.max(TY.bigMin, Math.min(cap, Math.floor((avail * 0.98) / longest)))
   }
 
+  /**
+   * 大字在这几秒里「从什么时候起真的画出来」。
+   * 页首 1.5 秒画章节卡，大字要让位不出场（见 drawBig 里那条 return）——
+   * 质检那份盒子要是不认这条，就会在第 492 帧报一个画面上根本不存在的大字压刻度卡（自测22 的假报）。
+   */
+  function bigVisibleFrom(b) {
+    const pg = pageAt(b.f0)
+    return pg && pg.title ? Math.max(b.f0, pg.start + 1.5) : b.f0
+  }
+
+  /** 刻度卡压着右边一块（0.575h 起、高 210）。返回这段时间里它的下沿；没有就是 null。 */
+  function gaugeBottomDuring(f0, f1) {
+    let best = null
+    for (const g of S.blocks || []) {
+      if (g.kind !== 'gauge') continue
+      if (g.f1 <= f0 || g.f0 >= f1) continue
+      const bot = h * 0.575 + 210
+      if (best === null || bot > best) best = bot
+    }
+    return best
+  }
+
+  /**
+   * 一句大字的几何：字号、行高、板的位置。**画、让位、质检盒子三处都从这一份算**——
+   * 自测21 的 11px「假失败」就是两处各算一遍算岔了（一处按墨迹、一处按板；一处按当前帧、一处按区间起点）。
+   *
+   * 刻度卡那条：短句子会被字号上限顶到 168px，板顶升到 1286px，正好插进刻度卡底部 1314px
+   * （自测22 第 545 帧：「越来越低 ↓」被板沿切掉）。板的底边是固定的，只能把字缩到板顶落在卡底以下。
+   */
+  function bigGeom(b2, shot = null) {
+    const lines = b2.lines && b2.lines.length ? b2.lines : [b2.text]
+    const bottom = bigBottom(shot || shotAt(b2.f0))
+    let size = fitBigSize(lines)
+    const gBot = gaugeBottomDuring(bigVisibleFrom(b2), b2.f1)
+    if (gBot !== null) {
+      const room = bottom - gBot - 22
+      const maxSize = Math.floor(room / (lines.length * (BGL.lineGap || 1.06) + 0.14))
+      size = Math.max(TY.bigMin, Math.min(size, maxSize))
+    }
+    const lh = size * (BGL.lineGap || 1.06)
+    const padY = Math.round(size * 0.14)
+    const top = bottom - lines.length * lh
+    return { lines, size, lh, padY, top, bottom, plateTop: Math.round(top - padY) }
+  }
+
   /** 大字的底边（不是顶边）：满幅压在胸口，竖框在小窗下面，小窗在左侧中下部。
    *  参考片的大字基本落在 0.5–0.72 这一段，字幕在 0.84——两者永远不重叠。 */
   function bigBottom(shot) {
@@ -285,11 +330,11 @@ export async function createFilm({ media }) {
     // 1.5 秒，大字从 1.5 秒起，两者不同屏也不再留空。
     const pg0 = pageAt(t)
     if (pg0 && pg0.title && t < pg0.start + 1.5) return
-    const lines = b.lines && b.lines.length ? b.lines : [b.text]
-    const size = fitBigSize(lines)
-    const lh = size * (BGL.lineGap || 1.06)
-    const bottom = bigBottom(shot)
-    const top = bottom - lines.length * lh
+    const g = bigGeom(b, shot)
+    const lines = g.lines
+    const size = g.size
+    const lh = g.lh
+    const top = g.top
     // ── 底色板（自测18）──
     // 对折光抽帧做对照才看清的：人家的大字下面永远垫着一块深色板，字和人分属两层；
     // 我们的字直接浮在实拍上（只有一层阴影），同一个动作读起来就是「字幕」而不是「版面」。
@@ -297,7 +342,7 @@ export async function createFilm({ media }) {
     // 板宽必须按真字宽量：以前用 textEm（ASCII 一律算 0.56em）估，「GPT」这类词量出来比画的窄，
     // 板就短出字一截（自测18 的第 690 帧上「用C」露在板外）。
     const widest = Math.max(1, ...lines.map(l => measure(c, l, size, F.sans, 900)))
-    const padX = Math.round(size * 0.18), padY = Math.round(size * 0.14)
+    const padX = Math.round(size * 0.18), padY = g.padY
     const plate = {
       x: Math.max(M - 8, Math.round(BGL.left - padX)),
       y: Math.round(top - padY),
@@ -538,12 +583,21 @@ export async function createFilm({ media }) {
     // 这条对**所有**版式都成立：小窗页的卡原来只在满幅页避让大字，
     // 实测竖框页（frame）上大字也在下半区，卡落在 1484–1568px 正好压字
     // （自测15 质检抓到 7 帧「big × block:check」11052px²）。有大字就一律让到大字上方。
-    const bigNow = (S.bigs || []).find(b2 => t >= b2.f0 && t < b2.f1)
-    if (bigNow) {
-      const bl = bigNow.lines && bigNow.lines.length ? bigNow.lines : [bigNow.text]
-      const bTop = h * 0.775 - bl.length * fitBigSize(bl) * (BGL.lineGap || 1.06)
-      yBase = Math.max(h * 0.30, bTop - 22)
+    // 让位按「这张卡活着的整段」算，不按当前这一帧算，理由两条：
+    //  ① 卡跨两句大字时，按当前帧算会在第二句起来的瞬间往上跳一下（自测21 第 1104 帧：
+    //     卡 34.167–37.017s，前半段那句大字 size 106、后半段 121，卡在中途跳了 16px）；
+    //  ② 缝要量到**底板**上沿，不是墨迹上沿——自测18 给大字加了 0.14×字号的内边距，
+    //     墨迹让 22px 实际到板只剩 5px，卡贴着板边，看着就像压在一起。
+    // 定死一条：卡底 = 这段里**最高那块板**的上沿 − 22px。位置不随时间动，
+    // 质检那份按数据重算的盒子（src/layout-boxes.mjs）才可能算出和画面同一个数。
+    let plateTop = null
+    for (const b2 of S.bigs || []) {
+      // 被章节卡压住的那段不算：那 1.5 秒它根本没画出来（质检盒子也按同一条口径裁）
+      if (b2.f1 <= Math.max(b.f0, bigVisibleFrom(b2)) || b2.f0 >= b.f1) continue
+      const pt = bigGeom(b2).plateTop
+      if (plateTop === null || pt < plateTop) plateTop = pt
     }
+    if (plateTop !== null) yBase = Math.max(h * 0.30, plateTop - 22)
     // 小窗页原来把卡放在 0.86h，正好压在字幕 pill 上（自测14 抓到 7 帧「sub × block:check」）。
     // 卡底不许越过字幕顶——这条对三种版式都成立。
     const subPh = Math.round(TY.sub * 1.28 + SUBL.padY * 2)

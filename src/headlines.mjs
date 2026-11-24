@@ -9,7 +9,7 @@
  * 所以它只可能是「正在说的这句」的压缩，不可能变成别的句子的总结。
  * 模型给不出合格的就退回确定性摘句（从这句里挑一段原话），绝不静默留空、也不许编。
  */
-import { chatJSON, LLM } from './llm.mjs'
+import { chatJSONCached, taskCall } from './llm.mjs'
 import { segment } from './segment.mjs'
 
 export const HEADLINE = {
@@ -205,7 +205,7 @@ export async function titleSentences({ sentences, log = () => {}, repair = true 
   const list = (Array.isArray(sentences) ? sentences : []).filter(s => s && strip(s.text))
   if (!list.length) return { ok: false, skipped: 'no-sentences', titles: [] }
   const input = list.map(s => ({ index: s.index, 原文: strip(s.text) }))
-  const r = await chatJSON({ prompt: promptFor(input), maxTokens: 1800, model: LLM.models.fast })
+  const r = await chatJSONCached({ prompt: promptFor(input), ...taskCall('cutter', { maxTokens: 1800 }) })
   if (!r.ok) {
     log('句级大字：模型没接上（' + r.skipped + '），按原文摘句')
     return { ok: false, skipped: r.skipped, detail: r.detail || null, titles: list.map(s => ({ index: s.index, text: pickHeadline(s.text), source: 'rules', ok: true })), model: null }
@@ -224,7 +224,7 @@ export async function titleSentences({ sentences, log = () => {}, repair = true 
       JSON.stringify(rejected.map((t, i) => ({ index: t.index, 原文: strip(secs[i].text), 不合格: t.why, 上一版: t.asked })), null, 1),
       '只输出 JSON：{"titles":[{"index":1,"text":"3到6个字"}]}',
     ].join('\n')
-    const r2 = await chatJSON({ prompt: fixPrompt, maxTokens: 900, model: LLM.models.fast })
+    const r2 = await chatJSONCached({ prompt: fixPrompt, ...taskCall('cutter', { maxTokens: 900 }) })
     if (r2.ok) {
       const fixed = validateBatch(secs, Array.isArray(r2.value && r2.value.titles) ? r2.value.titles : [], used)
       const by = new Map(fixed.map(t => [t.index, t]))

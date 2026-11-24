@@ -12,6 +12,7 @@ import { join } from 'node:path'
 import { buildScene } from '../templates/zheguang/scene.mjs'
 import { segment } from '../src/segment.mjs'
 import { qaBoxes } from '../templates/zheguang/render.mjs'
+import { layoutBoxes } from '../src/layout-boxes.mjs'
 
 const ROOT = process.cwd()
 const argv = process.argv.slice(2)
@@ -180,6 +181,85 @@ ok('章节名不超过 10 字', scene.pages.every(p => bare(p.title).length <= 1
 // 6) HUD：页码、品牌、进度线三件都在
 ok('HUD 品牌/平台字段在', scene.labels && scene.labels.template === '折光')
 ok('时间线统计齐', scene.stats && scene.stats.out > 0 && scene.frames > 0)
+
+// 7) 对勾卡给大字让位：让到**底板**上沿，而且整段只算一次
+//
+// 这一节来自自测21 的一条真失败：第 1104 帧质检报「big × block:check 重叠 11px」。
+// 查下去是三件事叠在一起——
+//   · 自测18 给大字加了底板（0.14×字号内边距），可对勾卡还按「墨迹顶 − 22」让位，
+//     到板只剩 5px，卡贴着板边；
+//   · 卡跨两句大字（size 106 → 121）时按当前帧算，卡会在中途往上跳 16px；
+//   · 质检那份盒子按「区间起点那一帧」算，拿短的那句去比，报出画面里并不存在的重叠（假失败）。
+// 现在两条实现都改成「区间内最高那块板 − 22」，这一节把这条钉住。
+{
+  const L7 = tpl.layouts['9:16']
+  const W7 = 1080, H7 = 1920
+  const em7 = s => [...String(s)].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)
+  const sizeOf = lines => {
+    const n = lines.length
+    const cap = n >= 3 ? Math.min(tpl.type.big, 104) : tpl.type.big
+    const longest = Math.max(1, ...lines.map(em7))
+    return Math.max(tpl.type.bigMin, Math.min(cap, Math.floor(((W7 - L7.big.left - L7.big.right) * 0.98) / longest)))
+  }
+  const plateTopOf = lines => {
+    const size = sizeOf(lines)
+    const lh = size * (L7.big.lineGap || 1.06)
+    return Math.round(H7 * 0.775 - lines.length * lh - Math.round(size * 0.14))
+  }
+  const A = ['知道的人会做的人'], B = ['我现在要花一千']
+  const synth = {
+    template: 'zheguang', ratio: '9:16', size: [W7, H7], fps: 30, frames: 480, duration: 16,
+    shots: [{ f0: 0, f1: 16, kind: 'full' }], subs: [], chips: [], sections: [], pages: [],
+    bigs: [
+      { f0: 8, f1: 11, lines: A, text: A[0], hot: '' },
+      { f0: 11, f1: 15, lines: B, text: B[0], hot: '' },
+    ],
+    // 卡从 10s 活到 13.5s：跨了两句大字，后半段那句更大
+    blocks: [{ kind: 'check', text: '做出一周的工作量', f0: 10, f1: 13.5 }],
+  }
+  const b7 = layoutBoxes({ scene: synth, template: tpl })
+  const card = (b7.items || []).find(x => x.tag === 'block:check')
+  const bigs7 = (b7.items || []).filter(x => x.tag === 'big')
+  const expect = Math.min(plateTopOf(A), plateTopOf(B)) - 22
+  ok('对勾卡让到底板上沿 22px（不是墨迹顶）', Boolean(card) && card.y + card.h === expect, card ? '卡底 ' + (card.y + card.h) + '，应为 ' + expect : '没有卡')
+  const hitBig = bigs7.filter(b => !(card.x + card.w <= b.x || b.x + b.w <= card.x || card.y + card.h <= b.y || b.y + b.h <= card.y))
+  ok('对勾卡和它整段里的两句大字都不压', Boolean(card) && hitBig.length === 0, hitBig.length + ' 处')
+  ok('对勾卡没有被打到 0.30h 上限以外', Boolean(card) && card.y >= Math.round(H7 * 0.30) - 1, card ? String(card.y) : '-')
+  // 大字盒子的上沿必须比墨迹顶再高一档内边距：这一条错了，「让 22px」就变成「贴 5px」
+  const inkTopB = Math.round(H7 * 0.775 - B.length * sizeOf(B) * (L7.big.lineGap || 1.06))
+  const boxB = bigs7.find(b => Math.abs(b.t0 - 11) < 0.01)
+  ok('大字盒子上沿 = 墨迹顶 − 内边距', Boolean(boxB) && boxB.y === plateTopOf(B) && boxB.y < inkTopB - 8, boxB ? boxB.y + ' vs 墨迹 ' + inkTopB : '-')
+  // 反向验证：把卡挪到贴墨迹顶，同一条相交判断必须报出来——尺子得有分辨力
+  const bad = { ...card, y: inkTopB - card.h + 4 }
+  const badHit = bigs7.some(b => !(bad.x + bad.w <= b.x || b.x + b.w <= bad.x || bad.y + bad.h <= b.y || b.y + b.h <= bad.y))
+  ok('贴墨迹顶的卡会被判成压字（尺子有分辨力）', badHit === true)
+}
+
+// 8) 刻度卡与大字：谁也别压谁；章节卡占场那 1.5 秒，大字不进盒子
+//
+// 自测22 质检报「10 帧 big × block:gauge，第 492 帧」，量下去一半真一半假：
+//   · 真的：第 545 帧「越来越低 ↓」被大字板沿切掉——短句子按内容顶到 168px，板顶升到 1286px，
+//     正好插进刻度卡底部 1314px；
+//   · 假的：492–519 帧大字被章节卡压着根本没画，盒子却照样算它，还报了重叠。
+// 两条口径，渲染器和盒子都认：① 有刻度卡在场就把字号缩到板顶落在卡底 22px 以下；
+// ② 大字的可见起点 = max(f0, 页首 + 1.5s)。
+{
+  const H8 = 1920
+  const base8 = {
+    template: 'zheguang', ratio: '9:16', size: [1080, H8], fps: 30, frames: 600, duration: 20,
+    shots: [{ f0: 0, f1: 20, kind: 'full' }], subs: [], chips: [], sections: [],
+    pages: [{ index: 1, total: 1, start: 0, end: 20, title: '技术门槛越来越低' }],
+  }
+  const bigOf = s => (layoutBoxes({ scene: s, template: tpl }).items || []).find(x => x.tag === 'big')
+  const bigW = bigOf({ ...base8, bigs: [{ f0: 5, f1: 9, lines: ['生产力工具'], text: '生产力工具', hot: '' }], blocks: [{ kind: 'gauge', label: '门槛', f0: 6, f1: 10 }] })
+  const bigN = bigOf({ ...base8, bigs: [{ f0: 5, f1: 9, lines: ['生产力工具'], text: '生产力工具', hot: '' }], blocks: [] })
+  const gaugeBottom = Math.round(H8 * 0.575 + 210)
+  ok('刻度卡在场时，大字的板顶落在卡底 22px 以下', Boolean(bigW) && bigW.y >= gaugeBottom + 22, bigW ? '板顶 ' + bigW.y + '，卡底 ' + gaugeBottom : '没有大字')
+  ok('没有刻度卡时字号回到内容上限（不被白缩一档）', Boolean(bigN) && Boolean(bigW) && bigN.y < bigW.y, bigN && bigW ? bigN.y + ' vs ' + bigW.y : '-')
+  ok('缩的是字号，不是把板切一刀', Boolean(bigW) && Boolean(bigN) && bigW.h < bigN.h, bigW && bigN ? bigW.h + ' vs ' + bigN.h : '-')
+  const bigE = bigOf({ ...base8, bigs: [{ f0: 0.2, f1: 4, lines: ['最赚钱的不是技术'], text: '最赚钱的不是技术', hot: '' }], blocks: [] })
+  ok('章节卡占场那 1.5 秒，大字不进盒子', Boolean(bigE) && bigE.t0 >= 1.5 - 1e-6, bigE ? String(bigE.t0) : '-')
+}
 
 console.log('折光自检：' + pass + ' 通过，' + fails.length + ' 失败')
 if (fails.length) { for (const f of fails) console.log('  ✗ ' + f) }
