@@ -160,7 +160,12 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     const kind = p.intent || 'full'
     if (kind === 'full') continue
     if (kind === 'card') {
-      const g = (p.cards || []).find(c => cleanShort(c.text, 6) && c.f1 - c.f0 >= 0.9)
+      // 色卡上排的是大字（一屏最多 3 行），不是字幕：4–12 字的一句原话就够。
+      // 6 字那条线是照着「一句金句」想的，真实口播里 10 个字的金句到处都是，
+      // 结果是自测 03–10 一条片子都没出过全屏色卡——参考片最抓眼的动作我们一次都没做。
+      const asked = bare(p.cardText || '')
+      const host = (p.cards || []).find(c => asked && bare(c.text).includes(asked) && c.f1 - c.f0 >= 0.7)
+      const g = host || (p.cards || []).find(c => cleanShort(c.text, 12) && c.f1 - c.f0 >= 0.9)
       if (g && cut(g.f0, Math.min(p.end, g.f1 + 0.9), 'card', '分镜：金句「' + g.text + '」占满屏')) p.cardUsed = true
       continue
     }
@@ -177,7 +182,12 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
           if (run.length >= 2 && span >= 2.0 && (!best || span > best.span)) best = { from: run[0].f0, to: run[run.length - 1].f1, span }
         } else run = []
       }
-      const w = best || { from: (p.cards[0] || {}).f0 || p.start, to: (p.cards[0] || {}).f1 || p.start + 3 }
+      const w = best || (() => {
+        const cs = (p.cards || []).slice(0, 2)
+        if (cs.length === 2) return { from: cs[0].f0, to: cs[1].f1 }
+        const c = cs[0]
+        return { from: c ? c.f0 : p.start, to: c ? Math.max(c.f1, c.f0 + 2) : p.start + 2.4 }
+      })()
       if (cut(w.from - 0.3, Math.min(p.end, w.to + 0.6), 'frame', '分镜：这一页在列举，人物收进竖框')) {
         frameWindow.set(p.index, { from: w.from - 0.3, to: Math.min(p.end, w.to + 0.6) })
       }
@@ -196,7 +206,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     while (s.f1 - cursor > 11) {
       const at = cursor + 9
       // 先看有没有金句能占一整屏（这是参考片最抓眼的那个动作），没有再换小窗
-      const gold = beats.find(x => x.f0 >= at && x.f0 < at + 4.5 && cleanShort(x.text, 6) && x.f1 - x.f0 >= 0.8)
+      const gold = beats.find(x => x.f0 >= at && x.f0 < at + 4.5 && cleanShort(x.text, 12) && x.f1 - x.f0 >= 0.8)
       if (gold && shots.filter(y => y.kind === 'card').length < 2) {
         const to = Math.min(s.f1, Math.max(gold.f1 + 0.9, gold.f0 + 1.8))
         if (cut(gold.f0, to, 'card', '节奏：金句「' + gold.text + '」占满屏')) { cursor = gold.f0 + 1.8; continue }
@@ -211,7 +221,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
   // 兜底节奏：参考片的签名是「一两次全屏字卡 + 一次竖框」。模型没给就引擎补一次，
   // 不硬塞：页里真有一句 6 字以内的金句才补，否则宁可不补。
   if (duration > 25 && !shots.some(s => s.kind === 'card')) {
-    const g = beats.find(b => cleanShort(b.text, 6) && b.f1 - b.f0 >= 1.0 && b.f0 > duration * 0.18 && b.f0 < duration * 0.85)
+    const g = beats.find(b => cleanShort(b.text, 12) && b.f1 - b.f0 >= 1.0 && b.f0 > duration * 0.18 && b.f0 < duration * 0.85)
     if (g) cut(g.f0, Math.min(duration - 1, Math.max(g.f1 + 0.9, g.f0 + 1.8)), 'card', '引擎补节奏：金句「' + g.text + '」占满屏')
   }
   if (duration > 35 && !shots.some(s => s.kind === 'frame')) {

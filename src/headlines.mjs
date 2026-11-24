@@ -49,7 +49,18 @@ export function insideSentence(text, sentence) {
   return true
 }
 
-/** 一条标题能不能挂在这一句上：长度、100% 取自本句、开头结尾不是半句话。纯函数，可单测。 */
+/**
+ * 是不是这一句里**连续**的一段。
+ * 只查「字都在这一句里」（insideSentence）挡不住从中间抽字：
+ * 「真正赚钱的有几个」抽掉一个「的」还是「字都在」，但读起来是「真正赚钱几个」——
+ * 自测 03–10 的大字里一直有这种被掐断的句子，根因就是接地只查字袋子、不查连续性。
+ */
+export function contiguous(text, sentence) {
+  const t = strip(text), s = strip(sentence)
+  return Boolean(t) && s.includes(t)
+}
+
+/** 一条标题能不能挂在这一句上：长度、连续取自本句、开头结尾不是半句话。纯函数，可单测。 */
 export function checkHeadline(text, sentence) {
   const t = strip(text)
   if (!t) return { ok: false, why: '空标题' }
@@ -62,6 +73,7 @@ export function checkHeadline(text, sentence) {
     const bad = cs.filter(ch => !p.has(ch))
     return { ok: false, why: '有这一句里没有的字：' + [...new Set(bad)].join('') }
   }
+  if (!contiguous(t, sentence)) return { ok: false, why: '不是这一句里连续的一段（中间抽掉了字）' }
   const last = cs[cs.length - 1]
   if (HEADLINE.badTail.includes(last)) return { ok: false, why: '结尾是「' + last + '」，读起来是半句话' }
   if (HEADLINE.badHead.test(t)) return { ok: false, why: '以连接词开头，抓不住人' }
@@ -106,8 +118,11 @@ function promptFor(input) {
     '- 结尾落在实词上，不许是「的、了、是、在、就、都、也、才、把」这类字——那是半句话。',
     '- 不许以「但是、然后、所以、因为、就是」开头；不要问句、不要感叹号。',
     '- 每条只对指定的那一句负责：不要拿前后句的内容来概括，也不要跨句改写。',
+    '- 必须是这一句里连续的一段：可以砍头、可以砍尾，不能从中间抽字。',
+    '  原文「真正赚钱的有几个呢」写成「真正赚钱几个」（抽掉一个「的」）就要退回原句重来。',
+    '',
     '示范：原文「但是我今天就要给大家泼一瓶冷水」→ 大字「泼一瓶冷水」；',
-    '原文「就是说用AI来做生产力工具」→「AI做生产力工具」；',
+    '原文「真正的机会是在OPC结合内容」→「机会是在OPC」（不能写成「真正机会在OPC」）；',
     '原文「研究了一圈」→「研究了一圈」（整句就是短的，照旧）。',
     '',
     '句子（index / 原文）：',

@@ -10,7 +10,8 @@
  */
 import { ff } from './ffmpeg.mjs'
 
-export const TEXT_COLOR = { bone: [0.945, 0.929, 0.894], signal: [1.0, 0.353, 0.122], ash: [0.545, 0.537, 0.514] }
+// void = 折光全屏色卡上的字色（荧光绿底上的近黑字，是反白，不是 bone）
+export const TEXT_COLOR = { bone: [0.945, 0.929, 0.894], signal: [1.0, 0.353, 0.122], ash: [0.545, 0.537, 0.514], void: [0.043, 0.043, 0.047] }
 
 export function luma([r, g, b]) {
   const f = v => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4))
@@ -154,7 +155,10 @@ export function boxContrast({ frames, box, color, fps }) {
     const y0 = Math.max(0, Math.round((box.y / (box.outH || 1)) * f.h))
     const y1 = Math.min(f.h - 1, Math.round(((box.y + box.h) / (box.outH || 1)) * f.h))
     const n = f.w * f.h
-    const target = luma(color)
+    // color 可以是数组，也可以是 t => 数组：同一个盒子在不同版式下字色不同
+    // （折光色卡是荧光绿底＋近黑大字，别处是骨白字），只认一种颜色就会量出假失败
+    const col = typeof color === 'function' ? color(t) : color
+    const target = luma(col)
     const bg = []
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
@@ -167,7 +171,7 @@ export function boxContrast({ frames, box, color, fps }) {
     if (bg.length < 12) continue
     bg.sort((a, b) => a - b)
     const p50 = bg[bg.length >> 1]
-    per.push({ t: Number(t.toFixed(2)), bgLuma: Number(p50.toFixed(3)), ratio: Number(contrastRatio(color, [p50, p50, p50]).toFixed(2)) })
+    per.push({ t: Number(t.toFixed(2)), bgLuma: Number(p50.toFixed(3)), ratio: Number(contrastRatio(col, [p50, p50, p50]).toFixed(2)) })
   }
   if (!per.length) return { ok: false, reason: '这个盒子在样帧里没有出现', samples: [] }
   const worst = per.reduce((a, b) => (a.ratio <= b.ratio ? a : b))

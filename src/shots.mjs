@@ -41,25 +41,20 @@ function onWordBoundary(text, pageText) {
   return words.join('') === t
 }
 
-/** 这一段里能不能真的用竖框：得有一串短句连着说（在列举） */
-function hasList(page) {
-  const cards = page.cards || []
-  let run = 0
-  let start = null
-  for (const c of cards) {
-    if (cleanShort(c.text, 10)) {
-      if (run === 0) start = c
-      run++
-      if (run >= 2 && c.f1 - start.f0 >= 2.4) return { ok: true, from: start.f0 - 0.3, to: c.f1 + 0.6, count: run }
-    } else { run = 0; start = null }
-  }
-  return { ok: false }
+/** 这一页够不够用竖框：人物收窄之后，画面里得有东西（至少两张字幕卡） */
+function canFrame(page) {
+  return (page.cards || []).length >= 2
 }
 
-/** 这一段里有没有一句够短的金句可以做成全屏色卡 */
-function hasGoldLine(page) {
-  const c = (page.cards || []).find(x => cleanShort(x.text, 6) && x.f1 - x.f0 >= 0.9)
-  return c ? { ok: true, from: c.f0, to: c.f1 + 0.9, text: c.text } : { ok: false }
+/** 这一页的词表：给模型抄，别让它自己拼字（它拼出来的「泼冷水」原话里是「泼一瓶冷水」） */
+function wordsOf(text, max = 14) {
+  const out = []
+  for (const w of segment(bare(text))) {
+    const b = bare(w)
+    if (b.length >= 2 && !out.includes(b)) out.push(b)
+    if (out.length >= max) break
+  }
+  return out
 }
 
 /**
@@ -91,16 +86,24 @@ export function validateProposal({ pages, proposal }) {
     let shot = SHOT_KINDS.includes(raw.shot) ? raw.shot : 'full'
     if (raw.shot && !SHOT_KINDS.includes(raw.shot)) problems.push('第 ' + page.index + ' 页版式「' + raw.shot + '」不认识')
     if (shot === 'card') {
+      // 色卡上排的是大字（一屏最多 3 行），不是字幕卡：4–12 字的原话就够，不必短到 6 字。
+      // 6 字这条线是照着「一句金句」想的，真实口播里 10 个字的金句到处都是，
+      // 结果自测 03–10 一条片子都没出过全屏色卡——参考片最抓眼的那个动作我们一次都没做。
       const asked = bare(raw.cardText || '')
-      const c = (page.cards || []).find(x => asked && bare(x.text) === asked && cleanShort(x.text, 8))
-      if (!c) {
-        problems.push('第 ' + page.index + ' 页想用全屏色卡，但没引用一句本页 6 字以内的原话（cardText）')
+      const host = (page.cards || []).find(x => asked && asked.length >= 4 && bare(x.text).includes(asked))
+      if (!asked || asked.length < 4) {
+        problems.push('第 ' + page.index + ' 页想用全屏色卡，但 cardText 太短或没给（要本页原话里 4–12 字的一段）')
+        shot = 'full'
+      } else if (asked.length > 12) {
+        problems.push('第 ' + page.index + ' 页的色卡文字「' + asked + '」有 ' + asked.length + ' 字，一屏排不下（最多 12 字）')
+        shot = 'full'
+      } else if (!host) {
+        problems.push('第 ' + page.index + ' 页的色卡文字「' + asked + '」不是本页哪一句话里连续的一段')
         shot = 'full'
       } else raw.cardText = asked
     }
     if (shot === 'frame') {
-      const l = hasList(page)
-      if (!l.ok) { problems.push('第 ' + page.index + ' 页想用竖框，但这一段没有连续短句在列举'); shot = 'full' }
+      if (!canFrame(page)) { problems.push('第 ' + page.index + ' 页想用竖框，但这一页只有一张字幕卡，收窄了画面里没东西'); shot = 'full' }
     }
     if (shot !== 'full') {
       if (counts[shot] >= QUOTA[shot]) {
@@ -121,7 +124,7 @@ export function validateProposal({ pages, proposal }) {
         else if (shot !== 'frame' && shot !== 'corner') problems.push('第 ' + page.index + ' 页标签墙只能配竖框/小窗（满幅会压在脸上）')
         else block = { kind: 'tagwall', items: items.slice(0, 8) }
       } else if (kind === 'check') {
-        const text = bare(b.text).slice(0, 14)
+        const text = bare(b.text).slice(0, 16)
         if (text.length < 2 || !inside(text, page.text)) problems.push('第 ' + page.index + ' 页对勾卡「' + b.text + '」不是本页原话')
         else if (shot === 'card') problems.push('第 ' + page.index + ' 页对勾卡不能和全屏色卡同时用')
         else block = { kind: 'check', text }
@@ -151,30 +154,39 @@ export function validateProposal({ pages, proposal }) {
   return { pages: out, problems, counts }
 }
 
-const PROMPT = (input) => [
+const PROMPT = (input, problems = []) => [
   '你在给一条竖屏口播视频做分镜，节奏参考「折光」：每几秒换一次构图，字的密度高，但只有金句才占满屏。',
-  '给你若干页，每页是那几秒里说过的原话（已经剪好的成片文本）。为每页决定：',
+  '给你若干页，每页是那几秒里说过的原话（已经剪好的成片文本），并给出这一页的「词」（原话切好的词）。',
+  '凡是要上屏的文字，一律从「词」或原话里逐字照抄——连「的、就、了、是」也不能少一个字、换一个字。',
+  '模型改写过的短语（比如原话「泼一瓶冷水」写成「泼冷水」）会被校验器打回，那一处就等于没做。',
   '',
-  '1) title 章节名：3–8 个汉字。必须是这一页原话里连续出现的一段，不许改写、不许缩写、不许用别的页的字。',
+  '为每页决定：',
+  '1) title 章节名：3–8 个汉字（带 OPC / AI 这类西文词的可以到 10 个字）。必须是这一页原话里连续出现的一段。',
   '   不要以「的、了、是、在、就、都、也、这、那」这类字开头，也不要收在「给、做、说、越、如果」这种半句话上。',
   '2) eyebrow 小字眉：2–4 个汉字，同样取自这一页原话（挑一个实词，比如「门槛」「机会」）。',
   '3) shot 版式：',
   '   full   满幅（默认：人在说话）',
   '   corner 右上小窗，画面让给字（交代背景、转折、要强调一段话时）',
-  '   frame  竖框居中，人物收窄（只有一段里连着列好几样东西时才用）',
-  '   card   全屏色卡（只有一句 6 字以内的金句或反问时才用；全片最多 2 次）。用 card 必须给 cardText，',
-  '          照抄该页「卡片」里那一句的原话；给不出 cardText 就别用 card。',
+  '   frame  竖框居中，人物收窄（这一页要把话摊开讲、或者要给图形块腾地方时）',
+  '   card   全屏色卡：整屏只有一句大字，最抓眼。只要这一页有一句 4–12 字、说得完整、不带逗号的原话就可以用；',
+  '          必须给 cardText，逐字照抄那一句（照抄「卡片」里最长的那张也能过）。全片最多 2 次。',
   '4) emph 强调词：2–4 个字，这一页最值得上色（黄 / 荧光绿 / 红底）的那个词，必须原话里有。',
   '5) block 图形块（可选，只在内容和它天然对得上时才给，不要为了热闹硬加）：',
-  '   tagwall 标签墙：把这一段说到的 3–8 个同类名词列成标签，每个 2–6 字，必须都在本页原话里；只能配 frame / corner',
-  '   check   对勾卡：说「你能得到 / 你想要的」时，给一句 2–14 字的交付物，必须是原话',
-  '   banner  红条打叉：说「别再看 / 不要 / 别再」这类否定时，给 2–10 字',
+  '   tagwall 标签墙：把这一段说到的 3–8 个同类名词列成标签，每个 2–6 字，必须都在原话里；只能配 frame / corner',
+  '   check   对勾卡：说「你能得到 / 你想要的」时，给一句 2–16 字的交付物，逐字照抄原话',
+  '   banner  红条打叉：说「别再看 / 不要 / 别再」这类否定时，给 2–10 字，逐字照抄；只配满幅',
   '   gauge   刻度卡：说门槛越来越低 / 越来越难时（卡上不写数字）',
   '   none    不加',
   '',
   '硬规矩：任何地方都不许写原话里没有的数字、品牌名、人名、结论。整体配额：card ≤ 2、frame ≤ 1、corner 2–3，其余 full。',
   '',
-  '页（index / 起始秒 / 原文）：',
+  (problems.length ? [
+    '上一版有下面这些没过校验（校验器只认原话里连续出现的一段，改写一律不算）：',
+    ...problems.slice(0, 12).map(p => '- ' + p),
+    '请逐条改对，重新输出完整 JSON（所有页都要给，不是只给改的那几页）。',
+    '',
+  ].join('\n') : ''),
+  '页（index / 起始秒 / 原文 / 卡片 / 词）：',
   JSON.stringify(input, null, 1),
   '',
   '只输出 JSON：{"pages":[{"index":1,"title":"...","eyebrow":"...","shot":"full","cardText":"","emph":"...","block":{"kind":"none","items":[],"text":""}}]}',
@@ -183,6 +195,9 @@ const PROMPT = (input) => [
 /**
  * 给每一页要一个分镜。返回的 pages 一定和传入的页等长、index 一一对应。
  * 模型没接上 / 全不合格 → 确定性兜底（页骨架自带 title/eyebrow，版式回落 full）。
+ *
+ * 打回了会带着「哪条没过、为什么」再提一次（只一次）。真实提案里大半驳回是模型没按
+ * 「逐字照抄」引用，不是它想错——规则仍然定生死，但给模型一次按规则改写的机会。
  */
 export async function planPages({ pages, log = () => {} } = {}) {
   const list = (Array.isArray(pages) ? pages : []).filter(p => p && bare(p.text))
@@ -191,18 +206,32 @@ export async function planPages({ pages, log = () => {} } = {}) {
   const input = list.map(p => ({
     index: p.index, 起始: p.start, 原文: bare(p.text),
     卡片: (p.cards || []).map(c => bare(c.text)).filter(t => t.length <= 12),
+    词: wordsOf(p.text),
   }))
-  const r = await chatJSON({ prompt: PROMPT(input), maxTokens: 2200, model: LLM.models.fast })
+  const score = v => v.pages.filter(p => p.shot !== 'full').length * 2 + v.pages.filter(p => p.block).length * 3 + v.pages.filter(p => p.source === 'model').length
+  const r = await chatJSON({ prompt: PROMPT(input), maxTokens: 2400, model: LLM.models.fast })
   if (!r.ok) {
     log('分镜：模型没接上（' + r.skipped + '），按内容规则排版')
     return { ok: false, skipped: r.skipped, pages: fallback, problems: [], model: null }
   }
-  const v = validateProposal({ pages: list, proposal: r.value })
+  let v = validateProposal({ pages: list, proposal: r.value })
+  let raw = r.value
+  let attempts = 1
+  if (v.problems.length) {
+    const r2 = await chatJSON({ prompt: PROMPT(input, v.problems), maxTokens: 2400, model: LLM.models.fast })
+    attempts = 2
+    if (r2.ok) {
+      const v2 = validateProposal({ pages: list, proposal: r2.value })
+      if (score(v2) > score(v)) { v = v2; raw = r2.value }
+    }
+  }
   const adopted = v.pages.filter(p => p.source === 'model').length
   const blocks = v.pages.filter(p => p.block).length
   log('分镜：' + list.length + ' 页，模型采纳 ' + adopted + ' 页；版式 ' +
     Object.entries(v.counts).filter(([, n]) => n).map(([k, n]) => SHOT_LABEL[k] + ' ' + n).join(' / ') +
     (blocks ? '；图形块 ' + blocks + ' 个' : '') +
+    (attempts > 1 ? '；带驳回理由重提 1 次' : '') +
     (v.problems.length ? '；打回 ' + v.problems.length + ' 条（' + v.problems.slice(0, 2).join('；') + '）' : ''))
-  return { ok: true, model: r.model, ms: r.ms, tokens: r.tokens, pages: v.pages, problems: v.problems, counts: v.counts }
+  // raw 留着：报告里要能看出「模型提了什么、被哪条规则打回」，不能只有结果
+  return { ok: true, model: r.model, ms: r.ms, tokens: r.tokens, pages: v.pages, problems: v.problems, counts: v.counts, raw, attempts }
 }

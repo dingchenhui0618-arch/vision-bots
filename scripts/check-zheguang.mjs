@@ -104,7 +104,7 @@ ok('图形块文字都来自原话', blockTexts.every(t => inside(t, allText)), 
 // 5) 章节名：不空就别是半句话
 const BAD_END = /[的了是在和就都也才把给对从但而很太更不没有着过吧呢吗啊嘛去来出要会能说看用做你我他她它们这那越]$/
 ok('章节名不以虚词收尾', scene.pages.every(p => !p.title || !BAD_END.test(p.title)), scene.pages.filter(p => p.title && BAD_END.test(p.title)).map(p => p.title).join('、'))
-ok('章节名不超过 8 字', scene.pages.every(p => bare(p.title).length <= 8))
+ok('章节名不超过 10 字', scene.pages.every(p => bare(p.title).length <= 10))
 
 // 6) HUD：页码、品牌、进度线三件都在
 ok('HUD 品牌/平台字段在', scene.labels && scene.labels.template === '折光')

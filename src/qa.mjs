@@ -219,8 +219,17 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
         { headPx: [Math.round(y0), Math.round(y1)], hits })
     }
 
-    // 4. 安全区：不许出画，也不许贴边
-    const bad = unions.filter(b => b.x < BAR.margin || b.y < BAR.margin || b.x + b.w > outSize[0] - BAR.margin || b.y + b.h > outSize[1] - BAR.margin)
+    // 4. 安全区：不许出画，也不许贴边。
+    // 量的是「画出来的那个盒子」，不是 unions——union 会把左边的标签和右边的标签并成一个
+    // 1080 宽的大框，于是一个都不出画的版式被判成出画（自测 11 的 block:tag 就是这么假失败的）。
+    const seen = new Set()
+    const bad = []
+    for (const b of (boxes || [])) {
+      const key = [b.tag, Math.round(b.x), Math.round(b.y), Math.round(b.w), Math.round(b.h)].join(',')
+      if (seen.has(key)) continue
+      seen.add(key)
+      if (b.x < BAR.margin || b.y < BAR.margin || b.x + b.w > outSize[0] - BAR.margin || b.y + b.h > outSize[1] - BAR.margin) bad.push(b)
+    }
     add('safe_area', bad.length === 0,
       bad.length ? `${bad.length} 个元素出画/贴边：${bad.slice(0, 3).map(b => b.tag).join('、')}` : `所有元素都在画面内，离边 ${BAR.margin}px 以上`,
       { bad: bad.map(b => ({ tag: b.tag, x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.w), h: Math.round(b.h) })) })
@@ -231,7 +240,14 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
     }
     if (frames && frames.length) {
       const need = { big: BAR.contrastBig, rail: BAR.contrastRail, sub: BAR.contrastSmall, 'hud:rec': BAR.contrastSmall, 'hud:sec': BAR.contrastSmall }
-      const colorOf = tag => (tag === 'rail' ? TEXT_COLOR.signal : TEXT_COLOR.bone)
+      // 色卡是反白：荧光绿底 + 近黑大字。以前一律按 bone（骨白）量，色卡上就量出 1.4:1
+      // 这种假失败——字色得跟着画的颜色走，否则量的是不存在的字。
+      const onCardAt = t => Boolean(scene && (scene.shots || []).some(s => s.kind === 'card' && t >= s.f0 - 0.01 && t < s.f1))
+      const colorOf = (tag) => {
+        if (tag === 'rail') return TEXT_COLOR.signal
+        if (tag === 'big') return t => (onCardAt(t) ? TEXT_COLOR.void : TEXT_COLOR.bone)
+        return TEXT_COLOR.bone
+      }
       const fails = []
       const report = []
       for (const b of unions) {

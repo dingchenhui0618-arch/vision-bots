@@ -5,7 +5,7 @@
  */
 import { sectionsOf } from './sections.mjs'
 import { segment } from './segment.mjs'
-import { insideSentence } from './headlines.mjs'
+import { insideSentence, contiguous } from './headlines.mjs'
 
 const round = (n, k = 3) => Number(n.toFixed(k))
 const PUNCT = /[\s，。！？、；：,.!?;:""''…—~·\-]/g
@@ -24,21 +24,25 @@ export const STOP = new Set(['这个', '那个', '就是', '但是', '所以', '
   '这样', '那样', '一下', '一点', '还是', '然后', '而且', '只是', '这些', '那些', '都能', '做出', '看到', '只有',
   '这种', '那种', '是不是', '一句话'])
 
-/** 一条标题能不能挂在页上：3–8 字、连续取自本页原话、不虚词起头收尾。纯函数。 */
+/** 一条标题能不能挂在页上：3–10 字、连续取自本页原话、不虚词起头收尾。纯函数。 */
 export function checkPageTitle(text, source) {
   const t = String(text || '')
   const n = bare(t).length
   if (!n) return { ok: false, why: '空标题' }
   if (n < 3) return { ok: false, why: '少于 3 字' }
-  if (n > 8) return { ok: false, why: '超过 8 字' }
+  // 8 个字是当初按纯中文估的；带 OPC / AI 这类西文词的标题（「真正的机会在OPC」）
+  // 数字数会被算成 10，但它只占 7 个字宽，54px 章节名在 1080 宽里放得下。
+  if (n > 10) return { ok: false, why: '超过 10 字' }
   if (!insideSentence(t, source)) return { ok: false, why: '有本页原话里没有的字' }
+  // 章节名同理：只查字袋子会放过「从中间抽掉一个的」这种掐断的标题
+  if (!contiguous(t, source)) return { ok: false, why: '不是本页原话里连续的一段' }
   if (BAD_START.test(t)) return { ok: false, why: '虚词起头，像半句话' }
   if (BAD_END.test(t) || BAD_END_WORD.test(t)) return { ok: false, why: '结尾是半句话' }
   return { ok: true, chars: n }
 }
 
 /**
- * 确定性兜底：在页原话上按词滑窗口，挑一段能当标题的 3–8 字。
+ * 确定性兜底：在页原话上按词滑窗口，挑一段能当标题的 3–10 字。
  * 返回的一定是原话里连续的一段，不缩写、不改写。
  */
 export function pickPageTitle(source) {
@@ -50,7 +54,7 @@ export function pickPageTitle(source) {
     for (let j = i; j < ws.length; j++) {
       acc += ws[j]
       const n = bare(acc).length
-      if (n > 8) break
+      if (n > 10) break
       if (n < 3) continue
       if (BAD_START.test(acc) || BAD_END.test(acc) || BAD_END_WORD.test(acc)) continue
       const content = ws.slice(i, j + 1).filter(w => !STOP.has(w) && bare(w).length >= 2).length
