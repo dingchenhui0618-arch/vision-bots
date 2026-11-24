@@ -71,6 +71,9 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
       // 它该看的是交付字幕卡本身；大字是这些卡的压缩词，不构成新的文案来源。
       sections: [],
       brief, terms: loadTerms(group.dir), log,
+      // 听音复核仲裁要源素材：语义审读提的改法必须拿音频对一次（没有更强模型时会明说没验）
+      media: (state.source && state.source.file) || null,
+      relistenDir: join(group.dir, 'cache', 'relisten'),
     })
   } catch (e) {
     semantic = { ok: false, skipped: 'exception', detail: e.message }
@@ -91,6 +94,24 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
   }
   report.frames = frames
   state.report = report
+
+  // 音频与字幕不一致的地方 = 真的听错了/吞字了。写成返工线索：下次剪辑先把这几句重听一遍，
+  // 而不是让助手凭猜去改字（听音复核定案，四遍纠错照样不改时间码）。
+  try {
+    // 两类都要进线索：①音频与字幕不一致（听错了）；②模型给了逐字改法但过不了逐词校验的
+    // （「AI是带」→「AI时代」：两字都同音，只是跨了词，四遍纠错的逐词规则改不了）。
+    // 线索只负责「把这几句重听一遍」，改不改由听音复核的证据说了算。
+    const diffs = (semantic.issues || []).filter(i =>
+      (i.audioReview && i.audioReview.text && i.audioReview.tier === 'strong' && i.audioReview.contradicted === false) ||
+      (i.to && i.quote && String(i.to).length === String(i.quote).length))
+    if (diffs.length) {
+      writeFileSync(join(group.dir, 'revise-hints.json'), JSON.stringify({
+        at: new Date().toISOString(),
+        hints: diffs.map(i => ({ quote: i.quote, audio: i.audioReview.text, at: i.at })),
+      }, null, 1), 'utf8')
+      log('质检线索：' + diffs.length + ' 处音频与字幕不一致，已写成返工线索（下次剪辑优先重听）')
+    }
+  } catch (e) { log('写质检线索失败：' + e.message) }
   const reportPath = join(group.dir, 'work', job.id, 'report.json')
   writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf8')
   artifact('report', reportPath)

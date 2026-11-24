@@ -27,6 +27,7 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { chat, LLM } from './llm.mjs'
+import { R as RELISTEN, alignCrop, charDiff, enabled as relistenEnabled, modelAvailable as relistenModel, planRepair, relistenSentence, silentGaps, slotAnomaly } from './relisten.mjs'
 
 /** execFile 不收 stdin，拼音查询要喂 JSON，所以自己开管道。 */
 function runStdin(cmd, args, input, { timeout = 120000, maxBuffer = 4 << 20 } = {}) {
@@ -538,6 +539,8 @@ ${nudge}
  */
 export const FIXER_VERSION = createHash('sha1')
   .update(readFileSync(fileURLToPath(import.meta.url), 'utf8'))
+  // 听音复核是纠错的一部分（第五遍），它自己的规则变了同样要重新纠错
+  .update(readFileSync(fileURLToPath(new URL('./relisten.mjs', import.meta.url)), 'utf8'))
   .digest('hex').slice(0, 12)
 
 /**
@@ -677,12 +680,223 @@ export function applyToSegments(words, segments) {
   })
 }
 
+// ── 第五遍：听音复核 ──
+// 四遍纠错和第二意见全在文本上推理，ASR 吞字（少吐字）这一类的错它们结构上看不见：
+// 少了字的那句话照样读得通，模型不会报，语义审读只能凭语感猜——猜出来的东西没法当证据。
+// 唯一能当证据的是音频本身，所以这里换一个更强的模型，把押着疑问的那一小段重新听一遍。
+//
+// 触发条件不是「模型说这句有问题」，而是「ASR 自己在这几个词上没把握」：
+// 4 个词的窗口里出现 ≥2 个 p<0.65 的词，就是小模型在这儿卡过的实证（实测「知(0.42) 道 会(0.55)」
+// 正是它把两句话并成一句的地方）。全片最多重听 RELISTEN.maxSpans 处，逐条记账。
+
+/** 句子里低置信词扎堆的位置。纯函数，可单测。 */
+export function lowConfidenceClusters(view, cfg = RELISTEN) {
+  const out = []
+  const ws = (view && view.ws) || []
+  for (let s = 0; s < ws.length; s++) {
+    const win = ws.slice(s, s + cfg.lowWindow)
+    const low = win.filter(w => typeof w.p === 'number' && w.p < cfg.lowP)
+    if (low.length >= cfg.lowNeeded) out.push({ at: s, n: low.length, minP: Math.min(...low.map(w => w.p)) })
+  }
+  return out
+}
+
+/**
+ * 听音复核，并把能落地的改动落到 words 上。
+ * 返回新的 current、记账 section、改动涉及的源时间区间（断言用）、净词数变化。
+ */
+async function relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords = '', hints = [], log }) {
+  const base = { model: RELISTEN.model, ran: true, candidates: 0, spans: [], applied: 0 }
+  const off = (why, detail) => ({ current, section: { ...base, ran: false, why, detail: detail || null }, ranges: [], confirmed: [], delta: 0 })
+  if (!relistenEnabled()) return off('disabled', 'VISION_BOTS_RELISTEN=0')
+  if (!relistenModel(RELISTEN.model)) {
+    log('听音复核没跑：本机没有 faster-whisper ' + RELISTEN.model + '（要一个比 small 更强的耳朵；small 就是犯错的那个）')
+    return off('no-strong-model', '本机没有 faster-whisper ' + RELISTEN.model)
+  }
+  if (!media) return off('no-media', '没拿到源素材路径')
+  if (!segments || !segments.length) return off('no-segments', '没有句级时间戳')
+
+  // 候选按**文字**记，不按词下标：改一处会插/删词，后面几条的下标就全歪了。
+  // 处理每条时再按文字在当前的词表里重新定位，改完前面一条也不影响后面。
+  // 把词表拼成字符流再找引用的位置：这样得到的区间**正好覆盖**那句话，
+  // 不会把前一句的字也圈进来（第一版从每个词往后累加，找到含引用的位置就返回，
+  // 结果区间起点常常偏早——实测「知道会做」的区间变成 36.46–44.58，把前面 6 秒也带上了，
+  // 两个窗口的读数因此不一致，本该补的字反而没补）。
+  const findRange = (needle) => {
+    const q = strip(needle)
+    if (!q) return null
+    let s = ''
+    const owner = []
+    for (let i = 0; i < current.length; i++) {
+      for (const ch of splitAffixes(current[i].w).core) { s += ch; owner.push(i) }
+    }
+    const at = s.indexOf(q)
+    if (at < 0) return null
+    const a = owner[at]
+    const b = owner[at + q.length - 1]
+    if (a === undefined || b === undefined) return null
+    return { a, b }
+  }
+
+  // 质检报出来「音频与字幕不一致」的地方排最前：那是上一轮跑完质检留下的线索，
+  // 剪辑返工时第一件该做的事就是把它听清楚（不靠猜，靠重听）。
+  const cands = []
+  const seen = new Set()
+  for (const h of hints || []) {
+    const q = strip(h && h.quote)
+    if (!q || seen.has(q)) continue
+    seen.add(q)
+    cands.push({ text: q, hint: h, lowN: 0, minP: 1, slot: null })
+  }
+  for (const v of sentenceView(current, segments)) {
+    if (seen.has(v.text)) continue
+    seen.add(v.text)
+    const lowN = v.ws.filter(w => typeof w.p === 'number' && w.p < RELISTEN.lowP).length
+    const minP = Math.min(...v.ws.map(w => (typeof w.p === 'number' ? w.p : 1)))
+    // 词槽吞静音的迹象：一个词的时长远超它字数该占的时间、里面还压着一段静音。
+    // 这是「丢了字」最直接的证据，而且与模型无关——比「低置信词多」更能说明问题。
+    let slot = null
+    for (const w of v.ws) {
+      const ww = current[w.i]
+      const an = slotAnomaly({ start: ww.start, end: ww.end, chars: [...splitAffixes(ww.w).core].length, gaps: silentGaps(envelope, ww.start, ww.end) })
+      if (an.anomaly && (!slot || an.ratio > slot.ratio)) slot = { ratio: an.ratio, i: w.i, gap: an.gap }
+    }
+    if (!lowConfidenceClusters(v).length && !slot) continue
+    cands.push({ text: v.text, lowN, minP, slot })
+  }
+  // 排序：质检线索最优先，其次看词槽有没有吞字的迹象，再看低置信词多不多
+  cands.sort((a, b) => (Number(Boolean(b.hint)) - Number(Boolean(a.hint))) || (b.slot ? b.slot.ratio : 0) - (a.slot ? a.slot.ratio : 0) || b.lowN - a.lowN || a.minP - b.minP)
+  const section = {
+    ...base, candidates: cands.length,
+    picked: cands.slice(0, RELISTEN.maxSpans).map(c => ({ text: c.text.slice(0, 16), hint: Boolean(c.hint), slot: c.slot ? c.slot.ratio : null, low: c.lowN })),
+  }
+  if (!cands.length) {
+    return off('nothing-suspicious', '既没有质检线索，也没有扎堆的低置信词（4 个词里 ≥2 个 p<' + RELISTEN.lowP + '）或吞了静音的词槽，没有值得重听的地方')
+  }
+
+  const ranges = []
+  const confirmed = []
+  const reject = (span, r, v, why) => {
+    section.spans.push({ span, agree: true, text: r.text, mine: v.text, rejected: why })
+    log('听音复核：' + span.join('–') + 's 音频是「' + r.text + '」、字幕是「' + v.text + '」，但' + why + '，不改')
+  }
+
+  for (const cand of cands.slice(0, RELISTEN.maxSpans)) {
+    const rg = findRange(cand.text)
+    if (!rg) { section.spans.push({ skipped: 'not-found', quote: cand.text.slice(0, 24) }); continue }
+    const v = { ws: [], text: '' }
+    for (let i = rg.a; i <= rg.b; i++) v.ws.push({ i, core: splitAffixes(current[i].w).core, p: current[i].p })
+    v.text = v.ws.map(x => x.core).join('')
+    const t0 = current[rg.a].start
+    const t1 = current[rg.b].end
+    const span = [+t0.toFixed(2), +t1.toFixed(2)]
+    const r = await relistenSentence({ media, span: [t0, t1], cacheDir: relistenDir, hotwords, expect: v.text, log })
+    if (!r.ok) {
+      section.spans.push({ span, skipped: r.skipped, detail: r.detail || null })
+      log('听音复核：' + span.join('–') + 's 没听成（' + r.skipped + '），这条不改')
+      continue
+    }
+    if (!r.agree) {
+      section.spans.push({ span, agree: false, decodes: r.decodes })
+      log('听音复核：' + span.join('–') + 's 两次听的不一致（' + (r.decodes || []).map(d => '「' + d.text + '」').join(' vs ') + '），不算证据')
+      continue
+    }
+    const diff = charDiff(v.text, r.text)
+    if (diff.same) {
+      section.spans.push({ span, agree: true, confirmed: true, text: r.text })
+      // 强耳朵逐字读过、和字幕一样：这句话里的词不算「没把握」了
+      if (r.tier === 'strong') confirmed.push([t0 - 1e-6, t1 + 1e-6])
+      log('听音复核：' + span.join('–') + 's 音频与字幕逐字一致（「' + r.text + '」），这句没有吞字')
+      continue
+    }
+    if (diff.error) { reject(span, r, v, diff.error); continue }
+    const ws = v.ws.map(w => ({ i: w.i, core: w.core, start: current[w.i].start, end: current[w.i].end }))
+    const gapsOf = i => silentGaps(envelope, current[i].start, current[i].end)
+    const rep = planRepair({ ws, diff, gapsOf })
+    if (!rep.ok) { reject(span, r, v, rep.why); continue }
+
+    // 弱耳朵（还是 small，只是紧窗口重听）只能给「本来就该有的字」命名，不能自己开一扇门：
+    // 要它授权补字，必须再加一条与模型无关的证据——那个词槽明显吞了静音
+    // （实测「会」一个字的槽 0.88s，等于 5.5 个字的时长，里面有 0.46s 静音）。
+    // 改字只认「强耳朵 + 两个窗口都听成」：弱耳朵就是犯错的那个模型（实测它把「知道」读成「直到」），
+    // 让它授权改字等于用一个错去改另一个错。
+    if (r.tier !== 'strong' || r.single) {
+      reject(span, r, v, r.tier !== 'strong'
+        ? '弱耳朵（' + r.model + '）不能单独授权改字，它自己也会听错'
+        : '强耳朵这次只有一个窗口听成了（另一个没起来），改字要两个窗口逐字一致')
+      continue
+    }
+
+    let next = null
+    if (rep.op === 'insert') {
+      const host = current[rep.host]
+      const nw = { w: rep.newWord.w, start: rep.newWord.start, end: rep.newWord.end, p: host.p, fixed: true, src: 'relisten' }
+      const nh = { ...host, start: rep.hostStart, fixed: true, src: 'relisten' }
+      next = [...current.slice(0, rep.host), nw, nh, ...current.slice(rep.host + 1)]
+    } else if (rep.op === 'sub') {
+      // 等字数替换：只换词里的字，时间码一个字都不动
+      next = current.map((w, i) => {
+        const hp = rep.parts.find(x => x.i === i)
+        if (!hp) return w
+        const af = splitAffixes(w.w)
+        return { ...w, w: af.lead + hp.to + af.trail, fixed: true, src: 'relisten' }
+      })
+    } else if (rep.op === 'delete') {
+      if (rep.eaten.some(e => !e.full)) { reject(span, r, v, '删字切在词中间，v1 不拆词'); continue }
+      const ids = new Set(rep.eaten.map(e => e.i))
+      if (Math.min(...ids) === 0) { reject(span, r, v, '删掉的是句首词，v1 不动句子起点'); continue }
+      let carry = null
+      const out = []
+      for (let i = 0; i < current.length; i++) {
+        if (ids.has(i)) { carry = current[i].end; continue }
+        if (carry !== null && out.length) {
+          out[out.length - 1] = { ...out[out.length - 1], end: carry, fixed: true, src: 'relisten' }
+          carry = null
+        }
+        out.push(current[i])
+      }
+      if (carry !== null && out.length) out[out.length - 1] = { ...out[out.length - 1], end: carry, fixed: true, src: 'relisten' }
+      next = out
+    }
+    if (!next) { reject(span, r, v, '没有可落地的改法'); continue }
+
+    // 落地后那句必须逐字对上音频，对不上就整处撤回，绝不半截改。
+    // 不用句子视图（可能跨段），直接在改完的词表附近重新做一次文字对齐。
+    const back = alignCrop(r.text, next.slice(Math.max(0, rg.a - 1), rg.b + 6).map(w => ({ w: w.w })))
+    if (!back || back.text !== r.text) {
+      reject(span, r, v, '改完仍对不上音频（' + (back ? '「' + back.text + '」' : '句子散了') + '），已撤回')
+      continue
+    }
+    current = next
+    // 删字会把它前面那个词的 end 延长到被删词的 end，那个词的时间码确实变了，
+    // 所以要把它一起划进「允许变动」的区间，否则断言会把它当成越权改动。
+    const widen = rep.op === 'delete' ? current[Math.max(0, rg.a - 1)].start : t0
+    ranges.push([Math.min(t0, widen) - 1e-6, t1 + 1e-6])
+    section.applied += 1
+    section.spans.push({
+      span, agree: true, text: r.text, mine: v.text, applied: true, op: rep.op,
+      tier: r.tier, model: r.model,
+      added: rep.op === 'insert' ? rep.newWord.w : null,
+      gap: rep.gap || null,
+      decodes: r.decodes,
+    })
+    log('听音复核：' + span.join('–') + 's 字幕「' + v.text + '」→ 音频「' + r.text + '」' +
+      (rep.op === 'insert'
+        ? '（补「' + rep.newWord.w + '」，放进 ' + rep.gap[0] + '–' + rep.gap[1] + 's 的静音缝隙）'
+        : rep.op === 'sub'
+          ? '（把「' + rep.parts.map(x => x.from).join('') + '」改成「' + rep.parts.map(x => x.to).join('') + '」，时间码不动）'
+          : '（删 ' + rep.eaten.length + ' 个词）') + '；两次听一致（强耳朵 ' + r.model + '，两个窗口）')
+  }
+  section.delta = current.length - words.length
+  section.confirmedSpans = confirmed.length
+  return { current, section, ranges, confirmed, delta: section.delta }
+}
+
 /**
  * 主入口。返回 {words, report}。
  */
-export async function correct({ words, terms, log = () => {}, askModel = true, segments = null }) {
+export async function correct({ words, terms, log = () => {}, askModel = true, segments = null, media = null, envelope = null, relistenDir = null, hints = [] }) {
   const t0 = Date.now()
-  const baseline = JSON.stringify(words.map(w => [w.start, w.end]))
 
   const g = applyTerms(words, terms)
   let current = g.words
@@ -885,19 +1099,44 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     }
   }
 
+  // 第五遍：听音复核。只重听 ASR 自己卡过的那几句，预算 RELISTEN.maxSpans 处。
+  const aud = await relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords: hotwordPrompt(terms), hints, log })
+  current = aud.current
+  report.relisten = aud.section
+
   const appliedIdx = new Set()
   for (const a of report.applied) for (let k = 0; k < (a.n || 1); k++) appliedIdx.add(a.i + k)
+  const audioIdx = new Set(current.map((w, i) => (w.src === 'relisten' ? i : -1)).filter(i => i >= 0))
+  const heardRanges = [...(aud.ranges || []), ...(aud.confirmed || [])]
+  const heard = w => heardRanges.some(r => w.start >= r[0] && w.end <= r[1] + 1e-6)
   report.pending = current
-    .map((w, i) => ({ i, at: +w.start.toFixed(2), w: w.w, p: w.p }))
-    .filter(x => typeof x.p === 'number' && x.p < LOW_P && !appliedIdx.has(x.i))
+    .map((w, i) => ({ i, at: +w.start.toFixed(2), w: w.w, p: w.p, heard: heard(w) }))
+    // 听音复核改过的词、以及强耳朵逐字读过且与字幕一致的词，都不再算「没把握」
+    .filter(x => typeof x.p === 'number' && x.p < LOW_P && !appliedIdx.has(x.i) && !audioIdx.has(x.i) && !x.heard)
+    .map(({ heard: _h, ...rest }) => rest)
 
-  const after = JSON.stringify(current.map(w => [w.start, w.end]))
+  // 硬约束改两条，都比原来更严：
+  //   · 改动那句**外面**的词，起止一个字节都不许动（原来要求全片逐词相等；
+  //     听音复核补字会在这句里插词，全片相等就不再成立，所以按句子划界）；
+  //   · 词数的变化必须正好等于听音复核插/删的词数，多一个少一个都算越权。
+  const inRange = w => aud.ranges.some(r => w.start >= r[0] && w.end <= r[1] + 1e-6)
+  const slice = arr => JSON.stringify(arr.filter(w => !inRange(w)).map(w => [+w.start.toFixed(3), +w.end.toFixed(3)]))
   report.assertion = {
-    wordCount: words.length === current.length,
-    timingUntouched: baseline === after,
+    wordCount: current.length === words.length + (aud.delta || 0),
+    timingUntouched: slice(words) === slice(current),
+    audioRepairs: aud.section.applied,
+    wordCountDelta: current.length - words.length,
   }
   if (!report.assertion.wordCount || !report.assertion.timingUntouched) {
-    throw new Error('纠错层动了时间码或词数，已中止（这是硬约束）')
+    // 报错要能定位：把区间外对不上的前几处写进报告（只报「动了时间码」等于没报）
+    const outA = words.filter(w => !inRange(w))
+    const outB = current.filter(w => !inRange(w))
+    const bad = []
+    for (let i = 0; i < Math.min(outA.length, outB.length) && bad.length < 5; i++) {
+      if (outA[i].start !== outB[i].start || outA[i].end !== outB[i].end) bad.push({ i, a: [outA[i].start, outA[i].end, outA[i].w], b: [outB[i].start, outB[i].end, outB[i].w] })
+    }
+    report.assertion.detail = { ranges: aud.ranges, outA: outA.length, outB: outB.length, bad }
+    throw new Error('纠错层动了时间码或词数，已中止（这是硬约束）：' + JSON.stringify(report.assertion))
   }
   report.stats = {
     words: current.length,
@@ -909,9 +1148,10 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     deleted: report.applied.reduce((n, a) => n + (a.deleted || 0), 0),
     near: report.applied.filter(a => a.kind === 'near').length,
     span: report.applied.filter(a => a.kind === 'span').length,
+    relisten: aud.section.applied || 0,
     ms: Date.now() - t0,
   }
   const aiAccepted = report.applied.length - g.hits.length
-  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 第二意见 ${report.dual && report.dual.ok ? report.dual.need + ' 待证/' + report.dual.agreed + ' 一致' : '未用'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}、双模型 ${report.stats.dual}） · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
+  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 第二意见 ${report.dual && report.dual.ok ? report.dual.need + ' 待证/' + report.dual.agreed + ' 一致' : '未用'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}、双模型 ${report.stats.dual}） · 听音复核 ${report.relisten && report.relisten.ran ? (report.relisten.candidates + ' 句待听/' + report.relisten.applied + ' 处落地') : '未跑'} · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
   return { words: current, report }
 }

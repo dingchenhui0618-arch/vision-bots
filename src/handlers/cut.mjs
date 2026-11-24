@@ -51,6 +51,15 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   const wav = join(work, 'audio.wav')
   await extractAudio(input, wav)
 
+  // 能量包络算在这里，两个地方要用：接缝吸附找最安静的下刀点，听音复核判断词槽里
+  // 哪一段是静音（补回来的字必须放进静音里，不许挤掉已经说出声的音节）。
+  let envelope = null
+  try {
+    envelope = envelope16(wav)
+  } catch (err) {
+    log('能量包络没算出来（' + String(err.message).slice(0, 60) + '），接缝按名义值切')
+  }
+
   // 第一层治理：转写前把术语表当热词喂进去，让它一开始就别写错
   const terms = loadTerms(group.dir)
   const hot = hotwordPrompt(terms)
@@ -60,8 +69,18 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   //   · 纠错结果还跟「术语表内容 + 纠错层版本」有关。
   // 以前两件事共用一个键（键里是整份术语表），加一个术语就整条重听一遍素材——
   // 客户加一个行业词要等十几分钟，等于错字治理不敢动。现在分开算。
+  // 质检留下的「音频与字幕不一致」线索：剪辑返工时优先重听这几句（qc handler 写，出片后清空）
+  const hintPath = join(group.dir, 'revise-hints.json')
+  let hints = []
+  try {
+    const j = JSON.parse(readFileSync(hintPath, 'utf8'))
+    hints = (Array.isArray(j && j.hints) ? j.hints : []).filter(h => h && h.quote)
+    if (hints.length) log('质检线索 ' + hints.length + ' 条：' + hints.map(h => '「' + h.quote + '」').join('、') + '（会优先重听这几句）')
+  } catch { /* 没有线索文件是常态 */ }
+
   const forceFresh = /^(1|true|yes)$/i.test(String(process.env.VISION_BOTS_ASR_FRESH || ''))
-  const cached = forceFresh ? null : readCutCache({ dir: group.dir, input, terms, brief })
+  // 有线索时不复用纠错结果：键里没有线索，复用会把新线索吃掉
+  const cached = forceFresh || hints.length ? null : readCutCache({ dir: group.dir, input, terms, brief })
   let words, segments, fixReport, language
   let asrSeconds = 0
   let reused = false        // 原始转写 + 纠错都复用
@@ -101,7 +120,14 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
       log(`转写完成：${raw.length} 词 · ${asrSeconds.toFixed(1)}s`)
     }
     // 第二层治理：受约束纠错。只改词文本，时间码和词数由模块内部断言
-    const fix = await correct({ words: raw, terms, log, segments: rawSegments })
+    const fix = await correct({
+      words: raw, terms, log, segments: rawSegments,
+      media: input, envelope,
+      relistenDir: join(group.dir, 'cache', 'relisten'),
+      hints,
+    })
+    // 线索已消费：这次已经重听过，别再让它影响下一次
+    if (hints.length) { try { writeFileSync(hintPath, JSON.stringify({ hints: [], consumedAt: new Date().toISOString() }, null, 1), 'utf8') } catch { /* ignore */ } }
     words = fix.words
     fixReport = fix.report
     // 句子文本也要跟着纠错走，否则大字用的还是错的（字幕改了、片子里没改）
@@ -117,13 +143,6 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   // 剪辑的所有口径来自它自己的配置（config/bots/cutter.json），不是散在代码里的常量。
   // 只有用户明确说的东西（语速）才算覆盖。
   const cutParams = paramsOf('cutter')
-  let envelope = null
-  try {
-    envelope = envelope16(wav)
-  } catch (err) {
-    // 包络读不出来只影响接缝精度，不该让整条片子停下
-    log('能量包络没算出来（' + String(err.message).slice(0, 60) + '），接缝按名义值切')
-  }
   const plan = buildPlan(words, info.duration, {
     pauseThreshold: brief.pauseThreshold ?? cutParams.pauseThreshold,
     keepHead: cutParams.keepHead,

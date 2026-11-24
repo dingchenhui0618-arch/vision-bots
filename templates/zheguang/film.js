@@ -509,7 +509,20 @@ export async function createFilm({ media }) {
     const shot = shotAt(t)
     // 小窗版式的大字现在压在 0.74h 的胸口（以前在 0.50h），对勾卡跟着让到 0.50h：
     // 小窗只到 0.50h，卡正好落在窗口下面、大字上面那块空处。
-    const yBase = shot.kind === 'corner' ? h * 0.50 : shot.kind === 'frame' ? h * 0.86 : h * 0.775
+    let yBase = shot.kind === 'corner' ? h * 0.50 : shot.kind === 'frame' ? h * 0.86 : h * 0.775
+    // 满幅页的大字底边也在 0.775h、往上长，卡按原来的位置画就是字压字
+    // （自测14 质检抓到 7 帧「big × block:check」重叠 36226px²）。有大字就让到大字上面去：
+    // 参考片里图形块本来就在大字上方，卡在大字下面反而挤掉胸口那一片。
+    const bigNow = (S.bigs || []).find(b2 => t >= b2.f0 && t < b2.f1)
+    if (bigNow && shot.kind === 'full') {
+      const bl = bigNow.lines && bigNow.lines.length ? bigNow.lines : [bigNow.text]
+      const bTop = h * 0.775 - bl.length * fitBigSize(bl) * (BGL.lineGap || 1.06)
+      yBase = Math.max(h * 0.30, bTop - 22)
+    }
+    // 小窗页原来把卡放在 0.86h，正好压在字幕 pill 上（自测14 抓到 7 帧「sub × block:check」）。
+    // 卡底不许越过字幕顶——这条对三种版式都成立。
+    const subPh = Math.round(TY.sub * 1.28 + SUBL.padY * 2)
+    yBase = Math.min(yBase, h - SUBL.bottom - subPh - 12)
     const x = M, y = Math.round(yBase) - chh
     c.save()
     c.globalAlpha *= Math.min(1, k)

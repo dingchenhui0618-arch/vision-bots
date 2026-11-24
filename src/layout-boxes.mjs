@@ -81,10 +81,33 @@ export function layoutBoxes({ scene, template }) {
       return { x: 0, y: 0, w, h }
     }
 
+    // 满幅页上大字就压在同一段（0.775h 往上长），对勾卡再画在 0.775h 就是字压字。
+    // 和 film.js 的 checkCard 同一口径：有大字时卡让到大字上面（行盒顶 - 22px）。
+    const bigLineTopAt = (t) => {
+      const b = (scene.bigs || []).find(x => t >= x.f0 && t < x.f1)
+      if (!b) return null
+      const linesN = Math.max(1, (b.lines && b.lines.length) || 1)
+      const longest = Math.max(1, ...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))
+      const capSize = linesN >= 3 ? Math.min(TY.big || 96, 104) : (TY.big || 96)
+      const size = Math.max(TY.bigMin || 62, Math.min(capSize, Math.floor(((w - ((L.big && L.big.left) || 62) - ((L.big && L.big.right) || 150)) * 0.98) / longest)))
+      const lh = size * ((L.big && L.big.lineGap) || 1.06)
+      return h * 0.775 - linesN * lh
+    }
+
     // 图形块：按种类算真实范围（不是「整块保守区」）
     for (const b of scene.blocks || []) {
       const sk = shotAt(b.f0).kind
-      if (b.kind === 'check') items.push({ tag: 'block:check', x: 56, y: Math.round(sk === 'corner' ? h * 0.50 : sk === 'frame' ? h * 0.86 : h * 0.775) - 84, w: Math.min(w - 112, 620), h: 84, t0: b.f0, t1: b.f1, shot: sk })
+      if (b.kind === 'check') {
+        let yb = sk === 'corner' ? h * 0.50 : sk === 'frame' ? h * 0.86 : h * 0.775
+        if (sk === 'full') {
+          const top = bigLineTopAt(b.f0)
+          if (top !== null) yb = Math.max(h * 0.30, top - 22)
+        }
+        // 卡底不许越过字幕顶（和 film.js 的 checkCard 同一口径）
+        const subPh = Math.round((TY.sub || 42) * 1.28 + SUB2.padY * 2)
+        yb = Math.min(yb, h - SUB2.bottom - subPh - 12)
+        items.push({ tag: 'block:check', x: 56, y: Math.round(yb) - 84, w: Math.min(w - 112, 620), h: 84, t0: b.f0, t1: b.f1, shot: sk })
+      }
       else if (b.kind === 'banner') {
         // 红条是两条斜杠压出来的「划掉」：位置按 film.js 的 banner() 记两个真盒子（以前记成一个 0.42h 的整条，
         // 量出来的高度和画出来的不是一回事）。它按设计是满幅出血，所以带 bleed 标记，安全区只放宽横向。
