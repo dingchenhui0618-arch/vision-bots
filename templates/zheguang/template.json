@@ -29,10 +29,10 @@
     "eyebrow": 21,
     "chapterNum": 84,
     "chapterTitle": 54,
-    "big": 96,
-    "bigMin": 62,
-    "sub": 42,
-    "subSmall": 34,
+    "big": 168,
+    "bigMin": 64,
+    "sub": 46,
+    "subSmall": 38,
     "block": 26,
     "blockSmall": 20
   },
@@ -66,15 +66,15 @@
         "radius": 14
       },
       "frame": {
-        "w": 0.46,
+        "w": 0.56,
         "y": 0.1
       },
       "corner": {
-        "w": 0.4,
+        "w": 0.52,
         "top": 0.1
       },
       "outro": {
-        "w": 0.46
+        "w": 0.5
       },
       "progress": {
         "y": 1852,

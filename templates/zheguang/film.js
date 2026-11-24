@@ -25,7 +25,10 @@ export async function createFilm({ media }) {
   let TPL = null
   try { TPL = await loadJSON('/project/template.json') } catch (e) { TPL = null }
   const L = (TPL && TPL.layouts && (TPL.layouts[S.ratio] || TPL.layouts[TPL.ratio])) || {}
-  const TY = (S.type && S.type.size) ? S.type : { big: 96, bigMin: 62, sub: 42, subSmall: 34, eyebrow: 21, chapterNum: 84, chapterTitle: 54, block: 26, blockSmall: 20, page: 22, brand: 21 }
+  // 字号以 template.json 的 type 为准，scene 可覆盖。以前这里判断 S.type.size，而 type 是扁平结构，
+  // 于是永远走默认值——模板改字号实际不生效（自测08 之后发现）。
+  const TY = Object.assign({ big: 96, bigMin: 62, sub: 42, subSmall: 34, eyebrow: 21, chapterNum: 84, chapterTitle: 54, block: 26, blockSmall: 20, page: 22, brand: 21 },
+    (TPL && TPL.type) || {}, S.type || {})
   const P = Object.assign({ void: '#0B0B0C', paper: '#F4F2EC', lime: '#D8FF3E', green: '#35E07A', yellow: '#F5E13C', red: '#E23A2C', ash: '#8C8B85' }, S.palette || {})
   const M = L.margin || 56
   const HUD_Y = (L.hud && L.hud.y) || 92
@@ -57,7 +60,7 @@ export async function createFilm({ media }) {
       return { x: Math.round((w - dw) / 2), y: dy, w: dw, h: dh, round: 0 }
     }
     if (shot.kind === 'corner') {
-      const dw = Math.round(ww * ((L.corner && L.corner.w) || 0.40))
+      const dw = Math.round(ww * ((L.corner && L.corner.w) || 0.46))
       const dh = Math.round(dw * h / w)
       return { x: w - dw - M, y: Math.round(h * ((L.corner && L.corner.top) || 0.12)), w: dw, h: dh, round: 12 }
     }
@@ -69,13 +72,38 @@ export async function createFilm({ media }) {
     return { x: 0, y: 0, w, h, round: 0 }
   }
 
+  // 小窗/竖框页的背景：以前是纯黑，人物一缩小，环境就整块消失——参考片里环境始终在。
+  // 这里把同一帧整幅铺满、压暗，再降采样回放当廉价模糊（1080×1920 上真做 blur 会拖垮渲染）。
+  let bgCv = null
+  let bgTex = null
+  function bgPlate(c, img) {
+    // 小窗/竖框页的底：不是「压暗的实拍」，是一块设计好的深色底——近黑 + 细点阵 + 一层很弱的中心光。
+    // 自测09 第一版把实拍压暗当底，同一张脸在窗口后面放大出现，读起来就是双重曝光；
+    // 参考片的窗口页是干净深色底（实测均值 65，我们原来纯黑 19），质感来自点阵和光，不来自素材。
+    c.fillStyle = R(P.void, 1)
+    c.fillRect(0, 0, w, h)
+    const glow = c.createRadialGradient(w * 0.5, h * 0.35, 0, w * 0.5, h * 0.35, h * 0.75)
+    glow.addColorStop(0, R(P.paper, 0.10)); glow.addColorStop(0.55, R(P.paper, 0.03)); glow.addColorStop(1, R(P.paper, 0))
+    c.fillStyle = glow
+    c.fillRect(0, 0, w, h)
+    // 细点阵：参考片的小窗/字卡页不是纯黑，是一层极淡的点阵，空的地方才有质感
+    if (!bgTex) {
+      bgTex = document.createElement('canvas')
+      bgTex.width = w; bgTex.height = h
+      const t2 = bgTex.getContext('2d')
+      t2.fillStyle = R(P.paper, 0.085)
+      const step = 26
+      for (let y = step; y < h; y += step) for (let x = step; x < w; x += step) {
+        t2.beginPath(); t2.arc(x, y, 1.2, 0, TAU); t2.fill()
+      }
+    }
+    c.drawImage(bgTex, 0, 0, w, h)
+  }
+
   function drawPerson(c, img, shot) {
     const r = personRect(shot)
-    if (shot.kind !== 'full') {
-      c.fillStyle = R(P.void, 1)
-      c.fillRect(0, 0, w, h)
-    }
-    if (!img) return
+    if (!img) { c.fillStyle = R(P.void, 1); c.fillRect(0, 0, w, h); return }
+    if (shot.kind !== 'full') bgPlate(c, img)
     c.save()
     c.filter = 'contrast(1.05) saturate(0.94) brightness(0.98)'
     if (r.round) { rrect(c, r.x, r.y, r.w, r.h, r.round); c.clip() }
@@ -84,7 +112,8 @@ export async function createFilm({ media }) {
     if (r.round || shot.kind !== 'full') {
       c.save()
       rrect(c, r.x, r.y, r.w, r.h, r.round || 0)
-      c.strokeStyle = R(P.paper, 0.14); c.lineWidth = 2; c.stroke()
+      // 参考片的窗口是一道荧光绿细框，不是白描边：它把小窗从背景里拎出来
+      c.strokeStyle = R(P.lime, 0.78); c.lineWidth = 2.5; c.stroke()
       c.restore()
     }
   }
@@ -92,17 +121,26 @@ export async function createFilm({ media }) {
   // ───────── 压光：字要压得住，人不能被压死 ─────────
   function scrim(c, shot, t) {
     if (shot.kind === 'card') return
+    if (shot.kind !== 'full') {
+      // 小窗/竖框页的底本来就是压暗的实拍，再叠顶/底压光只会越压越黑
+      // （自测08 里三成画面近黑，一半原因在这儿）。只保一条给字幕用的底光。
+      const wash = c.createLinearGradient(0, h * 0.62, 0, h)
+      wash.addColorStop(0, R(P.void, 0)); wash.addColorStop(1, R(P.void, 0.42))
+      c.fillStyle = wash; c.fillRect(0, h * 0.62, w, h * 0.38)
+      return
+    }
     const top = c.createLinearGradient(0, 0, 0, h * 0.22)
     top.addColorStop(0, R(P.void, 0.55)); top.addColorStop(1, R(P.void, 0))
     c.fillStyle = top; c.fillRect(0, 0, w, h * 0.22)
     const bot = c.createLinearGradient(0, h * 0.52, 0, h)
     bot.addColorStop(0, R(P.void, 0)); bot.addColorStop(0.55, R(P.void, 0.38)); bot.addColorStop(1, R(P.void, 0.72))
     c.fillStyle = bot; c.fillRect(0, h * 0.52, w, h * 0.48)
-    if (shot.kind === 'corner' || shot.kind === 'outro') {
-      const side = c.createLinearGradient(0, 0, w * 0.7, 0)
-      side.addColorStop(0, R(P.void, 0.9)); side.addColorStop(1, R(P.void, 0.2))
-      c.fillStyle = side; c.fillRect(0, 0, w, h)
-    }
+  }
+
+  /** 参考片的四角括角：给实拍套一层取景框，画面立刻不像直出素材。只压在满幅页上。 */
+  function frameMarks(c, shot) {
+    if (shot.kind !== 'full') return
+    cornerTicks(c, M, Math.round(h * 0.085), w - M * 2, Math.round(h * 0.50), 22, R(P.paper, 0.22), 2)
   }
 
   // ───────── HUD：页码 / 品牌胶囊 / 进度线 ─────────
@@ -182,18 +220,18 @@ export async function createFilm({ media }) {
     const longest = Math.max(1, ...lines.map(l => textEm(l)))
     // 三行大字要缩一档：整块高度 = 行数 × 字号 × 行距，三行按 96 排会顶穿到
     // 头部区（实测 top=1058px，禁区线 1075px）。宁可小一号，也不让字爬到脸上。
-    const cap = lines.length >= 3 ? Math.min(TY.big, 90) : TY.big
-    return Math.max(TY.bigMin, Math.min(cap, Math.floor(avail / longest)))
+    const cap = lines.length >= 3 ? Math.min(TY.big, 104) : TY.big
+    return Math.max(TY.bigMin, Math.min(cap, Math.floor((avail * 0.98) / longest)))
   }
 
   /** 大字的底边（不是顶边）：满幅压在胸口，竖框在小窗下面，小窗在左侧中下部。
    *  参考片的大字基本落在 0.5–0.72 这一段，字幕在 0.84——两者永远不重叠。 */
   function bigBottom(shot) {
     if (shot.kind === 'frame') return h * 0.80
-    // 小窗只占上方右侧（0.10–0.50h），大字压到窗口下面的胸口，和满幅同一个位置。
-    // 以前放在 0.50h：既贴着小窗底边，又因为要避开窗口被压窄到 0.4w，字号掉到 62、左边一片死黑。
-    if (shot.kind === 'corner') return h * 0.74
-    return h * 0.71
+    // 参考片的大字压在 0.70–0.80h 的胸口位置，一行一条、字很大；我们以前在 0.71h 且最多三行，
+    // 3 行块顶到 0.48h 就爬上了脸。行数已经由数据层合并到 1 行，底边顺势下移。
+    if (shot.kind === 'corner') return h * 0.775
+    return h * 0.775
   }
 
   function drawBig(c, b, t, shot) {
@@ -255,7 +293,7 @@ export async function createFilm({ media }) {
         c.restore()
       }
       c.save()
-      if (shadow && !lime && !red) { c.shadowColor = R(P.void, 0.75); c.shadowBlur = 26; c.shadowOffsetY = 5 }
+      if (shadow && !lime && !red) { c.shadowColor = R(P.void, 0.88); c.shadowBlur = 38; c.shadowOffsetY = 9 }
       c.fillStyle = lime || red ? R(P.void, 1) : accent ? R(P.yellow, 1) : R(P.paper, 1)
       c.textAlign = 'left'
       c.fillText(p.text, cx, y)
@@ -521,6 +559,7 @@ export async function createFilm({ media }) {
       else {
         drawPerson(c, img, shot)
         scrim(c, shot, t)
+        frameMarks(c, shot)
       }
       const onCard = shot.kind === 'card'
       const onOutro = shot.kind === 'outro'

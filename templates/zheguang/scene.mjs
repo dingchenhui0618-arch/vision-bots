@@ -240,6 +240,20 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     while (out.length > (bigL.maxLines || 3) && per < 16) { per += 1; out = wrapWords(text, per) }
     return out
   }
+  // 折行只是「一屏放不下」的妥协，不是句读：能并回一行就并回去。
+  // 自测08 的抽帧里「机会在 / OPC / 内容」被排成三行堆叠——明明一行就放得下，
+  // 结果大字看起来像字幕、还爬到人物下巴上。并行的上限是：并完仍能以 bigMin 排满整幅宽。
+  const emWidth = (str) => [...String(str)].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)
+  const mergeLines = (lines) => {
+    const avail = ((L.size && L.size[0]) || 1080) - (bigL.left || 62) - (bigL.right || 150)
+    const out = []
+    for (const ln of lines) {
+      const last = out.length - 1
+      if (last >= 0 && emWidth(out[last] + ln) <= avail / Math.max(1, t.type && t.type.bigMin || 64)) { out[last] += ln; continue }
+      out.push(ln)
+    }
+    return out
+  }
   const bigs = []
   beats.forEach((s, i) => {
     const next = beats[i + 1]
@@ -263,7 +277,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
       index: bigs.length + 1, beat: i, text,
       hot: hot || '', style,
       words: segment(text),
-      lines: bigLines(text),
+      lines: mergeLines(bigLines(text)),
       f0, f1,
       page: page ? page.index : 1,
       pageTitle: page ? page.title : '',
@@ -310,6 +324,10 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
       if (full) blocks.push({ kind: 'banner', f0: Math.max(banBeat.f0, full.f0 + 0.2), f1: Math.min(banBeat.f1 + 1.2, full.f1 - 0.1, duration - 0.4), text: banBeat.text, at: 'center' })
     }
   }
+  // 品牌胶囊不能空：参考片的右上角一直是「● 项目名 + 时间码」，空着只剩时间码就不成胶囊。
+  // 但品牌名 ≠ 出镜人的名字——把它填进名牌卡等于替人署名，所以这两个字段分开：
+  // brand 只进 HUD，avatar 只在真的知道出镜人名字时才画。
+  const brand = brief.brand || 'Vision Bots'
   const author = brief.author || brief.account || ''
   if (author) blocks.push({ kind: 'avatar', f0: Math.max(duration - 5.4, 0), f1: Math.max(duration - 2.8, 0.5), name: author, role: '', at: 'left' })
 
@@ -361,7 +379,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
       duration: round(duration),
       tracks: [{ name: 'KEEP', color: t.palette.green, clips: ranges.map(r => [round(r.outF0 / fps / duration, 4), round(r.outF1 / fps / duration, 4)]) }],
     },
-    labels: { platform: brief.platform || '', template: t.name, brand: author },
+    labels: { platform: brief.platform || '', template: t.name, brand },
     planSummary: {
       shots: shots.map(s => ({ at: round(s.f0), kind: s.kind, label: SHOT_LABEL[s.kind] || s.kind, why: s.why })),
       blocks: blocks.map(b => ({ at: round(b.f0), kind: b.kind })),

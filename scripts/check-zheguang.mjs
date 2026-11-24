@@ -72,6 +72,22 @@ ok('大字之间不重叠（同一时刻只有一条）', !bigOverlap, String(bi
 // 大字区间 = 字幕卡区间，版式切点也可能落在卡中间：只要求「每条大字至少落在一个版式里」
 ok('每条大字都有版式归', scene.bigs.every(b => scene.shots.some(s => overlap(b, s))))
 
+// 折行只是「一屏放不下」的妥协，不是句读：相邻两行如果能并回一行（按 bigMin 还排得下整幅宽），
+// 就该并回去。自测08 抽帧里「机会在 / OPC / 内容」三行堆叠，明明一行放得下——那看起来像字幕，不像大字。
+const emOf = (s) => [...String(s)].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)
+const LZ = tpl.layouts['9:16']
+const availW = LZ.size[0] - (LZ.big.left || 62) - (LZ.big.right || 150)
+const bigMin = (tpl.type && tpl.type.bigMin) || 64
+const mergeable = []
+for (const b of scene.bigs) {
+  for (let i = 1; i < b.lines.length; i++) {
+    if (emOf(b.lines[i - 1] + b.lines[i]) * bigMin <= availW) mergeable.push(b.index + '「' + b.lines[i - 1] + '+' + b.lines[i] + '」')
+  }
+}
+ok('大字能一行就一行（不许把放得下的行拆开堆叠）', mergeable.length === 0, mergeable.join('、'))
+ok('品牌胶囊不为空（右上角要有项目名，不只是时间码）', !!String(scene.labels.brand || '').trim(), String(scene.labels.brand))
+ok('出镜人名字不会被品牌名顶替', !scene.blocks.some(b => b.kind === 'avatar' && b.name === scene.labels.brand), scene.blocks.filter(b => b.kind === 'avatar').map(b => b.name).join('、'))
+
 // 4) 图形块：只能出现在支持的版式里、文字接地
 const kindsOk = { tagwall: ['frame', 'corner'], check: ['full', 'corner', 'frame'], banner: ['full'], gauge: ['full', 'corner', 'frame'], avatar: ['full', 'corner', 'frame', 'outro'] }
 let badBlock = null

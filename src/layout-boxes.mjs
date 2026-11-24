@@ -37,10 +37,10 @@ export function layoutBoxes({ scene, template }) {
       const lines = Math.max(1, (b.lines && b.lines.length) || 1)
       const longest = Math.max(1, ...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))
       // 三行缩一档，和 film.js 的 fitBigSize 同一口径（不然盒子说 96、画面画 90，量出来的高度是假的）
-      const capSize = lines >= 3 ? Math.min(TY.big || 96, 90) : (TY.big || 96)
-      const size = Math.max(TY.bigMin || 62, Math.min(capSize, Math.floor((w - L.big.left - L.big.right) / longest)))
+      const capSize = lines >= 3 ? Math.min(TY.big || 96, 104) : (TY.big || 96)
+      const size = Math.max(TY.bigMin || 62, Math.min(capSize, Math.floor(((w - L.big.left - L.big.right) * 0.98) / longest)))
       const bh = lines * size * ((L.big && L.big.lineGap) || 1.06)
-      const bottom = shot.kind === 'frame' ? h * 0.80 : shot.kind === 'corner' ? h * 0.74 : h * 0.71
+      const bottom = shot.kind === 'frame' ? h * 0.80 : h * 0.775
       const x = (L.big && L.big.left) || 62
       // 小窗版式的大字以前被压窄到 0.55w（怕撞小窗），结果字号掉到 62、左边一片死黑；
       // 小窗只占上方右侧（0.10–0.50h），大字压在 0.56h 以下的胸口，两者从不重叠，用满宽。
@@ -77,7 +77,7 @@ export function layoutBoxes({ scene, template }) {
       if (!p.title) continue
       items.push({ tag: 'chapter', x: M2, y: Math.round(CH2.y - 90), w: w - M2 * 2, h: 170, t0: p.start, t1: Math.min(p.end, p.start + 2.0) })
     }
-    return { ok: true, items, layout: { mode: 'zheguang', bigBottom: Math.round(h * 0.71), subTop: Math.round(h - SUB2.bottom - 90), shots: shots.length } }
+    return { ok: true, items, layout: { mode: 'zheguang', bigBottom: Math.round(h * 0.775), subTop: Math.round(h - SUB2.bottom - 90), shots: shots.length } }
   }
 
   // 轨道：和 film.js 同一套让位规则（有头部实测才让，没有就用模板值）
