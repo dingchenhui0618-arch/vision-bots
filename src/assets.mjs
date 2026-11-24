@@ -80,7 +80,12 @@ export function validateTerms(j) {
       if (to.length > MAX_WORD) errors.push({ at, why: 'to 超过 ' + MAX_WORD + ' 字' })
     }
     const from = Array.isArray(t.from) ? t.from : []
-    if (!from.length) errors.push({ at, why: '缺少 from（ASR 常写错的形态）' })
+    if (!from.length) {
+      // from 空着 = 证据词条：只把 to 登记成「校验器认得的词」，顺带算进转写热词，
+      // 不做确定性替换。用来登记本领域专有名词（GPT / Claude）——写成 from 的话，
+      // 用户真的说 GDP 也会被无条件改成 GPT。
+      if (t.kind && t.kind !== 'term') warnings.push('「' + to + '」的 from 是空的，只当证据和热词、不做替换；这种条目只对专有名词（kind: term）有意义')
+    }
     from.forEach((f, k) => {
       const a = at + '.from[' + k + ']'
       if (typeof f !== 'string' || !f.trim()) return errors.push({ at: a, why: '空形态' })

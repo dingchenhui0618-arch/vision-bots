@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "note": "错字治理的术语表。hotwords 转写前注入 initial_prompt；terms 做确定性替换（from 是 ASR 常写错的形态，to 是正确形态）。只允许四类：homophone 同音字 / term 专有名词 / number 数字 / punct 标点。带 next 的条目只在「下一个词以此开头」时生效，用来修被拆成两个词的错（如「化」+「走」）。",
+  "note": "错字治理的术语表。hotwords 转写前注入 initial_prompt；terms 做确定性替换（from 是 ASR 常写错的形态，to 是正确形态）。from 空着的条目只是「证据 + 热词」，不做替换（用来登记本领域专有名词）；只允许四类：homophone 同音字 / term 专有名词 / number 数字 / punct 标点。带 next 的条目只在「下一个词以此开头」时生效，用来修被拆成两个词的错（如「化」+「走」）。",
   "hotwords": [
     "口播", "完播率", "转场", "光轨", "拆条", "封面", "钩子", "留存", "卡点", "分镜", "气口",
     "跳切", "成片", "素材", "字幕", "封面图", "完播", "二创", "爆款", "脚本", "划走"
@@ -18,6 +18,13 @@
     { "kind": "term", "to": "光轨", "from": ["光鬼", "光归"] },
     { "kind": "term", "to": "抖音", "from": ["斗音", "抖阴"] },
     { "kind": "term", "to": "视频号", "from": ["视频好", "是频号"] },
-    { "kind": "term", "to": "小红书", "from": ["小虹书", "小红熟"] }
+    { "kind": "term", "to": "小红书", "from": ["小虹书", "小红熟"] },
+    { "kind": "term", "to": "GPT", "from": [] },
+    { "kind": "term", "to": "Claude", "from": [] },
+    { "kind": "term", "to": "Codex", "from": [] },
+    { "kind": "term", "to": "OpenAI", "from": [] },
+    { "kind": "term", "to": "DeepSeek", "from": [] },
+    { "kind": "term", "to": "剪映", "from": [] },
+    { "kind": "term", "to": "CapCut", "from": [] }
   ]
 }

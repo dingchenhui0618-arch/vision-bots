@@ -2,7 +2,7 @@
  * 错字治理的自检：术语表、模型提案的校验器、句子回流、硬断言。
  * 模型提案用固定样本喂进来，不联网；拼音校验在本机有 uv 时额外验一遍。
  */
-import { applyTerms, applyToSegments, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, loadTerms } from '../src/asr-fix.mjs'
+import { applyTerms, applyToSegments, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, loadTerms, LEN_NUDGE } from '../src/asr-fix.mjs'
 
 let pass = 0
 const fails = []
@@ -152,15 +152,19 @@ const sw = [W('指', 0, 0.33), W('纹', 0.4, 0.55), W('住', 0.8, 0.31), W('在'
 const sv = sentenceView(sw, [{ start: 0, end: 3.0, text: '指纹住在做内容为什么' }])
 const S = (items, opts) => validateSpans(items, sw, sv, opts)
 const p1 = await S([{ s: 1, from: '指纹住在', to: '真正在做', why: '听成了指纹' }])
-ok('整句 · 整段等字数替换放行', p1.accepted.length === 1 && p1.accepted[0].kind === 'span' && p1.accepted[0].n === 4, JSON.stringify(p1.rejected[0] || {}))
-ok('整句 · 换完字数没变（字幕卡不会撑破）', p1.accepted.length === 1 && p1.accepted[0].parts.join('').length === 4, JSON.stringify(p1.accepted[0] && p1.accepted[0].parts))
+ok('整句 · 只有低置信推断的整段改法不再自动落地，标记成候选', p1.accepted.length === 0 && p1.rejected[0].need === true && p1.rejected[0].weak === true, JSON.stringify(p1.rejected[0] || {}))
+const p1b = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在做' }], sw, sv, { duals: new Set(['1|指纹住在|真正在做']), dualModel: 'smart' })
+ok('整句 · 等字数替换 + 两个模型一致才放行', p1b.accepted.length === 1 && p1b.accepted[0].kind === 'span' && p1b.accepted[0].n === 4, JSON.stringify(p1b.rejected[0] || {}))
+ok('整句 · 换完字数没变（字幕卡不会撑破）', p1b.accepted.length === 1 && p1b.accepted[0].parts.join('').length === 4, JSON.stringify(p1b.accepted[0] && p1b.accepted[0].parts))
 // 「内容」是一个词：只取里面的「容」就切在词中间（这种改法会把半个词改掉）
 const p2 = await S([{ s: 1, from: '容', to: '差' }])
 ok('整句 · 首尾切在词中间就拦', p2.accepted.length === 0 && /词中间/.test(p2.rejected[0].why), JSON.stringify(p2.rejected[0]))
 const p3 = await S([{ s: 1, from: '没有这段', to: '同样字数吧' }])
 ok('整句 · from 不在句子里就拦', p3.accepted.length === 0 && /逐字出现/.test(p3.rejected[0].why), JSON.stringify(p3.rejected[0]))
-const p4 = await S([{ s: 1, from: '指纹住在', to: '真正在' }])
-ok('整句 · 字数不一致就拦', p4.accepted.length === 0 && /字数变了/.test(p4.rejected[0].why), JSON.stringify(p4.rejected[0]))
+const p4 = await S([{ s: 1, from: '指纹住在', to: '真正在做呢' }])
+ok('整句 · 加字一律拦（撑破字幕卡）', p4.accepted.length === 0 && /字数变了/.test(p4.rejected[0].why), JSON.stringify(p4.rejected[0]))
+const p4b = await S([{ s: 1, from: '指纹住在', to: '真正在' }])
+ok('整句 · 删字不当场拦，但要等第二意见', p4b.accepted.length === 0 && /删字必须有第二个模型/.test(p4b.rejected[0].why), JSON.stringify(p4b.rejected[0]))
 const sureSpan = sw.map((w, i) => i === 1 ? { ...w, p: 0.93 } : w)
 const sv2 = sentenceView(sureSpan, [{ start: 0, end: 3.0 }])
 const p5 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在做' }], sureSpan, sv2, {})
@@ -175,8 +179,71 @@ const manySpans = [
   { s: 1, from: '指纹住在', to: '真正在做' },
   { s: 1, from: '住在做', to: '在装配' },
 ]
-const p8 = await S(manySpans)
+const p8 = await validateSpans(manySpans, sw, sv, { duals: new Set(['1|指纹住在|真正在做', '1|住在做|在装配']) })
 ok('整句 · 同一段只认一条', p8.accepted.length === 1 && p8.rejected.some(r => /已经改过/.test(r.why)), p8.accepted.length + '/' + p8.rejected.length)
+
+
+// ── 13. 证据词条（from 空）：只让校验器认得这个词，不做替换 ──
+const evTerms = [{ kind: 'term', to: 'GPT', from: [] }, { kind: 'term', to: 'Claude', from: [] }]
+const evT = loadTerms()
+ok('证据词条 · 仓库表里有 from 空的专有名词', evT.some(t => t.to === 'GPT' && Array.isArray(t.from) && t.from.length === 0), JSON.stringify(evT.filter(t => !t.from.length).map(t => t.to)))
+const evG = applyTerms([W('用', 0), W('GDP', 0.4)], evTerms)
+ok('证据词条 · 不做确定性替换（用户真说 GDP 不许被改）', evG.words[1].w === 'GDP' && evG.hits.length === 0, JSON.stringify(evG.words.map(w => w.w)))
+
+// ── 14. 拉丁词：等字数放宽，但只放给「命中术语表」的专有名词 ──
+const lw = [W('大家', 0), W('用', 0.4), W('Cloud', 0.8, 0.97), W('做', 1.2), W('内容', 1.6)]
+const L1 = await validate([{ i: 2, to: 'Claude', kind: 'term' }], lw, { terms: evTerms, pinyin: null })
+ok('拉丁 · Cloud→Claude 字数 +1 放行（字母不占等量时间）', L1.accepted.length === 1 && L1.accepted[0].parts[0] === 'Claude' && /术语表/.test(L1.accepted[0].verified), JSON.stringify(L1.rejected[0] || L1.accepted[0]))
+const L2 = await validate([{ i: 2, to: 'Claude', kind: 'term' }], lw, { terms: [], pinyin: null })
+ok('拉丁 · 术语表里没有就不许改字数', L2.accepted.length === 0 && /术语表里没有/.test(L2.rejected[0].why), JSON.stringify(L2.rejected[0]))
+const L3 = await validate([{ i: 2, to: 'ClaudeCode', kind: 'term' }], lw, { terms: evTerms, pinyin: null })
+ok('拉丁 · 差 5 个字母还是要拦', L3.accepted.length === 0 && /字数变了/.test(L3.rejected[0].why), JSON.stringify(L3.rejected[0]))
+const L4 = await validate([{ i: 2, to: 'claude', kind: 'term' }], lw, { terms: evTerms, pinyin: null })
+ok('拉丁 · 大小写是 ASR 的写法，认词不认大小写', L4.accepted.length === 1 && L4.accepted[0].parts[0] === 'claude', JSON.stringify(L4.rejected[0] || L4.accepted[0]))
+const lowLatin = [W('用', 0), W('Cloud', 0.4), W('做', 0.8)]
+const LV = sentenceView(lowLatin, [{ start: 0, end: 2.0 }])
+const L5 = await validateSpans([{ s: 1, from: 'Cloud', to: 'Claude' }], lowLatin, LV, { duals: new Set(['1|Cloud|Claude']), dualModel: 'm' })
+ok('拉丁 · 连双模型一致也不许改拉丁词字数（要有术语证据）', L5.accepted.length === 0 && /拉丁词改字数/.test(L5.rejected[0].why), JSON.stringify(L5.rejected[0]))
+
+// ── 15. 双模型一致：语义型错的唯一证据档，要两条独立事实 + 单独配额 ──
+const dualKey = (s, f, t) => s + '|' + f + '|' + t
+const D1 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在做' }], sureSpan, sv2, { duals: new Set([dualKey(1, '指纹住在', '真正在做')]), dualModel: 'qwen3.8-max' })
+ok('双模型 · 两个模型逐字一致就放行', D1.accepted.length === 1 && /双模型一致（qwen3.8-max）/.test(D1.accepted[0].verified), JSON.stringify(D1.rejected[0] || D1.accepted[0]))
+const D2 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在做' }], sureSpan, sv2, { duals: new Set([dualKey(1, '指纹住在', '真正在')]) })
+ok('双模型 · 不在一致清单里照样打回，并标记 need（留给第二意见）', D2.accepted.length === 0 && D2.rejected[0].need === true, JSON.stringify(D2.rejected[0]))
+const dw = [W('甲', 0, 0.95), W('乙', 0.3, 0.95), W('丙', 0.6, 0.95), W('丁', 0.9, 0.95)]
+const dv = sentenceView(dw, [{ start: 0, end: 2.0 }])
+const threeDual = new Set([dualKey(1, '甲', '戊'), dualKey(1, '乙', '己'), dualKey(1, '丙', '庚')])
+const D3 = await validateSpans([{ s: 1, from: '甲', to: '戊' }, { s: 1, from: '乙', to: '己' }, { s: 1, from: '丙', to: '庚' }], dw, dv, { duals: threeDual, dualModel: 'm' })
+ok('双模型 · 全片最多 2 处', D3.accepted.length === 2 && D3.rejected.some(r => /双模型一致全片最多 2 处/.test(r.why)), D3.accepted.length + '/' + D3.rejected.length)
+const D4 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在做呢' }], sureSpan, sv2, { duals: new Set([dualKey(1, '指纹住在', '真正在做呢')]) })
+const nudge = LEN_NUDGE([{ from: '指纹住在', to: '真正在' }])
+ok('字数回问 · 提示里摆出具体字数（4 字 / 3 字）', /4 字/.test(nudge) && /3 字/.test(nudge) && /补不齐/.test(nudge), nudge.slice(0, 80))
+ok('双模型 · 加字谁来提都不认', D4.accepted.length === 0 && /字数变了/.test(D4.rejected[0].why), JSON.stringify(D4.rejected[0]))
+
+// ── 16. 删字：ASR 多吐一个字时，等字数规则会把对的改法挡在门外 ──
+// 真事件：口播是「真正在做内容」，whisper 吐成「指纹住在做内容」，模型两次正确地提「指纹住在→真正在」，
+// 都被「字数变了」挡回来，最后这句错字上了屏。删字必须放，但只认第二个模型逐字同意。
+const del = [W('指', 0, 0.5), W('纹', 0.4, 0.5), W('住', 0.8, 0.5), W('在', 1.2, 0.99), W('做', 1.6), W('内容', 2.0)]
+const dv2 = sentenceView(del, [{ start: 0, end: 3.0 }])
+const sp1 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在' }], del, dv2, { duals: new Set(['1|指纹住在|真正在']), dualModel: 'smart' })
+ok('删字 · 两个模型逐字同意就放行（4 字→3 字）', sp1.accepted.length === 1 && sp1.accepted[0].deleted === 1, JSON.stringify(sp1.rejected[0] || sp1.accepted[0]))
+ok('删字 · 最后一个词变空词，前面的字一位不错', sp1.accepted.length === 1 && JSON.stringify(sp1.accepted[0].parts) === JSON.stringify(['真', '正', '在', '']), JSON.stringify(sp1.accepted[0] && sp1.accepted[0].parts))
+ok('删字 · 词数与时间码不动', sp1.accepted.length === 1 && del.length === 6 && del[3].start === 1.2, String(del.length))
+const sp2 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在' }], del, dv2, {})
+ok('删字 · 没有第二意见就不许删', sp2.accepted.length === 0 && /删字必须有第二个模型/.test(sp2.rejected[0].why), JSON.stringify(sp2.rejected[0]))
+const sp3 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在做呢' }], del, dv2, { duals: new Set(['1|指纹住在|真正在做呢']), dualModel: 'smart' })
+ok('加字 · 依然一律拦下（撑破字幕卡）', sp3.accepted.length === 0 && /字数变了/.test(sp3.rejected[0].why), JSON.stringify(sp3.rejected[0]))
+const sp4 = await validateSpans([{ s: 1, from: '指', to: '真' }], del, dv2, {})
+ok('删字 · 词层那条路不放宽（只走整句通道）', sp4.accepted.length === 0 && sp4.rejected[0].need === true, JSON.stringify(sp4.rejected[0]))
+
+// 提案粒度不同、改的是同一个字：变更映射要能认出来（第二意见靠这个比，而不是比 from/to 字符串）
+const mw = [W('我', 0, 0.5), W('要', 0.3, 0.5), W('花', 0.6, 0.5), W('一', 0.9, 0.5), W('千', 1.2, 0.5), W('的', 1.5, 0.5), W('时间', 1.8, 0.5)]
+const mv = sentenceView(mw, [{ start: 0, end: 2.4 }])
+const M1 = await validateSpans([{ s: 1, from: '花一千的时间', to: '花一天的时间' }], mw, mv, {})
+ok('变更映射 · 只记真正改掉的字（千→天）', M1.rejected[0] && JSON.stringify(M1.rejected[0].map) === JSON.stringify([[4, '天']]), JSON.stringify(M1.rejected[0] && M1.rejected[0].map))
+const M2 = await validateSpans([{ s: 1, from: '一千', to: '一天' }], mw, mv, {})
+ok('变更映射 · 粒度更小的同一条改法映射相同', M2.rejected[0] && JSON.stringify(M2.rejected[0].map) === JSON.stringify([[4, '天']]), JSON.stringify(M2.rejected[0] && M2.rejected[0].map))
 
 const total = pass + fails.length
 if (fails.length) {
@@ -184,5 +251,5 @@ if (fails.length) {
   for (const f of fails) console.log('  · ' + f)
   process.exitCode = 1
 } else {
-  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2 / 跨词 6 / 近音 5 / 整句 8' + (py ? ' / 拼音 4' : '') + '）')
+  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2 / 跨词 6 / 近音 5 / 整句 8 / 证据词条 2 / 拉丁 5 / 双模型 4' + (py ? ' / 拼音 4' : '') + '）')
 }

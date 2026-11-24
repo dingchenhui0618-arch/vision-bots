@@ -64,6 +64,13 @@ const NEAR_P = 0.65
 // 约束不放松：字数不变、词数不变、时间码不动；全片最多 SPAN_CAP 处，逐条写进交付报告。
 const SPAN_CAP = 3
 const SPAN_P = 0.85
+// 第二意见（双模型一致）：语义型错没有音韵证据（指纹住在 → 真正在做 差得很远），
+// whisper 对它还很自信（实测 0.97），「一个模型说这句话读不通」不够当证据。
+// 两个不同的模型各自独立给出逐字相同的改法，才算第二条独立事实。全片最多 DUAL_CAP 处。
+const DUAL_CAP = 2
+// 删字（ASR 多吐字）全片最多 2 处，同样要有第二个模型逐字同意
+const DEL_CAP = 2
+const isAsciiWord = s => /^[A-Za-z0-9]+$/.test(String(s ?? ''))
 // 标点字符集（不带 g，避免 test() 的 lastIndex 状态）
 const PUNCT_CH = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/u
 const KINDS = ['homophone', 'term', 'number', 'near', 'span', 'punct']
@@ -78,7 +85,10 @@ export function loadTerms(groupDir = null) {
     if (!p || !existsSync(p)) continue
     try {
       const j = JSON.parse(readFileSync(p, 'utf8'))
-      for (const t of j.terms || []) if (t && t.to && Array.isArray(t.from) && t.from.length) out.push(t)
+      // from 允许是空数组：那种条目只当「证据 + 转写热词」，不做确定性替换。
+      // 用来登记本领域专有名词（GPT / Claude）：让它们成为校验器认得的词，
+      // 但不许无条件改写——用户真说 GDP 的时候，「GDP→GPT」这种替换会当场改坏片子。
+      for (const t of j.terms || []) if (t && t.to && Array.isArray(t.from)) out.push(t)
       out.hotwords = [...(out.hotwords || []), ...(j.hotwords || [])]
       sources.push(p)
     } catch { /* 术语表坏了不阻断出片 */ }
@@ -193,9 +203,15 @@ function splitAffixes(text) {
 
 /**
  * 把 n 个相邻词的文字按「原词字长」重新分配 to。
- * 总字数必须不变——字幕卡宽度、断行、时间码都靠这个不变式。
+ *
+ * 字数必须不变——字幕卡宽度、断行、时间码都靠这个不变式。两个例外，都是实测逼出来的：
+ *   · latinOk：纯字母数字的词（Cloud → Claude），多一个字母不占时间（词层要求术语证据）。
+ *   · allowDelete：**删字**。ASR 会多吐一个字（「指纹住在做内容」实际是「真正在做内容」，
+ *     多了个「在」），模型两次都正确地提议「指纹住在」→「真正在」，被等字数规则挡回来了。
+ *     删字不动时间码、不动词数，只让这一段最后一个词变成空词（它那 130ms 本来就不该有字），
+ *     字幕卡只会变窄，不会撑破。所以「减字」可以放，前提是第二个模型逐字同意这一处删法。
  */
-export function applySpan(words, i, n, to) {
+export function applySpan(words, i, n, to, { latinOk = false, allowDelete = false } = {}) {
   if (!Number.isInteger(n) || n < 1) return { error: '跨词数目不对' }
   if (i < 0 || i + n > words.length) return { error: '跨词区间越界' }
   const cores = []
@@ -210,7 +226,35 @@ export function applySpan(words, i, n, to) {
   if (PUNCT_CH.test(want)) return { error: '要改的内容里带了标点，标点由字幕层统一处理' }
   const chars = [...want]
   const total = cores.reduce((a, c) => a + [...c].length, 0)
-  if (chars.length !== total) return { error: `字数变了：原 ${total} 字，改成 ${chars.length} 字，会撑破字幕卡` }
+  if (chars.length !== total) {
+    // 等字数这条不变量的依据是「中文一个字 ≈ 0.1 秒、字幕卡按字数排宽」。
+    // 对纯字母数字的词它不成立：Cloud → Claude 多的那一个字母不占时间，卡也放得下。
+    // 所以只对「一个词、两边都是字母数字、差不超过 2」放宽，而且要不要采纳由调用方定
+    // （词层要求 kind: term 命中术语表，句层要求术语/同音证据）。
+    const latin = latinOk && n === 1 && isAsciiWord(cores[0]) && isAsciiWord(want) && Math.abs(want.length - cores[0].length) <= 2
+    if (!latin && allowDelete && chars.length > 0 && chars.length < total) {
+      // 删字：按原词字长从左往右装，装完的位置留空词，标点跟着前一个词走
+      const parts = []
+      let at = 0
+      for (let k = 0; k < n; k++) {
+        const len = [...cores[k]].length
+        const take = chars.slice(at, at + len).join('')
+        at += len
+        const lead = parts.length ? affixes[k].lead : affixes[k].lead
+        if (!take) {
+          // 这个词被删空了：把它的标点并到前一个词尾部（第一个词就并到自己的 lead）
+          if (parts.length) parts[parts.length - 1] += affixes[k].lead + affixes[k].trail
+          else parts.push(affixes[k].lead + affixes[k].trail)
+          continue
+        }
+        parts.push(lead + take + affixes[k].trail)
+      }
+      while (parts.length < n) parts.push('')
+      return { parts, cores, total, text: chars.join(''), deleted: total - chars.length }
+    }
+    if (!latin) return { error: `字数变了：原 ${total} 字，改成 ${chars.length} 字，会撑破字幕卡` }
+    return { parts: [affixes[0].lead + want + affixes[0].trail], cores, total, text: want, latin: true }
+  }
   const parts = []
   let at = 0
   for (let k = 0; k < n; k++) {
@@ -271,11 +315,11 @@ function locateInSentence(v, from) {
   return { a, b }
 }
 
-async function callSentenceReview(view) {
+async function callSentenceReview(view, { model = LLM.models.fast } = {}) {
   const lines = view.map((v, k) => `${k + 1}|${v.text}`).join('\n')
   const t0 = Date.now()
   try {
-    const r = await chat({ prompt: SENT_PROMPT(lines), maxTokens: 1200, model: LLM.models.fast, temperature: 0 })
+    const r = await chat({ prompt: SENT_PROMPT(lines), maxTokens: 1200, model, temperature: 0 })
     if (!r.ok) return { skipped: r.skipped, detail: r.detail || null }
     const m = r.content.match(/\[[\s\S]*\]/)
     const proposals = m ? JSON.parse(m[0]) : []
@@ -297,11 +341,13 @@ async function callSentenceReview(view) {
  *
  * 硬约束一条都不放松：等字数、词数不变、时间码不动、from 必须逐字出现且落在词边界上。
  */
-export async function validateSpans(proposals, words, view, { skip = new Set(), cap = SPAN_CAP, terms = [], pinyin, strongOnly = false } = {}) {
+export async function validateSpans(proposals, words, view, { skip = new Set(), cap = SPAN_CAP, terms = [], pinyin, strongOnly = false, duals = null, dualModel = '第二模型', dualCap = DUAL_CAP } = {}) {
   const accepted = []
   const rejected = []
   const seen = new Set(skip)
   const cand = []
+  let dualUsed = 0
+  let delUsed = 0
   for (const p of Array.isArray(proposals) ? proposals : []) {
     const k = Number(p && p.s)
     if (!Number.isInteger(k) || k < 1 || k > view.length) { rejected.push({ ...p, why: '句子序号越界' }); continue }
@@ -317,7 +363,7 @@ export async function validateSpans(proposals, words, view, { skip = new Set(), 
     let clash = false
     for (let j = 0; j < n; j++) if (seen.has(i + j)) clash = true
     if (clash) { rejected.push({ s: k, from, to, why: '这一段已经改过（术语表或第一遍）' }); continue }
-    const span = applySpan(words, i, n, to)
+    const span = applySpan(words, i, n, to, { latinOk: true, allowDelete: true })
     if (span.error) { rejected.push({ s: k, from, to, why: span.error }); continue }
     if (span.text === span.cores.join('')) { rejected.push({ s: k, from, to, why: '改完和原来一样' }); continue }
     // 证据只对「真正改掉的那几个字」提要求，不对整段提。
@@ -335,7 +381,15 @@ export async function validateSpans(proposals, words, view, { skip = new Set(), 
       if (w && typeof w.p === 'number' && w.p >= SPAN_P) sure.push(w)
     }
     const uniqSure = [...new Map(sure.map(w => [w.i, w])).values()]
-    cand.push({ s: k, from, to, i, n, span, v, a: loc.a, b: loc.b, sure: uniqSure, why: String((p && p.why) || '').slice(0, 40) })
+    // 两条提案粒度常常不同：一个说「一千的时间→一天的时间」，另一个说「一千→一天」，
+    // 逐字比 from/to 会判成不一致，可它们改的是同一个字。所以统一归到「词位 → 改后文本」再比。
+    const map = []
+    for (let q = 0; q < n; q++) {
+      const before = splitAffixes(words[i + q].w).core
+      const after = splitAffixes(span.parts[q]).core
+      if (after !== before) map.push([i + q, after])
+    }
+    cand.push({ s: k, from, to, i, n, span, v, a: loc.a, b: loc.b, sure: uniqSure, map, why: String((p && p.why) || '').slice(0, 40) })
     for (let j = 0; j < n; j++) seen.add(i + j)
   }
 
@@ -355,24 +409,50 @@ export async function validateSpans(proposals, words, view, { skip = new Set(), 
       const b = vals[idx * 2 + 1]
       if (a && b && a.py === b.py) verified = '整段同音：' + a.py + ' 逐字一致'
     }
-    if (!verified && terms.length && terms.some(t => t.to === x.to)) verified = '命中术语表：' + x.to
+    if (!verified && terms.length && terms.some(t => t.to === x.to || (isAsciiWord(t.to) && isAsciiWord(x.to) && String(t.to).toLowerCase() === x.to.toLowerCase()))) verified = '命中术语表：' + x.to
+    // 双模型一致：这是「语义型」唯一的证据档。它比低置信推断强、比同音弱，
+    // 所以既要两条独立事实，也要单独配额（全片最多 dualCap 处）。
+    const dk = x.s + '|' + x.from + '|' + x.to
+    const dual = Boolean(!verified && duals && duals.has(dk))
+    // 删字（少字）没有同音/术语这种硬证据可用，唯一的档就是「第二个模型逐字同意同一处删法」。
+    // 这条要排在「证据不够」之前，否则它会被当成普通的推断型改法打回，理由还写错。
+    if (x.span.deleted && !dual) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '删字必须有第二个模型逐字同意（这一处会少 ' + x.span.deleted + ' 个字）' }); continue }
+    if (dual) verified = '双模型一致（' + dualModel + '）：语义型，' + (x.span.deleted ? '删字' : '等字数替换')
     if (!verified && strongOnly) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '复核这一遍只认同音/术语证据，低置信推断不改' }); continue }
-    if (!verified && !x.sure.length) verified = '整段都是低置信词，等字数替换'
     if (!verified) {
+      // need:true 表示「几何都对、只差证据」——回问和第二意见只复核这一类，
+      // 字数变了、切在词中间、标点里混字的，谁来提都不认。
+      //
+      // 「这一段都是低置信词」曾经能单独定案。实测它两面都行：同一份素材上既靠它改对了
+      // 一天的时间，也把「指纹住在」改成了「之所以在」（下一遍模型自己又改回来）。
+      // 识别不确定是「可疑」，不是「证据」——所以这一档不再自动落地，只当候选，
+      // 要第二个模型逐字同意才动。
+      const weak = !x.sure.length
       rejected.push({
-        s: x.s, from: x.from, to: x.to,
-        why: '证据不够：不是同音、不是术语，被改掉的字所在的词识别得很确定（' +
-          x.sure.map(w => '「' + words[w.i].w + '」' + w.p.toFixed(2)).join('、') + '），不改',
+        s: x.s, from: x.from, to: x.to, need: true, ...(weak ? { weak: true } : {}), map: x.map,
+        why: weak
+          ? '这一段识别都不确定，但只有一个模型这么改——要第二个模型逐字同意才动'
+          : '证据不够：不是同音、不是术语，被改掉的字所在的词识别得很确定（' +
+            x.sure.map(w => '「' + words[w.i].w + '」' + w.p.toFixed(2)).join('、') + '），不改',
       })
       continue
     }
+    // 拉丁词改了字数就必须有术语/同音证据，不能靠「低置信推断」把 Cloud 改长成 Claude
+    if (x.span.latin && !/术语表|同音/.test(verified)) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '拉丁词改字数必须有术语或同音证据，推断不算' }); continue }
+    if (x.span.deleted) {
+      if (delUsed >= DEL_CAP) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '删字全片最多 ' + DEL_CAP + ' 处' }); continue }
+      delUsed++
+      verified += '（删 ' + x.span.deleted + ' 字）'
+    }
+    if (dual && dualUsed >= dualCap) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '双模型一致全片最多 ' + dualCap + ' 处' }); continue }
+    if (dual) dualUsed++
     if (accepted.length >= cap) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '整段纠错全片最多 ' + cap + ' 处' }); continue }
     accepted.push({
       i: x.i, n: x.n, at: +words[x.i].start.toFixed(2), from: x.from, to: x.to,
-      parts: x.span.parts, kind: 'span', why: x.why, verified,
+      parts: x.span.parts, kind: 'span', why: x.why, verified, ...(x.span.deleted ? { deleted: x.span.deleted } : {}),
     })
   }
-  return { accepted, rejected }
+  return { accepted, rejected, dualUsed }
 }
 
 function wordsForPrompt(words) {
@@ -423,6 +503,15 @@ ${nudge}
  * 但它只有报告权、没有回写通道，所以错字照样出厂。这一遍就是补上那条通道：
  * 用句子视图重读，允许整段等字数替换，校验不过照样打回。
  */
+/**
+ * 字数不对时的回问。模型最爱犯的错是「住在」→「在」这种合并同字：
+ * 指纹住在 / 真正在做 都是 4 字，它写成「真正在」只给 3 字，然后整条被字数不变式踢掉。
+ * 把具体数字摆给它看，比笼统说「字数要一样」有效；同时留退路，不许它为了凑字数乱填。
+ */
+export const LEN_NUDGE = bad => '注意：下面这些改法字数和原片段不一致，已经被退回（字幕卡按字数排宽，字数必须完全一样）：\n' +
+  bad.slice(0, 6).map(b => '- 原片段「' + b.from + '」是 ' + [...b.from].length + ' 字，你写成「' + b.to + '」是 ' + [...b.to].length + ' 字').join('\n') +
+  '\n请重新给等字数的改法；补不齐就换一个真正等字数的写法，实在没有就不要报这一处。'
+
 export const SENT_PROMPT = (lines, nudge = '') => `你是中文口播的校对。下面是转写并纠正过一轮的句子，每行「序号|句子」。把每句当人话读一遍，只挑读不通的。
 
 ${lines}
@@ -440,9 +529,15 @@ ${nudge}
 
 输出 JSON 数组。没有要改的输出 []。不要输出任何其他文字。`
 
-/** 纠错层版本：进了转写缓存的键。改了规则就该重新纠错，不许静默复用旧结果。 */
+/**
+ * 纠错层版本：进了转写缓存的键。改了规则就该重新纠错，不许静默复用旧结果。
+ *
+ * 这里以前只 hash 提示词和几个常量——实测踩过：改了校验逻辑（没动提示词），
+ * 缓存仍然命中，返工拿到的是旧规则的结果，而且一声不响。所以直接 hash 整个模块源码：
+ * 改注释也会失效，代价是重跑一遍纠错（十几秒），换来「改了就一定生效」。
+ */
 export const FIXER_VERSION = createHash('sha1')
-  .update([PROMPT('x'), SENT_PROMPT('x'), KINDS.join(','), String(SPAN_CAP), String(SPAN_P), String(NEAR_CAP), String(NEAR_P)].join('|'))
+  .update(readFileSync(fileURLToPath(import.meta.url), 'utf8'))
   .digest('hex').slice(0, 12)
 
 /**
@@ -489,7 +584,7 @@ export async function validate(proposals, words, { terms, pinyin }) {
     let touched = false
     for (let k = 0; k < n; k++) if (words[i + k] && words[i + k].fixed) touched = true
     if (touched) { rejected.push({ i, from: w.w, to, why: '这一段里有词已被术语表或整句纠错改过' }); continue }
-    const span = applySpan(words, i, n, to)
+    const span = applySpan(words, i, n, to, { latinOk: kind === 'term' })
     if (span.error) { rejected.push({ i, from: w.w, to, why: span.error }); continue }
     if (span.text === span.cores.join('')) { rejected.push({ i, from: w.w, to, why: '改完和原来一样' }); continue }
     if (kind === 'term' && n > 1) { rejected.push({ i, from: w.w, to, why: '专有名词改动不许跨词' }); continue }
@@ -505,7 +600,9 @@ export async function validate(proposals, words, { terms, pinyin }) {
       }
     }
     if (kind === 'term') {
-      const known = terms.some(t => t.to === strip(to))
+      const want = strip(to)
+      // 拉丁词的大小写是 ASR 自己的写法（cloud / Cloud / CLOUD），认词不认大小写
+      const known = terms.some(t => t.to === want || (isAsciiWord(t.to) && isAsciiWord(want) && String(t.to).toLowerCase() === want.toLowerCase()))
       if (!known) { rejected.push({ i, from: w.w, to, why: '术语表里没有这个词，专有名词改不了自证' }); continue }
     }
     pairs.push({ p, i, n, w, to, kind, span })
@@ -607,10 +704,13 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
   //
   // 顺序反过来会出事：逐词同音规则会把「直到」改成「只到」——每个字都对、整句更糟，
   // 它只看一个词，没有能力判断整句。整句视图先落地，被改过的词逐词层就不许再碰（validate 里 fixed 检查）。
+  let view = null
+  let passNeed = []
+  let passLen = []
   if (askModel && segments && segments.length) {
     const touched = new Set()
     for (const a of report.applied) for (let k = 0; k < (a.n || 1); k++) touched.add(a.i + k)
-    const view = sentenceView(current, segments)
+    view = sentenceView(current, segments)
     if (view.length) {
       const r2 = await callSentenceReview(view)
       if (r2.skipped) {
@@ -618,7 +718,9 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
         log('整句纠错：模型没接上（' + r2.skipped + '），只做了第一遍')
       } else {
         const v2 = await validateSpans(r2.proposals || [], current, view, { skip: touched, terms })
-        report.sentence = { ok: true, model: r2.model, ms: r2.ms, tokens: r2.tokens, proposals: (r2.proposals || []).length, sentences: view.length }
+        passNeed = v2.rejected.filter(x => x.need && x.from && x.to)
+        passLen = v2.rejected.filter(x => /^字数变了/.test(x.why) && x.from && x.to)
+        report.sentence = { ok: true, model: r2.model, ms: r2.ms, tokens: r2.tokens, proposals: (r2.proposals || []).length, sentences: view.length, trimmed: passLen.length }
         report.applied.push(...v2.accepted)
         report.rejected.push(...v2.rejected)
         const by2 = new Map()
@@ -628,6 +730,95 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
         }
         current = current.map((w, i) => by2.has(i) ? { ...w, w: by2.get(i), w0: w.w0 || w.w, fixed: true } : w)
         log('整句纠错：' + view.length + ' 句，' + (r2.proposals || []).length + ' 提案 / ' + v2.accepted.length + ' 采纳 / ' + v2.rejected.length + ' 打回')
+      }
+    }
+  }
+
+  // 语义型错的通道，两步：
+  //   ① 字数不对就带着具体数字回问一遍（「指纹住在」4 字、「真正在」3 字）；
+  //   ② 剩下的「几何都对、只差证据」交给**另一个**模型独立复读，逐字相同才采纳。
+  // 同一模型问两遍不构成第二条独立事实，所以 ② 必须换模型。这也是接 Opus 的插槽：只换这里。
+  if (askModel && view && passLen.length) {
+    const r1c = await callSentenceReview(view, { nudge: LEN_NUDGE(passLen) })
+    if (r1c.skipped) {
+      report.retry = { skipped: r1c.skipped, detail: r1c.detail || null }
+      log('字数回问：模型没接上（' + r1c.skipped + '）')
+    } else if ((r1c.proposals || []).length) {
+      const touched = new Set()
+      for (const a of report.applied) for (let k = 0; k < (a.n || 1); k++) touched.add(a.i + k)
+      const v1c = await validateSpans(r1c.proposals, current, view, { skip: touched, terms })
+      report.applied.push(...v1c.accepted)
+      report.rejected.push(...v1c.rejected)
+      report.retry = { ok: true, model: r1c.model, proposals: r1c.proposals.length, accepted: v1c.accepted.length, ms: r1c.ms }
+      passNeed = passNeed.concat(v1c.rejected.filter(x => x.need && x.from && x.to))
+      const by1c = new Map()
+      for (const a of v1c.accepted) {
+        const parts = a.parts || [a.to]
+        for (let k = 0; k < (a.n || 1); k++) by1c.set(a.i + k, parts[k])
+      }
+      current = current.map((w, i) => by1c.has(i) ? { ...w, w: by1c.get(i), w0: w.w0 || w.w, fixed: true } : w)
+      log('字数回问：' + r1c.proposals.length + ' 提案 / 采纳 ' + v1c.accepted.length + ' / 打回 ' + v1c.rejected.length)
+    } else {
+      report.retry = { ok: true, model: r1c.model, proposals: 0 }
+      log('字数回问：模型这次一条都没报')
+    }
+  }
+
+  if (askModel && view && passNeed.length) {
+    if (LLM.models.smart === LLM.models.fast) {
+      report.dual = { skipped: 'single-model', detail: 'fast 和 smart 是同一个模型，凑不出第二意见' }
+    } else {
+      const r1b = await callSentenceReview(view, { model: LLM.models.smart })
+      if (r1b.skipped) {
+        report.dual = { skipped: r1b.skipped, detail: r1b.detail || null }
+        log('第二意见：模型没接上（' + r1b.skipped + '），语义型错这轮不改')
+      } else {
+        const key = o => o.s + '|' + o.from + '|' + o.to
+        const mapKey = m => (m || []).map(([i, t]) => i + ':' + t).sort().join('|')
+        const seen = new Set()
+        for (const p of r1b.proposals || []) {
+          const v = view[Number(p && p.s) - 1]
+          if (!v || !p.from || !p.to) continue
+          const loc = locateInSentence(v, String(p.from))
+          if (loc.error) continue
+          const i = v.ws[loc.a].i
+          const n = loc.b - loc.a + 1
+          const sp = applySpan(current, i, n, String(p.to).trim(), { latinOk: true, allowDelete: true })
+          if (sp.error) continue
+          const m = []
+          for (let q = 0; q < n; q++) {
+            const before = splitAffixes(current[i + q].w).core
+            const after = splitAffixes(sp.parts[q]).core
+            if (after !== before) m.push([i + q, after])
+          }
+          const k = mapKey(m)
+          if (k) seen.add(k)
+        }
+        const duals = new Set(passNeed.filter(x => seen.has(mapKey(x.map))).map(key))
+        report.dual = {
+          ok: true, model: r1b.model, need: passNeed.length, agreed: duals.size, ms: r1b.ms, tokens: r1b.tokens, accepted: 0,
+          proposals: (r1b.proposals || []).map(p => ({ s: p.s, from: p.from, to: p.to })),
+          waiting: passNeed.map(x => ({ s: x.s, from: x.from, to: x.to })),
+        }
+        if (duals.size) {
+          const touched = new Set()
+          for (const a of report.applied) for (let k = 0; k < (a.n || 1); k++) touched.add(a.i + k)
+          const v1b = await validateSpans(
+            passNeed.map(x => ({ s: x.s, from: x.from, to: x.to, why: x.why })),
+            current, view, { skip: touched, terms, duals, dualModel: r1b.model })
+          report.applied.push(...v1b.accepted)
+          report.rejected.push(...v1b.rejected)
+          report.dual.accepted = v1b.accepted.length
+          const by1b = new Map()
+          for (const a of v1b.accepted) {
+            const parts = a.parts || [a.to]
+            for (let k = 0; k < (a.n || 1); k++) by1b.set(a.i + k, parts[k])
+          }
+          current = current.map((w, i) => by1b.has(i) ? { ...w, w: by1b.get(i), w0: w.w0 || w.w, fixed: true } : w)
+          log('第二意见（' + r1b.model + '）：' + passNeed.length + ' 条只差证据 / ' + duals.size + ' 条两个模型逐字一致 / 采纳 ' + v1b.accepted.length)
+        } else {
+          log('第二意见（' + r1b.model + '）：' + passNeed.length + ' 条只差证据，但两个模型没给出同一改法，一条都不采纳')
+        }
       }
     }
   }
@@ -677,7 +868,10 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
         log('回读：模型没接上（' + r3.skipped + '）')
       } else {
         const v3 = await validateSpans(r3.proposals || [], current, view3, { skip: termIdx, terms, strongOnly: true })
-        report.review = { ok: true, model: r3.model, ms: r3.ms, tokens: r3.tokens, proposals: (r3.proposals || []).length, sentences: view3.length }
+        report.review = {
+          ok: true, model: r3.model, ms: r3.ms, tokens: r3.tokens, proposals: (r3.proposals || []).length, sentences: view3.length,
+          raw: (r3.proposals || []).map(p => ({ s: p.s, from: p.from, to: p.to })),
+        }
         report.applied.push(...v3.accepted)
         report.rejected.push(...v3.rejected)
         const by3 = new Map()
@@ -711,11 +905,13 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     rejected: report.rejected.length,
     pending: report.pending.length,
     spans: report.applied.filter(a => (a.n || 1) > 1).length,
+    dual: report.applied.filter(a => /双模型一致/.test(String(a.verified || ''))).length,
+    deleted: report.applied.reduce((n, a) => n + (a.deleted || 0), 0),
     near: report.applied.filter(a => a.kind === 'near').length,
     span: report.applied.filter(a => a.kind === 'span').length,
     ms: Date.now() - t0,
   }
   const aiAccepted = report.applied.length - g.hits.length
-  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}） · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
+  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 第二意见 ${report.dual && report.dual.ok ? report.dual.need + ' 待证/' + report.dual.agreed + ' 一致' : '未用'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}、双模型 ${report.stats.dual}） · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
   return { words: current, report }
 }

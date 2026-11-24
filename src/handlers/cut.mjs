@@ -55,15 +55,18 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   const terms = loadTerms(group.dir)
   const hot = hotwordPrompt(terms)
 
-  // 转写很贵（这条素材 62s）。素材、术语表、识别模型都没变就复用上次结果：
-  // 「返工」「重跑」不该再从零听一遍素材。
-  const cached = readCutCache({ dir: group.dir, input, terms, brief })
+  // 转写很贵（70s 真素材要 12 分钟，本机还会 OOM）。两级缓存的键必须分开：
+  //   · 原始转写只跟「素材 + 识别模型 + 实际喂给 whisper 的热词串」有关；
+  //   · 纠错结果还跟「术语表内容 + 纠错层版本」有关。
+  // 以前两件事共用一个键（键里是整份术语表），加一个术语就整条重听一遍素材——
+  // 客户加一个行业词要等十几分钟，等于错字治理不敢动。现在分开算。
+  const forceFresh = /^(1|true|yes)$/i.test(String(process.env.VISION_BOTS_ASR_FRESH || ''))
+  const cached = forceFresh ? null : readCutCache({ dir: group.dir, input, terms, brief })
   let words, segments, fixReport, language
   let asrSeconds = 0
-  let reused = false
-  // 两级缓存：原始转写只跟素材/术语表/识别模型有关，纠错结果还跟纠错层版本有关。
-  // 以前缓存键里没有纠错层版本——改了纠错规则，返工照样拿回旧的错字结果（静默失效）。
-  // 现在改规则只重跑纠错，不从零听一遍素材（70s 真素材要 10 分钟，本机还会 OOM）。
+  let reused = false        // 原始转写 + 纠错都复用
+  let reusedRaw = false     // 只复用了原始转写
+  let staleHot = false      // 复用原始转写时，热词表已经变了
   let raw = null
   let rawSegments = null
   if (cached && cached.fixHit) {
@@ -73,13 +76,16 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     language = cached.language || 'zh'
     asrSeconds = cached.asrSeconds || 0
     reused = true
-    log(`复用上次转写：${words.length} 词（素材、术语表、识别模型、纠错层版本都没变）`)
+    log(`复用上次转写：${words.length} 词（素材、术语表、热词、识别模型、纠错层版本都没变）`)
   } else if (cached && cached.rawHit) {
     raw = cached.raw.words
     rawSegments = cached.raw.segments
     language = cached.raw.language || 'zh'
     asrSeconds = cached.raw.asrSeconds || 0
-    log(`复用上次的原始转写：${raw.length} 词；纠错层换过版本（${cached.fixer || '旧版'} → ${FIXER_VERSION}），只重跑纠错`)
+    reusedRaw = true
+    staleHot = Boolean(cached.hotChanged)
+    if (staleHot) log(`复用上次的原始转写：${raw.length} 词；热词表变了，但重听一遍要十几分钟，按复用策略没有再听（真要重听说 VISION_BOTS_ASR_FRESH=1），纠错按新术语表重跑`)
+    else log(`复用上次的原始转写：${raw.length} 词；纠错层换过版本（${cached.fixer || '旧版'} → ${FIXER_VERSION}）或术语表变了，只重跑纠错`)
   }
   if (!words) {
     if (!raw) {
@@ -102,9 +108,11 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     segments = applyToSegments(words, rawSegments)
     writeCutCache({ dir: group.dir, input, terms, brief, raw: { words: raw, segments: rawSegments, language, asrSeconds }, words, segments, fixReport })
   }
+  // 缓存怎么用的要进台账：客户看到「12 分钟转写被跳过」时得知道热词没重听
+  fixReport.cache = { mode: reused ? 'all' : (reusedRaw ? 'fix-only' : 'none'), staleHotwords: staleHot, fresh: forceFresh }
   const fixPath = join(work, 'fix-report.json')
   writeFileSync(fixPath, JSON.stringify(fixReport, null, 2), 'utf8')
-  artifact('fix', fixPath, { changed: fixReport.stats.changed, pending: fixReport.stats.pending, reused })
+  artifact('fix', fixPath, { changed: fixReport.stats.changed, pending: fixReport.stats.pending, reused, staleHot })
 
   // 剪辑的所有口径来自它自己的配置（config/bots/cutter.json），不是散在代码里的常量。
   // 只有用户明确说的东西（语速）才算覆盖。
@@ -252,12 +260,15 @@ function readCutCache({ dir, input, terms, brief }) {
   if (!c || c.version !== 1) return null
   const st = statSync(input)
   if (!c.asset || c.asset.size !== st.size || Math.abs(c.asset.mtimeMs - st.mtimeMs) > 1) return null
-  if (c.terms !== termsHash(terms)) return null
+  // 原始转写只看素材 + 识别模型；术语表不再参与这一层（它就是「不敢改术语表」的根源）
   if ((c.asrModel || 'small') !== (brief.asrModel || 'small')) return null
-  const fixHit = c.fixer === FIXER_VERSION && Array.isArray(c.words) && Array.isArray(c.segments) && c.fixReport && c.fixReport.stats
-  const rawHit = !fixHit && c.raw && Array.isArray(c.raw.words) && c.raw.words.length && Array.isArray(c.raw.segments)
-  if (!fixHit && !rawHit) return null
-  return { ...c, fixHit, rawHit }
+  const rawHit = Boolean(c.raw && Array.isArray(c.raw.words) && c.raw.words.length && Array.isArray(c.raw.segments))
+  // 旧缓存没有记热词串（undefined）→ 当成没变，别让一次升级把已有缓存全废掉
+  const hotChanged = typeof c.hot === 'string' ? c.hot !== hotwordPrompt(terms) : false
+  const fixHit = rawHit && c.fixer === FIXER_VERSION && c.terms === termsHash(terms) &&
+    Array.isArray(c.words) && Array.isArray(c.segments) && c.fixReport && c.fixReport.stats
+  if (!rawHit && !fixHit) return null
+  return { ...c, fixHit, rawHit, hotChanged }
 }
 
 function writeCutCache({ dir, input, terms, brief, raw, words, segments, fixReport }) {
@@ -268,6 +279,7 @@ function writeCutCache({ dir, input, terms, brief, raw, words, segments, fixRepo
     at: new Date().toISOString(),
     asset: { size: st.size, mtimeMs: st.mtimeMs },
     terms: termsHash(terms),
+    hot: hotwordPrompt(terms),
     asrModel: brief.asrModel || 'small',
     fixer: FIXER_VERSION,
     language: raw.language || 'zh',
