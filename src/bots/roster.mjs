@@ -55,6 +55,8 @@ export const BOTS = [
       '模板没做的画幅不许静默改尺寸',
       '改一句只重渲受影响帧，其余帧从母版切',
       '渲染慢了直接说多少倍，不粉饰',
+      // 时长是否达标由质检说了算：包装只报渲染出来的实际秒数，不许说「符合验收标准」
+      '时长达不达标不是你判；你只报成片实际多少秒，不说「符合标准」',
     ],
     tools: ['render_film', 'describe_templates'],
     skills: ['frame-render', 'caption-card', 'cover-layout'],

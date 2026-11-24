@@ -104,11 +104,54 @@ if (py) {
   console.log('· 本机没有拼音校验（uv/pypinyin 不可用），同音相关 4 条跳过')
 }
 
+// ── 10. 跨词重排：ASR 把词切错了位置，只能按总字数不变重排 ──
+const cw = [W('就', 0), W('化', 1), W('走', 2), W('了', 3)]
+const cwCalm = cw.map(w => ({ ...w, p: 0.99 }))
+const s1 = await validate([{ i: 1, n: 2, to: '划走', kind: 'homophone' }], cwCalm, { terms: [], pinyin: undefined })
+if (py) {
+  ok('跨词 · 相邻两词按原字长重排', s1.accepted.length === 1 && s1.accepted[0].parts.join('') === '划走', JSON.stringify(s1.rejected[0] || s1.accepted[0]))
+} else {
+  ok('跨词 · 没有拼音时保守（不采纳）', s1.accepted.length === 0 && s1.rejected.length === 1)
+}
+const s2 = await validate([{ i: 1, n: 2, to: '划走啊', kind: 'homophone' }], cwCalm, { terms: [], pinyin: null })
+ok('跨词 · 总字数变了要拦', s2.accepted.length === 0 && /字数变了/.test(s2.rejected[0].why), JSON.stringify(s2.rejected[0]))
+const s3 = await validate([{ i: 1, n: 2, to: '划，走', kind: 'homophone' }], cwCalm, { terms: [], pinyin: null })
+ok('跨词 · 片段里带标点要拦', s3.accepted.length === 0 && /标点/.test(s3.rejected[0].why), JSON.stringify(s3.rejected[0]))
+const s4 = await validate([{ i: 2, n: 9, to: '划走', kind: 'homophone' }], cwCalm, { terms: [], pinyin: null })
+ok('跨词 · 区间越界要拦', s4.accepted.length === 0 && /越界/.test(s4.rejected[0].why), JSON.stringify(s4.rejected[0]))
+const cwPunct = [W('就', 0), W('化', 1), W('走了。', 2)]
+const s5 = await validate([{ i: 1, n: 2, to: '划走了', kind: 'homophone' }], cwPunct.map(w => ({ ...w, p: 0.99 })), { terms: [], pinyin: py ? undefined : null })
+if (py) {
+  ok('跨词 · 标点留在原位', s5.accepted.length === 1 && s5.accepted[0].parts[1] === '走了。', JSON.stringify(s5.accepted[0] || s5.rejected[0]))
+}
+const cwFixed = cw.map((w, i) => i === 1 ? { ...w, fixed: true } : w)
+const s6 = await validate([{ i: 1, n: 2, to: '划走', kind: 'homophone' }], cwFixed, { terms: [], pinyin: null })
+ok('跨词 · 术语表改过的词位不许再动', s6.accepted.length === 0 && /术语表改过/.test(s6.rejected[0].why), JSON.stringify(s6.rejected[0]))
+
+// ── 11. 近音：「千」和「天」本来就不同音，必须有低置信词做独立证据 ──
+const nw = [W('我', 0), W('要', 1), W('花', 2), W('一', 3, 0.54), W('千', 4, 0.83), W('的', 5), W('时间', 6)]
+const nCalm = nw.map(w => w.w === '一' ? { ...w, p: 0.99 } : w)
+if (py) {
+  const h1 = await validate([{ i: 4, to: '天', kind: 'near', why: '一千的时间不通' }], nw, { terms: [], pinyin: undefined })
+  ok('近音 · 韵母声调一致、声母不同才放行', h1.accepted.length === 1 && /ian1/.test(h1.accepted[0].verified), JSON.stringify(h1.rejected[0] || h1.accepted[0]))
+  const h2 = await validate([{ i: 4, to: '天', kind: 'near' }], nCalm, { terms: [], pinyin: undefined })
+  ok('近音 · 没有低置信邻居就拦', h2.accepted.length === 0 && /独立证据/.test(h2.rejected[0].why), JSON.stringify(h2.rejected[0]))
+  const h3 = await validate([{ i: 4, to: '就', kind: 'near' }], nw, { terms: [], pinyin: undefined })
+  ok('近音 · 韵母或声调不同就拦', h3.accepted.length === 0 && /韵母或声调不同/.test(h3.rejected[0].why), JSON.stringify(h3.rejected[0]))
+  const h4 = await validate([{ i: 4, to: '签', kind: 'near' }], nw, { terms: [], pinyin: undefined })
+  ok('近音 · 本来就是同音的要改报同音', h4.accepted.length === 0 && /本来就是同音/.test(h4.rejected[0].why), JSON.stringify(h4.rejected[0]))
+  const cap3 = [W('花', 0), W('一', 1, 0.5), W('千', 2), W('花', 3), W('一', 4, 0.5), W('千', 5), W('花', 6), W('一', 7, 0.5), W('千', 8)]
+  const h5 = await validate([{ i: 2, to: '天', kind: 'near' }, { i: 5, to: '天', kind: 'near' }, { i: 8, to: '天', kind: 'near' }], cap3, { terms: [], pinyin: undefined })
+  ok('近音 · 全片最多 2 处', h5.accepted.length === 2 && h5.rejected.some(r => /最多 2 处/.test(r.why)), h5.accepted.length + '/' + h5.rejected.length)
+} else {
+  console.log('· mkdir 拼音不可用，近音 5 条跳过')
+}
+
 const total = pass + fails.length
 if (fails.length) {
   console.log('FAIL · ' + fails.length + '/' + total + ' 条没过')
   for (const f of fails) console.log('  · ' + f)
   process.exitCode = 1
 } else {
-  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2' + (py ? ' / 拼音 4' : '') + '）')
+  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2 / 跨词 6 / 近音 5' + (py ? ' / 拼音 4' : '') + '）')
 }

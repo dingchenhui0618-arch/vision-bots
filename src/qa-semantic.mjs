@@ -16,7 +16,9 @@ const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/g
 const strip = s => String(s || '').replace(PUNCT, '')
 
 export const KINDS = { homophone: '同音错字', semantic: '语句不通', repeat: '重复句', offtopic: '跑题' }
-export const SEMANTIC = { maxIssues: 12, maxTokens: 1400, timeoutMs: 90000 }
+// 输出预算按 26 张卡实测调过：1400 会在 JSON 中间被截断（reading-unverified），
+// 截断的语义审读等于没查，只能判不通过。宁可多花几百 token，也别让它半句话收工。
+export const SEMANTIC = { maxIssues: 8, maxTokens: 2600, timeoutMs: 90000 }
 
 /**
  * 读全性验证：条数 + 首尾卡的开头都要对得上。纯函数，可单测。
@@ -160,7 +162,7 @@ export async function reviewText({ words = [], captions = null, sections = [], b
     '只输出 JSON：{"checkedCaps":<条数>,"firstQuote":"前4字","lastQuote":"前4字","verdict":"ok"|"issues","issues":[{"kind":"homophone","at":12.3,"quote":"原文片段","to":"正确写法","why":"一句话"}]}',
   ].join('\n')
 
-  const r = await chatJSON({ prompt, model, maxTokens: SEMANTIC.maxTokens, timeoutMs: SEMANTIC.timeoutMs })
+  const r = await chatJSON({ prompt, model, maxTokens: SEMANTIC.maxTokens, timeoutMs: SEMANTIC.timeoutMs, temperature: 0 })
   if (!r.ok) {
     log('语义审读：模型没接上（' + r.skipped + '）')
     return { ok: false, skipped: r.skipped, detail: r.detail || null, model: null }

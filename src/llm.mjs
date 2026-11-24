@@ -65,7 +65,7 @@ export function llmStatus() {
  * 一次纯文本调用。返回 {ok, content, ms, tokens, model} 或 {ok:false, skipped, detail, ms}。
  * skipped: no-key / http-<code> / timeout / unreachable / empty
  */
-export async function chat({ prompt, system = null, messages: given = null, maxTokens = 700, timeoutMs = LLM.timeoutMs, model = null, tools = null, toolChoice = null } = {}) {
+export async function chat({ prompt, system = null, messages: given = null, maxTokens = 700, timeoutMs = LLM.timeoutMs, model = null, tools = null, toolChoice = null, temperature = null } = {}) {
   const key = readKey()
   if (!key) return { ok: false, skipped: 'no-key' }
   // 两种用法：给 prompt 一次性问完（读需求、纠错），或给 messages 自己管多轮（bot 的会话）
@@ -87,6 +87,8 @@ export async function chat({ prompt, system = null, messages: given = null, maxT
         model: model || LLM.model,
         messages,
         max_tokens: maxTokens,
+        // 抽取类任务（纠错、读需求）要可复现：不给温度就用服务端默认，同一句话两次结果不一样
+        ...(temperature === null ? {} : { temperature }),
         // 这个网关（TokenRouter / vLLM 系）认 enable_thinking；不认的服务器会忽略这个字段
         ...(LLM.thinking ? {} : { enable_thinking: false }),
         // 给 bot 用的函数调用：模型只能选工具和传参，不能自己写时间码
