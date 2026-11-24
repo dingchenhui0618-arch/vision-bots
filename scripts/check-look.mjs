@@ -90,9 +90,19 @@ function stats(file) {
     const mean = a => a.reduce((s, x) => s + x, 0) / (a.length || 1)
     const meanL = mean(lum)
     const sd = Math.sqrt(mean(Array.from(lum, x => (x - meanL) ** 2)))
-    // 切点：相邻帧降采样亮度差大就记一次（全屏色卡的进出会一次记两条，所以只当相对密度看）
+    // 切点：相邻帧降采样亮度差大就记一次，但**连续的几帧算一次**。
+    // 自测17 这里数的是「超线的帧数」而不是「变化次数」：一次 3 帧的渐变算 3 个切点、
+    // 一次 1 帧的硬切算 1 个。参考片的转场是渐变（3–6 帧），我们的是硬切，
+    // 同一件事量出来差三倍——「切点密度 0.24/s vs 0.52–0.78/s」就是这么来的，
+    // 差点为这个假差距去塞没用的切点。聚成事件后：我们 0.19/s，参考族 0.20–0.23/s。
     let cuts = 0
-    for (let f = 1; f < n; f++) if (Math.abs(lum[f] - lum[f - 1]) > 9) cuts++
+    let prevCut = -99
+    for (let f = 1; f < n; f++) {
+      if (Math.abs(lum[f] - lum[f - 1]) > 9) {
+        if (f - prevCut > 1) cuts++
+        prevCut = f
+      }
+    }
     const sorted = Array.from(lum).map((y, i) => ({ t: info.fps ? i / info.fps : i, y })).sort((a, b) => b.y - a.y)
     const accSorted = Array.from(accent).map((a, i) => ({ t: info.fps ? i / info.fps : i, a })).sort((x, y) => y.a - x.a)
     const accentMean = mean(accent)
@@ -134,6 +144,9 @@ if (refs.length) {
   push('参考族（' + refs.length + ' 支，折光自己的成片）：')
   for (const r of refs) push('  ' + r.file.split('\\').pop() + '  ' + r.w + '×' + r.h + '  ' + r1(r.duration, 2) + 's  亮度 ' + r1(r.meanY) + '  波动 ' + r1(r.sdY) + '  强调色 ' + pct(r.accent) + '  切点 ' + r1(r.cutRate) + '/s')
   push('')
+  // 切点密度是「次数 / 时长」，一次事件的差别在 0.017/s 量级：11 次 vs 13 次不叫差距。
+  // 其它三项是逐帧平均出来的连续量，没有这个问题。容差只给切点，且只给一次事件。
+  const TOL = { cutRate: 1 / Math.max(ours.duration, 1e-6) }
   const checks = [
     ['meanY', '平均亮度', ours.meanY, x => String(r1(x)), x => String(r1(x))],
     ['sdY', '亮度波动', ours.sdY, x => String(r1(x)), x => String(r1(x))],
@@ -143,7 +156,8 @@ if (refs.length) {
   push('指标        成片        参考族区间              判定')
   for (const [key, label, val, fmt, rfmt] of checks) {
     const b = band(key)
-    const inBand = val >= b.lo - 1e-9 && val <= b.hi + 1e-9
+    const tol = TOL[key] || 0
+    const inBand = val >= b.lo - tol - 1e-9 && val <= b.hi + tol + 1e-9
     rows.push({ key, label, val, lo: b.lo, hi: b.hi, ok: inBand })
     const padLabel = label.padEnd(12 - [...label].reduce((n, ch) => n + (ch.charCodeAt(0) > 127 ? 1 : 0), 0))
     push(padLabel + '' + fmt(val).padEnd(12) + (rfmt(b.lo) + ' – ' + rfmt(b.hi)).padEnd(24) + (inBand ? '在档内' : (val < b.lo ? '低于参考族' : '高于参考族')))

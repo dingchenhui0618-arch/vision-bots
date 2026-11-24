@@ -51,7 +51,39 @@ export function layoutBoxes({ scene, template }) {
       // 小窗只占上方右侧（0.10–0.50h），大字压在 0.56h 以下的胸口，两者从不重叠，用满宽。
       const maxW = w - x - ((L.big && L.big.right) || 150)
       const blockTop = Math.round(bottom - lines * lh)
-      items.push({ tag: 'big', x, y: blockTop + inkTop, w: Math.round(maxW), h: Math.round(bh), t0: b.f0, t1: b.f1, shot: shot.kind })
+      // 自测18：大字下面加了一块深色板（film.js 的 plate）。盒子跟着板走——质检量大字对比度时，
+      // 量的就是「字所在的那块板」；板比墨迹大一圈，这里留出同样的内边距。
+      const padX = Math.round(size * 0.18), padY = Math.round(size * 0.14)
+      // 板宽按「偏大」估：ASCII 按 0.72em（粗体拉丁词比 0.56 宽），盒子只会更严
+      const wideEm = s => [...String(s || '')].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.72 : 1), 0)
+      const widest = Math.max(1, ...b.lines.map(l => wideEm(l))) * size
+      // M0 在这个分支后面才声明（模块内 TDZ），这里自己取一次页边距
+      const Mg = L.margin || 56
+      const plate = {
+        x: Math.max(Mg - 8, Math.round(x - padX)),
+        y: Math.round(blockTop - padY),
+        w: Math.min(maxW, Math.round(widest + padX * 2)),
+        h: Math.round(lines * lh + padY * 2),
+      }
+      items.push({ tag: 'big', x: plate.x, y: plate.y, w: plate.w, h: plate.h, t0: b.f0, t1: b.f1, shot: shot.kind })
+      // 印章：和 film.js 的 stamp() 同一套条件与位置（2–3 字的强调词才盖）
+      const hotTxt = String(b.hot || '').replace(/[\s，。！？、；：,.!?;:""''…—~·\-]/g, '')
+      if (hotTxt.length >= 2 && hotTxt.length <= 3) {
+        const rr = Math.round(Math.min(96, Math.max(62, size * 0.44)))
+        const edge = Math.max(Mg, (L.safe && L.safe.right) || 150)
+        let cx = plate.x + plate.w + rr + 14
+        let cy = plate.y + Math.round(plate.h * 0.42)
+        // 有红条/刻度卡/对勾卡占着板的上方时不盖上方的章（和 film.js 的 stamp() 同一条件）
+        const blocked = (scene.blocks || []).some(x => (x.kind === 'banner' || x.kind === 'gauge' || x.kind === 'check') && b.f0 >= x.f0 && b.f0 < x.f1)
+        let skip = false
+        if (cx + rr > w - edge - 6) {
+          if (blocked) skip = true
+          else { cx = w - edge - rr - 6; cy = plate.y - rr - 18 }
+        }
+        if (!skip && cx - rr >= Mg && cx + rr <= w - Mg - 4 && cy - rr >= 92 + 150) {
+          items.push({ tag: 'block:stamp', x: cx - rr - 10, y: cy - rr - 10, w: rr * 2 + 20, h: rr * 2 + 20, t0: b.f0 + 0.18, t1: b.f1, shot: shot.kind })
+        }
+      }
     }
     // 字幕：和 film.js 同一个字宽公式
     for (const s of scene.subs || []) {
@@ -143,18 +175,20 @@ export function layoutBoxes({ scene, template }) {
       }
       else if (b.kind === 'avatar') items.push({ tag: 'block:avatar', x: 56, y: Math.round(h * 0.32), w: 560, h: 132, t0: b.f0, t1: b.f1, shot: sk })
     }
-    // 句子级小标签：和 film.js 的 chipLayer 同一套几何（左右两条边、三条泳道）
+    // 句子级小标签：和 film.js 的 chipLayer 同一套几何（左右两条边、四条泳道、每张带偏移）
     const CHIPL = L.chips || { lanes: [0.255, 0.345, 0.435], left: M0, right: 150, h: 46, padX: 20 }
     for (const ch of scene.chips || []) {
       const size = TY.chip || 24
       const cw = Math.round(textEm(ch.text) * size + (CHIPL.padX || 20) * 2)
       const hh = CHIPL.h || 46
-      const y = Math.round(h * (((CHIPL.lanes || [])[ch.lane]) || 0.3))
+      // 和 film.js 的 chipLayer 同一口径：泳道 + 每张自己的偏移（偏移存在 scene.json 里）
+      const y = Math.round(h * (((CHIPL.lanes || [])[ch.lane]) || 0.3)) + (ch.dy || 0)
       const sk2 = shotAt(ch.f0).kind
       const pr = personRect(sk2)
-      const x = (sk2 === 'frame' || sk2 === 'corner')
+      const x0 = (sk2 === 'frame' || sk2 === 'corner')
         ? (ch.side ? pr.x + pr.w + 18 : pr.x - 18 - cw)
         : (ch.side ? w - (CHIPL.right || 150) - cw : (CHIPL.left || M0))
+      const x = clamp(x0 + (ch.dx || 0), M0, w - M0 - cw)
       items.push({ tag: 'block:chip', x, y: y - hh / 2, w: cw, h: hh, t0: ch.f0, t1: ch.f1, shot: shotAt(ch.f0).kind })
     }
     // HUD 三件 + 章节卡：以前没进盒子表，等于质检看不见页码/胶囊/进度线/章节卡，

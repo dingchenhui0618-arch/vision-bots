@@ -107,7 +107,13 @@ const chips = scene.chips || []
 const LCH = (tpl.layouts['9:16'] || {}).chips || { lanes: [0.255, 0.345, 0.435], left: 56, right: 150, h: 46, padX: 20 }
 const chipSize = (tpl.type && tpl.type.chip) || 24
 const chipW = text => Math.round(emOf(text) * chipSize + LCH.padX * 2)
-const chipBox = c => ({ x: c.side ? LZ.size[0] - LCH.right - chipW(c.text) : LCH.left, y: LZ.size[1] * LCH.lanes[c.lane] - LCH.h / 2, w: chipW(c.text), h: LCH.h, f0: c.f0, f1: c.f1 })
+// 和 film.js / layout-boxes 同一套几何：泳道 + 每张自己的偏移（偏移存在 scene.json 里）
+const chipBox = c => {
+  const cw = chipW(c.text)
+  const x0 = c.side ? LZ.size[0] - LCH.right - cw : LCH.left
+  const x = Math.max((LZ.margin || 56), Math.min(LZ.size[0] - (LZ.margin || 56) - cw, x0 + (c.dx || 0)))
+  return { x, y: LZ.size[1] * LCH.lanes[c.lane] + (c.dy || 0) - LCH.h / 2, w: cw, h: LCH.h, f0: c.f0, f1: c.f1 }
+}
 const chipOut = []
 for (const c of chips) {
   const page = scene.pages.find(p => p.index === c.page)

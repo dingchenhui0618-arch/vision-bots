@@ -238,6 +238,45 @@ export async function createFilm({ media }) {
     return h * 0.775
   }
 
+  /**
+   * 印章徽章：板边一枚圆章，章上是大字里那个被挑中的强调词。
+   * 参考片里最像「设计」的那个动作——红圆章「卷」、皇冠章「才是王道」——它不是装饰，
+   * 是把一句话里的关键词单独拎出来盖一次。没有 2–3 字的强调词就不盖：空章等于编内容。
+   */
+  function stamp(c, b, plate, size, t) {
+    const hot = bare(b.hot || '')
+    if (hot.length < 2 || hot.length > 3) return
+    const r = Math.round(Math.min(96, Math.max(62, size * 0.44)))
+    const edge = Math.max(M, (L.safe && L.safe.right) || 150)
+    let cx = plate.x + plate.w + r + 14
+    let cy = plate.y + Math.round(plate.h * 0.42)
+    if (cx + r > w - edge - 6) {
+      // 板占满整行时右边塞不下：退一步盖在板的上方右侧（满幅页那一片是空的，还在头部区以下）。
+      // 但那一片会被红条/刻度卡/对勾卡占着——有块在的时候不盖，宁可这一条没有章。
+      if (blockAt(t).some(x => x.kind === 'banner' || x.kind === 'gauge' || x.kind === 'check')) return
+      cx = w - edge - r - 6
+      cy = plate.y - r - 18
+    }
+    if (cx - r < M || cx + r > w - M - 4) return
+    if (cy - r < HUD_Y + 150) return
+    const k = E.outCubic(clamp(seg(t, b.f0 + 0.18, b.f0 + 0.46)))
+    if (k <= 0.02) return
+    const red = b.style === 'redBox'
+    const col = red ? P.red : P.lime
+    c.save()
+    c.globalAlpha *= k
+    c.translate(cx, cy)
+    c.rotate(((-7 * Math.PI) / 180) * E.outCubic(clamp(seg(t, b.f0 + 0.10, b.f0 + 0.50))))
+    const sc = 0.86 + 0.14 * k
+    c.scale(sc, sc)
+    dot(c, 0, 0, r, R(col, red ? 1 : 0.94))
+    ring(c, 0, 0, r + 10, R(P.paper, 0.30), 2)
+    const ts = Math.round(Math.min(r * 0.88, (r * 1.6) / Math.max(1, textEm(hot))))
+    txt(c, hot, 0, Math.round(ts * 0.34), { size: ts, family: F.sans, weight: 900, color: R(red ? P.paper : P.void, 0.97), align: 'center' })
+    c.restore()
+    reg(cx - r - 10, cy - r - 10, r * 2 + 20, r * 2 + 20, 'block:stamp')
+  }
+
   function drawBig(c, b, t, shot) {
     if (t < b.f0 || t >= b.f1) return
     // 章节卡在的时候不放大字：两套文字同屏会打架（自测07 抽帧里「01 最赚钱的不是技术」
@@ -251,6 +290,33 @@ export async function createFilm({ media }) {
     const lh = size * (BGL.lineGap || 1.06)
     const bottom = bigBottom(shot)
     const top = bottom - lines.length * lh
+    // ── 底色板（自测18）──
+    // 对折光抽帧做对照才看清的：人家的大字下面永远垫着一块深色板，字和人分属两层；
+    // 我们的字直接浮在实拍上（只有一层阴影），同一个动作读起来就是「字幕」而不是「版面」。
+    // 板同时解决可读性：大字底下的像素从「白帽子 / 白墙」变成「压暗的板」，对比度不再是运气。
+    // 板宽必须按真字宽量：以前用 textEm（ASCII 一律算 0.56em）估，「GPT」这类词量出来比画的窄，
+    // 板就短出字一截（自测18 的第 690 帧上「用C」露在板外）。
+    const widest = Math.max(1, ...lines.map(l => measure(c, l, size, F.sans, 900)))
+    const padX = Math.round(size * 0.18), padY = Math.round(size * 0.14)
+    const plate = {
+      x: Math.max(M - 8, Math.round(BGL.left - padX)),
+      y: Math.round(top - padY),
+      w: Math.min(w - BGL.left - M, Math.round(widest + padX * 2)),
+      h: Math.round(lines.length * lh + padY * 2),
+    }
+    const kIn = E.outExpo(clamp(seg(t, b.f0, b.f0 + 0.30)))
+    c.save()
+    c.globalAlpha *= 0.94 * kIn
+    rrect(c, plate.x, plate.y, plate.w, plate.h, Math.round(size * 0.09))
+    c.fillStyle = R(P.void, 0.60)
+    c.fill()
+    // 板的左沿一道荧光绿细线：参考片的板都有边，光靠一块暗矩形看起来像「没渲染完」
+    c.fillStyle = R(P.lime, 0.85 * kIn)
+    c.fillRect(plate.x, plate.y + Math.round(size * 0.10), Math.max(3, Math.round(size * 0.022)), plate.h - Math.round(size * 0.20))
+    c.restore()
+    // 印章（徽章）：参考片的红圆章 / 皇冠章压在板边，是画面里唯一「不整齐」的东西，也是最像设计的地方。
+    // 只在大字真有一个 2–3 字的强调词时才盖：没有词的章等于编内容。
+    stamp(c, b, plate, size, t)
     c.save()
     // 小字眉：换页之后才出现，避免和章节卡打架
     const page = pageAt(t)
@@ -272,7 +338,8 @@ export async function createFilm({ media }) {
       drawRuns(c, ln, baseX, y, size, b.style, b.hot, true)
     })
     c.restore()
-    reg(BGL.left, top - 20, w - BGL.left - BGL.right, lines.length * lh + 10, 'big')
+    // 盒子跟着板走：质检量对比度时，量的就是字所在的那块板
+    reg(plate.x, plate.y, plate.w, plate.h, 'big')
   }
 
   /** 一行字按高亮拆成 before / hot / after 三段画；hot 可以是黄字、荧光绿底黑字、红底白字 */
@@ -572,12 +639,16 @@ export async function createFilm({ media }) {
       if (k <= 0.02) continue
       const cw = Math.round(measure(c, chip.text, size, F.sans, 700) + CHIPL.padX * 2)
       const hh = CHIPL.h
-      const y = h * ((CHIPL.lanes || [])[chip.lane] || 0.3)
+      // 位置 = 泳道 + 每张自己的偏移（偏移存在 scene.json 里，质检盒子读同一份）
+      const y = h * ((CHIPL.lanes || [])[chip.lane] || 0.3) + (chip.dy || 0)
       // 小窗/竖框页：标签贴着人物窗口的边排，不飘到画面最外侧（参考片的标签就是紧贴窗口的一列）
       // 满幅页：人物是整幅，标签压在画面左右两条边上，中间的脸留空
-      const x = (shot.kind === 'frame' || shot.kind === 'corner')
+      const x0 = (shot.kind === 'frame' || shot.kind === 'corner')
         ? (chip.side ? personRect(shot).x + personRect(shot).w + 18 : personRect(shot).x - 18 - cw)
         : (chip.side ? w - CHIPL.right - cw : CHIPL.left)
+      // 右边只让到页边（不是平台安全区的 150）：标签都在 0.20–0.44h 的上半区，
+      // 平台按钮压的是下半区；按 150 卡死时，长词（Claude）会被钉在 74% 线上 0.2px，判成「压脸」。
+      const x = Math.max(M, Math.min(w - M - cw, x0 + (chip.dx || 0)))
       c.save()
       c.globalAlpha *= k
       // 从边上滑进来一点点：静止出现像贴图，滑进来才像「跟着这句话冒出来」
@@ -620,6 +691,26 @@ export async function createFilm({ media }) {
       c.fillRect(0, 0, w, h)
     }
     cornerTicks(c, M, M, w - M * 2, h - M * 2, 26, R(P.paper, 0.20), 3)
+    // ── 字卡的版面结构（自测18）──
+    // 自测17 把整屏荧光绿换成暗底之后，字卡就剩「一行字 + 一条绿线」——抽帧对照参考片，
+    // 中间那一大片是空的，看起来像没画完。参考片同类的卡上永远有三层：小字眉、正文、页码层。
+    // 这里补的都是从数据来的东西（页码、下一页码、章节序号），没有一个是编出来的文案。
+    if (page) {
+      const pg = n => String(n).padStart(2, '0')
+      // 左下：巨大的半透明章节序号，压住画面的一角
+      const numSize = Math.round(h * 0.17)
+      c.save()
+      c.globalAlpha *= 0.13
+      txt(c, pg(page.index), M - 6, h - Math.round(h * 0.055), { size: numSize, family: F.disp, weight: 800, color: R(P.lime, 1), spacing: -4 })
+      c.restore()
+      line(c, M, Math.round(h * 0.795), M + 96, Math.round(h * 0.795), R(P.lime, 0.55), 3)
+      // 右上：页码流转 —— 参考片的字卡上都标着「P.02 → P.03」，观众知道自己在第几段
+      const nxt = page.index < page.total ? pg(page.index + 1) : null
+      const marker = nxt ? 'P.' + pg(page.index) + '  →  P.' + nxt : 'P.' + pg(page.index) + '  /  ' + pg(page.total)
+      const mSize = TY.eyebrow
+      const mw = measure(c, marker, mSize, F.disp, 700, 2.4)
+      txt(c, marker, w - M - mw, HUD_Y + 66, { size: mSize, family: F.disp, weight: 700, color: R(P.ash, 0.92), spacing: 2.4 })
+    }
     const text = b ? b.text : (page && page.title) || ''
     if (!text) return
     const lines = (b && b.lines && b.lines.length) ? b.lines : [text]

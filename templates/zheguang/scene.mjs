@@ -146,7 +146,9 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     for (const s of shots) {
       if (s.f1 <= a || s.f0 >= b) { out.push(s); continue }
       if (s.f0 < a) out.push({ ...s, f1: a })
-      if (s.f1 > b) out.push({ ...s, f0: b })
+      // 0.001 的容差：shots 的时间 round 到 3 位小数，duration 没有，直接比会留下一条零长度的尾段
+      // （自测18 的末尾那条 59.3667–59.367 full 就是这么来的，它让「结尾一定是画中画」这条断言假失败）
+      if (s.f1 - b > 0.001) out.push({ ...s, f0: b })
     }
     out.push({ f0: round(a), f1: round(b), kind, why })
     shots.length = 0
@@ -421,9 +423,13 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
 
   const chips = []
   const chipSlots = new Map()
-  const slotOrderA = [[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2]]
-  const slotOrderB = [[1, 0], [0, 0], [1, 1], [0, 1], [1, 2], [0, 2]]
-  const chipLife = (L.chips && L.chips.life) || 4.6
+  // 四条泳道 × 左右两侧：参考片的同一屏上叠着三五张小标签，三条泳道太少，两张一起就挤
+  const slotOrderA = [[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2], [0, 3], [1, 3]]
+  const slotOrderB = [[1, 0], [0, 0], [1, 1], [0, 1], [1, 2], [0, 2], [1, 3], [0, 3]]
+  const chipLife = (L.chips && L.chips.life) || 3.8
+  // 参考片的标签不是整齐排成一条线，是散着挂的。这里给每张一个固定的偏移（同一条片子每次渲染色一样），
+  // 偏移量写进 scene.json：渲染器和质检盒子读同一份，别各算一套。
+  const CHIP_NUDGE = [[-12, -8], [8, 6], [-6, 10], [12, -4]]
   for (const p of pagesRaw) {
     const list = beats.filter(b => b.f0 >= p.start - 0.25 && b.f0 < p.end)
     const pageText = list.map(b => b.text).join('')
@@ -472,7 +478,21 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
       busy.push([f0, f1])
       chipSlots.set(key, busy)
       const [side, lane] = key.split(':').map(Number)
-      chips.push({ text: c.text, f0, f1, side, lane, page: p.index, hot: c.kind === 'term' || c.kind === 'latin' ? 1 : 0 })
+      const [ndx, ndy] = CHIP_NUDGE[chips.length % CHIP_NUDGE.length]
+      // 只往画面外侧偏：往中间偏会压到脸（质检 label_edge 会拦，但没必要先犯一次）
+      let nx = side ? Math.abs(ndx) : -Math.abs(ndx)
+      // 满幅页的标签在画面两侧，中间 26%–74% 是脸。右边那条按「安全区右边距 150」排，
+      // 长词（Claude）算下来会正好压进 74% 线 0.2px——标签一长就被判「压脸」。
+      // 这里把偏移改成「至少把人脸带让出来」，仍然落在外侧，只是贴着安全区边。
+      if (s0.kind === 'full' && L.size) {
+        const Wp = L.size[0]
+        const cwEst = textEm(c.text) * ((t.type && t.type.chip) || 26) + ((L.chips && L.chips.padX) || 20) * 2
+        const faceL = Math.round(Wp * 0.26) + 4, faceR = Math.round(Wp * 0.74) - 4
+        const rightEdge = Wp - ((L.chips && L.chips.right) || 150) - cwEst
+        if (side && rightEdge + nx < faceR) nx = Math.round(faceR - rightEdge)
+        if (!side && ((L.chips && L.chips.left) || 56) + nx + cwEst > faceL) nx = Math.round(faceL - ((L.chips && L.chips.left) || 56) - cwEst)
+      }
+      chips.push({ text: c.text, f0, f1, side, lane, dx: nx, dy: ndy, page: p.index, hot: c.kind === 'term' || c.kind === 'latin' ? 1 : 0 })
     }
   }
 

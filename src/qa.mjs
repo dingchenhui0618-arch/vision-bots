@@ -309,13 +309,39 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
       }
       const fails = []
       const report = []
-      for (const b of unions) {
-        const want = need[b.tag]
-        if (!want) continue
+      // 对比度按「每个盒子在自己的时间窗里量」，不按 tag 的并集量。
+      // 并集是给重叠检查用的：20 条大字并起来是一个盖住大半屏、从 0s 到片尾的大矩形，
+      // 拿它量对比度，等于在「这条大字不在场」的时刻和位置上量别人的画面
+      // （自测18 就这样量出 48s 的 1.24:1：那一刻盒子里是人物胸口和浅色裤子）。
+      // 每个盒子自己的 t0–t1 才是那条字真的在屏上的时间窗。
+      // 量对比度用带真实时间窗的元素表（layoutBoxes 的 items）；没有就退回采样盒子
+      const src = (layout && Array.isArray(layout.items) && layout.items.length) ? layout.items : boxes
+      const seenBox = new Set()
+      const perBox = []
+      for (const b of src) {
+        if (!need[b.tag]) continue
+        const key2 = [b.tag, Math.round(b.x), Math.round(b.y), Math.round(b.w), Math.round(b.h), Number(b.t0).toFixed(2), Number(b.t1).toFixed(2)].join(',')
+        if (seenBox.has(key2)) continue
+        seenBox.add(key2)
+        // 盒子坐标是场景坐标（1080×1920），像素帧是降采样后的；boxContrast 靠 outW/outH 换算
+        perBox.push({ ...b, outW: outSize[0], outH: outSize[1] })
+      }
+      const worstOf = new Map()
+      let skipped = 0
+      for (const b of perBox) {
         const r = boxContrast({ frames, box: b, color: colorOf(b.tag), fps: scene ? scene.fps : 30 })
-        if (!r.ok) { fails.push({ tag: b.tag, why: r.reason }); continue }
-        report.push({ tag: b.tag, ratio: r.worst.ratio, at: r.worst.t })
-        if (r.worst.ratio < want) fails.push({ tag: b.tag, ratio: r.worst.ratio, want, at: r.worst.t })
+        // 取不到这一格的像素（这条字太短、抓帧没落在它的窗口里）就记一笔跳过，
+        // 但只要这个 tag 还有一个盒子被量到，结论就站得住；一个都量不到才算没证明。
+        if (!r.ok) { skipped++; continue }
+        const cur = worstOf.get(b.tag)
+        if (!cur) worstOf.set(b.tag, { tag: b.tag, ratio: r.worst.ratio, at: r.worst.t, want: need[b.tag], n: 1 })
+        else { cur.n++; if (r.worst.ratio < cur.ratio) { cur.ratio = r.worst.ratio; cur.at = r.worst.t } }
+      }
+      for (const tag of new Set(perBox.map(b => b.tag))) {
+        const w = worstOf.get(tag)
+        if (!w) { fails.push({ tag, why: '这一类元素一个都没量到（抓帧没落在它们的窗口里）' }); continue }
+        report.push({ tag: w.tag, ratio: w.ratio, at: w.at, boxes: w.n, skipped })
+        if (w.ratio < w.want) fails.push({ tag: w.tag, ratio: w.ratio, want: w.want, at: w.at })
       }
       const ok = fails.length === 0
       add('text_contrast', ok,

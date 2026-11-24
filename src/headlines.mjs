@@ -60,6 +60,22 @@ export function contiguous(text, sentence) {
   return Boolean(t) && s.includes(t)
 }
 
+/**
+ * 标题必须落在词的边界上。
+ * 自测18 抽帧抓到「大家用GPT用C」——它满足了「连续取自本句、结尾不是虚词」，
+ * 但把「Claude」切成了一个 C，上屏就是半截英文。规则只查字的袋子/连续性，
+ * 查不出「切断了词」，这一类一直漏到画面上才被看见。
+ */
+export function onWordBoundary(text, sentence) {
+  const t = strip(text), s = strip(sentence)
+  const at = s.indexOf(t)
+  if (at < 0) return false
+  const bounds = new Set([0])
+  let acc = 0
+  for (const w of segment(s)) { acc += w.length; bounds.add(acc) }
+  return bounds.has(at) && bounds.has(at + t.length)
+}
+
 /** 一条标题能不能挂在这一句上：长度、连续取自本句、开头结尾不是半句话。纯函数，可单测。 */
 export function checkHeadline(text, sentence) {
   const t = strip(text)
@@ -74,6 +90,7 @@ export function checkHeadline(text, sentence) {
     return { ok: false, why: '有这一句里没有的字：' + [...new Set(bad)].join('') }
   }
   if (!contiguous(t, sentence)) return { ok: false, why: '不是这一句里连续的一段（中间抽掉了字）' }
+  if (!onWordBoundary(t, sentence)) return { ok: false, why: '把词切断了（起止不在词边界上，比如把 Claude 切成「用C」）' }
   const last = cs[cs.length - 1]
   if (HEADLINE.badTail.includes(last)) return { ok: false, why: '结尾是「' + last + '」，读起来是半句话' }
   if (HEADLINE.badHead.test(t)) return { ok: false, why: '以连接词开头，抓不住人' }

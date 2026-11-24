@@ -30,7 +30,7 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
 
   // ── 画面审计：盒子从版式数据算（不依赖浏览器），像素从成片里抽 ──
   // 以前问渲染器要盒子：要在机器紧张时再起一次 Chrome，起不来质检就整个失效（2026-11-23 实测踩到）。
-  let boxes = null, layout = null
+  let boxes = null, layout = null, lbItems = null
   if (state.scene && state.templateId) {
     try {
       const tplPath = join(TPL_ROOT, state.templateId, 'template.json')
@@ -40,7 +40,9 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
         const step = Math.max(1, Math.round(state.scene.fps * 0.4))
         const samples = boxesAtTime(lb.items, state.scene.fps, 0, state.scene.frames - 1, step)
         boxes = samples.flatMap(s => s.list.map(b => ({ ...b, frame: s.frame })))
-        layout = lb.layout
+        // 盒子带上真实时间窗（lb.items 的 t0/t1），对比度才能「在每个盒子自己的时刻」量
+        layout = { ...lb.layout, items: lb.items }
+        lbItems = lb.items
         log('画面布局：' + lb.items.length + ' 个元素，' + samples.length + ' 个采样帧')
       } else {
         log('画面布局算不出：' + lb.reason)
@@ -54,8 +56,20 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
     const pick = []
     // 分辨率要够：216×384 时 22px 的 HUD 只剩 4px，字和 pill 的边界被缩放糊掉，
     // 「非文字像素中位数」会把抗锯齿像素算成背景，量出来的对比度严重偏低（假失败）。
+    // 抽哪几帧：以前均匀抽 16 帧，于是和对比度有关的盒子大半「在样帧里没有出现」
+    // （每条字幕只活 2.7 秒、每条大字 3 秒，16 帧摊到 59 秒上根本对不上）。
+    // 现在每个要量对比度的盒子各取一次自己的中点——盒子在哪一刻真的在屏上，就量那一刻。
+    const wantTags = new Set(['big', 'sub', 'rail', 'hud:rec', 'hud:sec'])
+    const midFrames = new Set()
+    for (const it of lbItems || []) {
+      if (!wantTags.has(it.tag) || it.t0 == null || it.t1 == null) continue
+      midFrames.add(Math.max(0, Math.round(((it.t0 + it.t1) / 2) * state.scene.fps)))
+    }
+    const sortedMid = [...midFrames].sort((a, b) => a - b)
+    const stepMid = Math.max(1, Math.ceil(sortedMid.length / 200))
+    for (let i = 0; i < sortedMid.length; i += stepMid) pick.push(sortedMid[i])
     const stride = Math.max(1, Math.ceil(uniq.length / 16))
-    for (let i = 0; i < uniq.length; i += stride) pick.push(uniq[i])
+    for (let i = 0; i < uniq.length; i += stride) if (!pick.includes(uniq[i])) pick.push(uniq[i])
     try { pxFrames = await grabFilmFrames({ file: state.video, frames: pick, size: [540, 960] }) } catch (e) { log('像素采样失败：' + e.message) }
   }
 
