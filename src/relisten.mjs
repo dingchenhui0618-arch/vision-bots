@@ -61,6 +61,11 @@ export const R = {
   maxInsert: 3,
   maxDelete: 2,
   maxDelta: 3,
+  // 一处「重说」（实测「指纹住在」→「专注在」）：整段塌成一个词，字数不必相等。
+  // 上限按词数算而不是字数——中文 whisper 常常一字一词，「指纹住在」就是 3 个词。
+  // 它只能吃整词，落地后还要整句逐字等于音频，否则整处撤回。
+  maxRespeakWords: 3,
+  maxRespeakChars: 4,
   // 静音缝隙后面是停顿：新词尾部补一个逗号，字幕才读得断
   commaGap: 0.30,
   // 文字对齐的最低相似度：低于这个就不认这段是我们要复核的句子
@@ -241,8 +246,13 @@ export async function relistenSentence({ media, span, cacheDir, model = R.model,
       decodes.push({ pad, text, words: ws, cached: !!r.cached })
     }
     if (!decodes.length) return { ok: false, skipped: (lastErr && lastErr.skipped) || 'decode-failed', detail: lastErr && lastErr.detail, model: m }
+    const texts = decodes.map(d => d.text)
     const agree = decodes.every(d => d.text === decodes[0].text) && decodes[0].text.length > 0
-    return { ok: true, agree, decodes, single: decodes.length < R.pads.length }
+    // 两个窗口只差**句外**切进来的一两个字时（实测「圈」被窗口边界带进来、因此两读不同），
+    // 按重叠部分算一致：以最短的那次为准，其余必须包含它，且多出来的字只能贴在两端。
+    const base = texts.slice().sort((x, y) => x.length - y.length)[0] || ''
+    const loose = !agree && base.length >= 2 && texts.every(t => t === base || t.endsWith(base) || t.startsWith(base))
+    return { ok: true, agree, loose, base, decodes, single: decodes.length < R.pads.length }
   }
 
   // 先用强耳朵。装不上（没下模型 / 内存不够起不来）就退到弱耳朵，并且如实标出来是哪一档——
@@ -270,8 +280,8 @@ export async function relistenSentence({ media, span, cacheDir, model = R.model,
   }
   return {
     ok: true, tier: used.tier, model: used.model, compute: used.compute, span,
-    agree: used.agree, single: Boolean(used.single),
-    text: used.agree ? used.decodes[0].text : null,
+    agree: used.agree, single: Boolean(used.single), loose: Boolean(used.loose),
+    text: used.agree ? used.decodes[0].text : (used.loose ? used.base : null),
     decodes: used.decodes.map(d => ({ pad: d.pad, text: d.text, cached: d.cached })),
     words: used.decodes[0].words,
     note: used.tier === 'weak'
@@ -303,9 +313,13 @@ export function charDiff(cur, audio, cfg = R) {
   while (suf < A.length - pre && suf < B.length - pre && A[A.length - 1 - suf] === B[B.length - 1 - suf]) suf++
   const del = A.length - pre - suf
   const ins = B.slice(pre, B.length - suf).join('')
-  if (del > cfg.maxDelete) return { error: '删字 ' + del + ' 个，超过 ' + cfg.maxDelete + ' 个的预算' }
-  if ([...ins].length > cfg.maxInsert) return { error: '加字 ' + [...ins].length + ' 个，超过 ' + cfg.maxInsert + ' 个的预算' }
-  if (del + [...ins].length > cfg.maxDelta) return { error: '一次动 ' + (del + [...ins].length) + ' 个字，超过 ' + cfg.maxDelta + ' 个的预算' }
+  const insN = [...ins].length
+  // 粗口径只拦「一次动太多」的越权改写。能不能落地由 planRepair 按四档分别判：
+  //   等字数替换 / 补字（要落进静音缝隙）/ 删字（只能吃整词）/ 一处重说（整段塌成一个词）。
+  // 以前这里一刀切 del>2 就打回，于是「指纹住在→专注在」这类整句重说永远轮不到音频说话。
+  if (del > cfg.maxRespeakChars) return { error: '删 ' + del + ' 个字，超过听音复核 ' + cfg.maxRespeakChars + ' 个字的预算' }
+  if (insN > cfg.maxInsert) return { error: '加 ' + insN + ' 个字，超过 ' + cfg.maxInsert + ' 个字的预算' }
+  if (del + insN > cfg.maxRespeakChars + cfg.maxInsert) return { error: '一次动 ' + (del + insN) + ' 个字，超过听音复核的预算' }
   return { at: pre, del, ins }
 }
 
@@ -320,9 +334,8 @@ export function planRepair({ ws, diff, gapsOf, cfg = R }) {
   for (const w of ws) bounds.push(bounds[bounds.length - 1] + [...w.core].length)
   const b = bounds.indexOf(diff.at)
   if (b < 0) return { ok: false, why: '改动点切在词的中间（第 ' + diff.at + ' 个字），会把半个词改成别的字' }
-  if (diff.del > 0 && diff.ins) {
+  if (diff.del > 0 && diff.ins && diff.del === [...diff.ins].length) {
     // 等字数替换（捡→卷）：不增不减，所以不需要静音缝隙，但必须整词替换、不拆词
-    if (diff.del !== [...diff.ins].length) return { ok: false, why: '一处改动同时增删且字数不同（删 ' + diff.del + ' 补 ' + [...diff.ins].length + '），v1 不做' }
     const eaten = []
     let left = diff.del
     for (let k = b; k < ws.length && left > 0; k++) {
@@ -341,6 +354,22 @@ export function planRepair({ ws, diff, gapsOf, cfg = R }) {
       return { i: e.i, from: e.core, to }
     })
     return { ok: true, op: 'sub', parts }
+  }
+  if (diff.del > 0 && diff.ins) {
+    // 一处重说（实测「指纹住在」→「专注在」4 字变 3 字）：整段塌成**一个**词。
+    // 它不拆词、不改句子起止（新词起点就是第一个被吃词的起点），也不动句外的任何时间码；
+    // 落地后还必须整句逐字等于音频，否则整处撤回。所以门槛按「吃掉几个词」算，不按字数算。
+    const eaten = []
+    let left = diff.del
+    for (let k = b; k < ws.length && left > 0; k++) {
+      const n = Math.min(left, [...ws[k].core].length)
+      eaten.push({ i: ws[k].i, n, full: n === [...ws[k].core].length, core: ws[k].core })
+      left -= n
+    }
+    if (left > 0) return { ok: false, why: '重说越过了句尾' }
+    if (eaten.some(e => !e.full)) return { ok: false, why: '重说切在词中间，这一档不拆词' }
+    if (eaten.length > (cfg.maxRespeakWords ?? 2)) return { ok: false, why: '重说吃掉 ' + eaten.length + ' 个词，超过 ' + (cfg.maxRespeakWords ?? 2) + ' 个词的预算' }
+    return { ok: true, op: 'respeak', at: b, eaten, ins: diff.ins }
   }
   if (diff.ins) {
     // 加字：新字放在 b 那个词槽的最前面，词槽内的静音缝隙接住它
@@ -368,6 +397,7 @@ export function planRepair({ ws, diff, gapsOf, cfg = R }) {
   }
   if (diff.del > 0) {
     // 删字：从 b 起往后吃掉 del 个字，吃空的词整个删掉，它的时间并给前一个词
+    if (diff.del > cfg.maxDelete) return { ok: false, why: '删字 ' + diff.del + ' 个，超过 ' + cfg.maxDelete + ' 个的预算' }
     let left = diff.del
     const eaten = []
     for (let k = b; k < ws.length && left > 0; k++) {

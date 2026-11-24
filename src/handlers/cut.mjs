@@ -78,6 +78,27 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     if (hints.length) log('质检线索 ' + hints.length + ' 条：' + hints.map(h => '「' + h.quote + '」').join('、') + '（会优先重听这几句）')
   } catch { /* 没有线索文件是常态 */ }
 
+  // 上一轮听音复核**已落地**的几处，重剪时必须重新听一遍。
+  // 为什么：纠错每次从原始转写重跑，而重听的采集预算是有限的、排序还会变——
+  // 实测自测15 第 4 次重剪时「指纹住在→专注在」那一句没被重新选中，修好的字就这么退回去了。
+  // 所以把这些句子记成「带过来的复核点」：不占采集预算，先按音频再确认一次。
+  const carryPath = join(group.dir, 'relisten-carry.json')
+  let carried = []
+  try {
+    const j = JSON.parse(readFileSync(carryPath, 'utf8'))
+    carried = (Array.isArray(j && j.quotes) ? j.quotes : []).filter(q => typeof q === 'string' && q)
+    if (carried.length) log('带过来的复核点 ' + carried.length + ' 处：' + carried.map(q => '「' + q.slice(0, 12) + '」').join('、'))
+  } catch { /* 第一次跑没有这个文件 */ }
+  if (carried.length) {
+    const seen = new Set(hints.map(h => String(h && h.quote || '').replace(/[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu, '')))
+    for (const q of carried) {
+      const k = q.replace(/[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu, '')
+      if (!k || seen.has(k)) continue
+      seen.add(k)
+      hints = [...hints, { quote: q, by: 'relisten-carry' }]
+    }
+  }
+
   const forceFresh = /^(1|true|yes)$/i.test(String(process.env.VISION_BOTS_ASR_FRESH || ''))
   // 有线索时不复用纠错结果：键里没有线索，复用会把新线索吃掉
   const cached = forceFresh || hints.length ? null : readCutCache({ dir: group.dir, input, terms, brief })
@@ -128,6 +149,22 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     })
     // 线索已消费：这次已经重听过，别再让它影响下一次
     if (hints.length) { try { writeFileSync(hintPath, JSON.stringify({ hints: [], consumedAt: new Date().toISOString() }, null, 1), 'utf8') } catch { /* ignore */ } }
+    // 把这一轮耳朵定过的句子记下来，下次重剪照样先听一遍（不然修好的字会退回去）
+    try {
+      const spans = (fix.report && fix.report.relisten && fix.report.relisten.spans) || []
+      const quotes = []
+      for (const s of spans) {
+        if (!(s.applied || s.confirmed)) continue
+        // 两条都记：改完的文字（下一轮正常命中）和改前的文字（万一这一轮没改上，下一轮还能定位）
+        for (const q of [s.text, s.mine]) {
+          const t = String(q || '').slice(0, 24)
+          if (t && !quotes.includes(t)) quotes.push(t)
+        }
+      }
+      // 合并而不是覆盖：上一轮的复核点下一轮还要再确认一次，覆盖会让修好的字过两轮又退回去。
+      const keep = carried.filter(q => !quotes.includes(q))
+      writeFileSync(carryPath, JSON.stringify({ at: new Date().toISOString(), quotes: [...quotes, ...keep].slice(0, 14) }, null, 1), 'utf8')
+    } catch { /* 记账失败不影响出片 */ }
     words = fix.words
     fixReport = fix.report
     // 句子文本也要跟着纠错走，否则大字用的还是错的（字幕改了、片子里没改）

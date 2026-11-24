@@ -154,8 +154,17 @@ export async function adjudicateByAudio({ issues = [], words = [], media = null,
     // 比对口径 = 引用本身（不扩），这样「都在做」的收尾字不会被算成不一致
     const r = await relistenSentence({ media, span: [words[hit.a].start, words[hit.b].end], cacheDir: relistenDir, expect: hit.text, log })
     used++
+    // 听音复核给不出事实（解码没跑成，或两个窗口听的不是同一句）时，这条建议**不能拦交付**：
+    // 「听不出来」不等于「字幕错了」。实测同一部片子跑两轮质检，同一处语义建议一轮拦、一轮不拦，
+    // 差别全在这一次解码像不像——拿这个当交付闸门，闸门就是随机的。
+    // 这处照实写成疑似，报告里带「音频两次不一致、无法定案」，由人决定。
     if (!r.ok || !r.agree) {
-      out.push({ ...it, why: it.why + '（听音复核没跑成：' + (r.skipped || '两次听不一致') + '，这条按原样保留）', audioReview: { ok: false, skipped: r.skipped || 'disagree' } })
+      out.push({
+        ...it,
+        severity: 'warn',
+        why: it.why + '（听音复核' + (r.ok ? '两次听的不是同一句（' + (r.decodes || []).map(d => '「' + d.text + '」').join(' vs ') + '），这一处无法定案' : '没跑成：' + (r.skipped || '未知')) + '，只记录，不拦交付）',
+        audioReview: { ok: false, skipped: r.skipped || 'disagree' },
+      })
       continue
     }
     const cur = hit.text

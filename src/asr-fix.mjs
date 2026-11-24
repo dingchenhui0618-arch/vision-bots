@@ -72,6 +72,27 @@ const DUAL_CAP = 2
 // 删字（ASR 多吐字）全片最多 2 处，同样要有第二个模型逐字同意
 const DEL_CAP = 2
 const isAsciiWord = s => /^[A-Za-z0-9]+$/.test(String(s ?? ''))
+
+/**
+ * 这条改动会不会把一个**分词器认可的整词**切碎。实测踩到：ASR 原判是对的「AI时代」
+ * （「时」置信度只有 0.23），逐词层把它改成同音的「是」，于是交付字幕变成「AI是代」——
+ * 每个字的拼音都对，整句却不成立了。同音规则只看一个字，看不见「时代」是个词。
+ *
+ * 判据用 ICU 分词（和断行用的是同一套）：改前窗口里是一个词、改后变成几个单字，
+ * 就说明改坏了。反方向（把两个单字改成整词，如「画走」→「划走」）永远放行——
+ * 这一层只拦「改碎」，不拦「改对」。
+ */
+export function breaksWord(before, after) {
+  const b = strip(before)
+  const a = strip(after)
+  if (!b || !a) return false
+  try {
+    const seg = s => [...new Intl.Segmenter('zh', { granularity: 'word' }).segment(s)].length
+    return seg(a) > seg(b) && seg(b) < [...b].length
+  } catch {
+    return false
+  }
+}
 // 标点字符集（不带 g，避免 test() 的 lastIndex 状态）
 const PUNCT_CH = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/u
 const KINDS = ['homophone', 'term', 'number', 'near', 'span', 'punct']
@@ -119,11 +140,67 @@ function replaceIn(word, from, to) {
 }
 
 /**
- * 术语表确定性替换：只换词内文本，长度变了就不换（避免字幕回流和字位错位）。
+ * 英文碎片合并：ASR 常把一个专有名词拆成几段（实测「Codex」→「C」+「ode」+「x」，
+ * 其中「ode」的时长为 0；「GPT」→「G」+「PT」）。碎片在字幕里拼起来看着没问题，
+ * 但词级时间码里多出零时长词，逐字跟读和大字挂点都会错位。
+ *
+ * 规则：连续 2–4 个纯英文/数字碎片，拼起来（忽略大小写）正好等于术语表里的词，
+ * 而且这一段里确实有碎片 ASR 自己没把握（p<0.65）或是零时长 → 合成一个词：
+ * 文本用术语表的写法，时间取这一段的起止。字符一个不增不减，变的只是词边界。
+ */
+export function mergeAsciiRuns(words, terms) {
+  const tos = (terms || []).map(t => String(t.to || '')).filter(isAsciiWord)
+  const out = []
+  const hits = []
+  let i = 0
+  while (i < words.length) {
+    const w = words[i]
+    if (!isAsciiWord(strip(w.w))) { out.push(w); i++; continue }
+    let best = null
+    let acc = ''
+    for (let n = 1; n <= 4 && i + n <= words.length; n++) {
+      const seg = words[i + n - 1]
+      const c = strip(seg.w)
+      if (!isAsciiWord(c)) break
+      acc += c
+      const term = tos.find(t => t.toLowerCase() === acc.toLowerCase())
+      if (!term || n < 2) continue
+      const group = words.slice(i, i + n)
+      const weak = group.some(x => (typeof x.p === 'number' && x.p < 0.65) || !(x.end > x.start))
+      if (weak) best = { n, term, group }
+    }
+    if (!best) { out.push(w); i++; continue }
+    const { n, term, group } = best
+    const first = splitAffixes(group[0].w)
+    const lastAf = splitAffixes(group[group.length - 1].w)
+    const merged = {
+      ...group[0],
+      w: first.lead + term + lastAf.trail,
+      start: group[0].start,
+      end: Math.max(group[group.length - 1].end, group[0].end),
+      p: Math.min(...group.map(x => (typeof x.p === 'number' ? x.p : 1))),
+      w0: group[0].w0 || group.map(x => x.w).join(''),
+      fixed: true,
+    }
+    out.push(merged)
+    hits.push({
+      i: out.length - 1, at: +merged.start.toFixed(2), start: merged.start, end: merged.end,
+      from: group.map(x => x.w).join(''), to: term,
+      kind: 'term', why: '术语表命中（英文碎片合并）', verified: '术语表命中（' + n + ' 段合成一个词）', merged: n,
+    })
+    i += n
+  }
+  return { words: out, hits, delta: out.length - words.length }
+}
+
+/**
+ * 术语表确定性替换：只换词内文本，中文字数变了就不换（避免字幕回流和字位错位）。
+ * 纯拉丁词例外（Cloud→Claude）：一个词就是一个词槽，字母数不占音节，见下面的 latin 分支。
  */
 export function applyTerms(words, terms) {
-  const out = words.map(w => ({ ...w }))
-  const hits = []
+  const seeded = mergeAsciiRuns(words, terms)
+  const out = seeded.words.map(w => ({ ...w }))
+  const hits = [...seeded.hits]
   const skipped = []
   for (const t of terms) {
     for (const from of t.from) {
@@ -143,19 +220,26 @@ export function applyTerms(words, terms) {
           skipped.push({ i, at: +w.start.toFixed(2), from, to: t.to, why: '识别置信度够高，术语表不覆盖' })
           continue
         }
-        if (strip(r.text).length !== strip(w.w).length) {
+        // 中文字幕的「等字数」是因为一字一个音节、字数决定字幕卡会不会撑破；
+        // 拉丁词不是这样：一个词就是一个词槽，字母多一个不占时间（实测 Cloud→Claude
+        // 被这条规则拦了整整三轮，最后只能靠模型提案，而模型提不提是随机的）。
+        // 所以纯拉丁词允许 ±2 个字母，但只在 from/to 都是纯拉丁时放开。
+        const latin = isAsciiWord(strip(from)) && isAsciiWord(strip(r.text)) && isAsciiWord(strip(w.w)) &&
+          Math.abs(strip(r.text).length - strip(w.w).length) <= 2
+        if (strip(r.text).length !== strip(w.w).length && !latin) {
           skipped.push({ i, at: +w.start.toFixed(2), from, to: t.to, why: '字数不一致，会撑破字幕卡' })
           continue
         }
         out[i] = { ...w, w: r.text, w0: w.w0 || w.w, fixed: true }
         hits.push({
-          i, at: +w.start.toFixed(2), from, to: t.to, kind: t.kind || 'term', why: '术语表命中',
-          verified: t.next ? `术语表命中（后接「${[].concat(t.next).join('/')}」）` : '术语表命中',
+          i, at: +w.start.toFixed(2), from, to: t.to, kind: t.kind || 'term', latin: latin || undefined,
+          why: latin ? '术语表命中（拉丁词按词槽走，字母数不占音节）' : '术语表命中',
+          verified: t.next ? `术语表命中（后接「${[].concat(t.next).join('/')}」）` : (latin ? '术语表命中（拉丁词）' : '术语表命中'),
         })
       }
     }
   }
-  return { words: out, hits, skipped }
+  return { words: out, hits, skipped, merged: seeded.hits, delta: seeded.delta }
 }
 
 /** 拼音原始查询，一次批量。返回 {ok, items} 或 null。 */
@@ -411,6 +495,15 @@ export async function validateSpans(proposals, words, view, { skip = new Set(), 
       if (a && b && a.py === b.py) verified = '整段同音：' + a.py + ' 逐字一致'
     }
     if (!verified && terms.length && terms.some(t => t.to === x.to || (isAsciiWord(t.to) && isAsciiWord(x.to) && String(t.to).toLowerCase() === x.to.toLowerCase()))) verified = '命中术语表：' + x.to
+    // 整段同音同样要过「别把词切碎」：一个字对不代表这个词还成立。
+    if (verified && /同音/.test(verified)) {
+      const L = x.a > 0 ? x.v.ws[x.a - 1].core : ''
+      const R = x.b < x.v.ws.length - 1 ? x.v.ws[x.b + 1].core : ''
+      if (breaksWord(L + x.from + R, L + x.to + R)) {
+        rejected.push({ s: x.s, from: x.from, to: x.to, why: '改完会把「' + strip(L + x.from + R) + '」这个词切碎（分词后变成几个单字），同音不等于这句成立' })
+        continue
+      }
+    }
     // 双模型一致：这是「语义型」唯一的证据档。它比低置信推断强、比同音弱，
     // 所以既要两条独立事实，也要单独配额（全片最多 dualCap 处）。
     const dk = x.s + '|' + x.from + '|' + x.to
@@ -589,6 +682,8 @@ export async function validate(proposals, words, { terms, pinyin }) {
     if (touched) { rejected.push({ i, from: w.w, to, why: '这一段里有词已被术语表或整句纠错改过' }); continue }
     const span = applySpan(words, i, n, to, { latinOk: kind === 'term' })
     if (span.error) { rejected.push({ i, from: w.w, to, why: span.error }); continue }
+    // 同音/近音只看一个词，看不见「这个词和旁边是一个词」。改碎的判定放在印证之后（见 accepted 前），
+    // 免得把「拼音根本不同」这类更硬的原因盖掉。
     if (span.text === span.cores.join('')) { rejected.push({ i, from: w.w, to, why: '改完和原来一样' }); continue }
     if (kind === 'term' && n > 1) { rejected.push({ i, from: w.w, to, why: '专有名词改动不许跨词' }); continue }
     if (kind === 'number') {
@@ -622,6 +717,15 @@ export async function validate(proposals, words, { terms, pinyin }) {
   }
 
   let nearUsed = 0
+  // 改碎判据：窗口 = 前一个词 + 这一段 + 后一个词，改前是一个整词、改后变成几个单字就是改坏了。
+  const wordBreak = (x) => {
+    const L = words[x.i - 1] ? splitAffixes(words[x.i - 1].w).core : ''
+    const R = words[x.i + x.n] ? splitAffixes(words[x.i + x.n].w).core : ''
+    const b = L + x.span.cores.join('') + R
+    const a = L + x.span.text + R
+    if (!breaksWord(b, a)) return null
+    return '改完会把「' + strip(b) + '」这个词切碎（' + strip(b) + ' → ' + strip(a) + '），同音不等于这句成立'
+  }
   for (const x of pairs) {
     if (accepted.length >= cap) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '超过本轮上限 ' + cap + ' 处' }); continue }
     // 同一个词位只认第一条：seen 在上一轮建候选时还没填，必须在这儿再拦一次，
@@ -640,6 +744,8 @@ export async function validate(proposals, words, { terms, pinyin }) {
       const b = vals[k + 1]
       if (!a || !b) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '拼音查不到，无法验证同音' }); continue }
       if (a.py !== b.py) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '不同音：' + a.py + ' vs ' + b.py }); continue }
+      const wb = wordBreak(x)
+      if (wb) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: wb }); continue }
       accepted.push({ ...base, verified: '拼音 ' + a.py + ' 一致' })
     } else if (x.kind === 'near') {
       if (!pyOk || !vals) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '本机没有拼音校验，保守模式不采纳近音改动' }); continue }
@@ -655,6 +761,8 @@ export async function validate(proposals, words, { terms, pinyin }) {
       if (a.ini.join('|') === b.ini.join('|')) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '声母也一致但不同音，无法自证' }); continue }
       const wit = nearWitness(words, x.i, x.n)
       if (!wit) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '近音要有独立证据：前后 ' + NEAR_WINDOW + ' 个词里没有低置信词' }); continue }
+      const wbn = wordBreak(x)
+      if (wbn) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: wbn }); continue }
       nearUsed++
       accepted.push({
         ...base,
@@ -707,6 +815,7 @@ export function lowConfidenceClusters(view, cfg = RELISTEN) {
  */
 async function relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords = '', hints = [], log }) {
   const base = { model: RELISTEN.model, ran: true, candidates: 0, spans: [], applied: 0 }
+  const startLen = current.length
   const off = (why, detail) => ({ current, section: { ...base, ran: false, why, detail: detail || null }, ranges: [], confirmed: [], delta: 0 })
   if (!relistenEnabled()) return off('disabled', 'VISION_BOTS_RELISTEN=0')
   if (!relistenModel(RELISTEN.model)) {
@@ -730,23 +839,33 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
     for (let i = 0; i < current.length; i++) {
       for (const ch of splitAffixes(current[i].w).core) { s += ch; owner.push(i) }
     }
-    const at = s.indexOf(q)
-    if (at < 0) return null
-    const a = owner[at]
-    const b = owner[at + q.length - 1]
-    if (a === undefined || b === undefined) return null
-    return { a, b }
+    const locate = (sub) => {
+      const at = s.indexOf(sub)
+      if (at < 0) return null
+      const a = owner[at]
+      const b = owner[at + sub.length - 1]
+      if (a === undefined || b === undefined) return null
+      return { a, b }
+    }
+    // 先按整条找；找不到就逐字收窄两头。质检线索引用的是**交付字幕**里的那句话，
+    // 与当前词表可能差一两个字（实测线索「AI是带最赚钱的不是技术」而词表已是「AI时代…」），
+    // 整条找不到就白写了一条线索。收到 4 字还找不到才算没这句。
+    const tries = [q]
+    for (let k = 1; k <= 2 && q.length - k >= 4; k++) tries.push(q.slice(k), q.slice(0, q.length - k))
+    for (const t of tries) { const hit = locate(t); if (hit) return { ...hit, approx: t !== q } }
+    return null
   }
 
   // 质检报出来「音频与字幕不一致」的地方排最前：那是上一轮跑完质检留下的线索，
   // 剪辑返工时第一件该做的事就是把它听清楚（不靠猜，靠重听）。
-  const cands = []
+  const hintCands = []
+  const auditCands = []
   const seen = new Set()
   for (const h of hints || []) {
     const q = strip(h && h.quote)
     if (!q || seen.has(q)) continue
     seen.add(q)
-    cands.push({ text: q, hint: h, lowN: 0, minP: 1, slot: null })
+    hintCands.push({ text: q, hint: h, lowN: 0, minP: 1, slot: null })
   }
   for (const v of sentenceView(current, segments)) {
     if (seen.has(v.text)) continue
@@ -762,15 +881,21 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       if (an.anomaly && (!slot || an.ratio > slot.ratio)) slot = { ratio: an.ratio, i: w.i, gap: an.gap }
     }
     if (!lowConfidenceClusters(v).length && !slot) continue
-    cands.push({ text: v.text, lowN, minP, slot })
+    auditCands.push({ text: v.text, lowN, minP, slot })
   }
-  // 排序：质检线索最优先，其次看词槽有没有吞字的迹象，再看低置信词多不多
-  cands.sort((a, b) => (Number(Boolean(b.hint)) - Number(Boolean(a.hint))) || (b.slot ? b.slot.ratio : 0) - (a.slot ? a.slot.ratio : 0) || b.lowN - a.lowN || a.minP - b.minP)
+  // 采集顺序：先看词槽有没有吞字的迹象，再看低置信词多不多
+  auditCands.sort((a, b) => (b.slot ? b.slot.ratio : 0) - (a.slot ? a.slot.ratio : 0) || b.lowN - a.lowN || a.minP - b.minP)
+  // 质检线索**不占**采集预算。以前线索和采集共用 maxSpans：上一轮 17 句待查只听了 5 句，
+  // 其中 3 句是线索，真正的错句（25.4s「指纹住在」）排在后面，一次都没轮到听过。
+  // 线索是上一轮质检实测出来的疑点，必须听；预算只在「ASR 自己卡过」的句子里挑。
+  const pickedCands = [...hintCands, ...auditCands.slice(0, RELISTEN.maxSpans)]
   const section = {
-    ...base, candidates: cands.length,
-    picked: cands.slice(0, RELISTEN.maxSpans).map(c => ({ text: c.text.slice(0, 16), hint: Boolean(c.hint), slot: c.slot ? c.slot.ratio : null, low: c.lowN })),
+    ...base, candidates: hintCands.length + auditCands.length, hints: hintCands.length,
+    notListened: Math.max(0, auditCands.length - RELISTEN.maxSpans),
+    notListenedTexts: auditCands.slice(RELISTEN.maxSpans, RELISTEN.maxSpans + 3).map(c => c.text.slice(0, 14)),
+    picked: pickedCands.map(c => ({ text: c.text.slice(0, 16), hint: Boolean(c.hint), slot: c.slot ? c.slot.ratio : null, low: c.lowN })),
   }
-  if (!cands.length) {
+  if (!pickedCands.length) {
     return off('nothing-suspicious', '既没有质检线索，也没有扎堆的低置信词（4 个词里 ≥2 个 p<' + RELISTEN.lowP + '）或吞了静音的词槽，没有值得重听的地方')
   }
 
@@ -781,7 +906,7 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
     log('听音复核：' + span.join('–') + 's 音频是「' + r.text + '」、字幕是「' + v.text + '」，但' + why + '，不改')
   }
 
-  for (const cand of cands.slice(0, RELISTEN.maxSpans)) {
+  for (const cand of pickedCands) {
     const rg = findRange(cand.text)
     if (!rg) { section.spans.push({ skipped: 'not-found', quote: cand.text.slice(0, 24) }); continue }
     const v = { ws: [], text: '' }
@@ -796,7 +921,7 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       log('听音复核：' + span.join('–') + 's 没听成（' + r.skipped + '），这条不改')
       continue
     }
-    if (!r.agree) {
+    if (!r.agree && !r.loose) {
       section.spans.push({ span, agree: false, decodes: r.decodes })
       log('听音复核：' + span.join('–') + 's 两次听的不一致（' + (r.decodes || []).map(d => '「' + d.text + '」').join(' vs ') + '），不算证据')
       continue
@@ -841,6 +966,16 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
         const af = splitAffixes(w.w)
         return { ...w, w: af.lead + hp.to + af.trail, fixed: true, src: 'relisten' }
       })
+    } else if (rep.op === 'respeak') {
+      // 一处重说：吃掉整词、合成一个词，占这一段的起止（句子起点因此不动）
+      const ids = rep.eaten.map(e => e.i).sort((x, y) => x - y)
+      const a = ids[0]
+      const z = ids[ids.length - 1]
+      if (z - a + 1 !== ids.length) { reject(span, r, v, '重说吃掉的词不连续'); continue }
+      const p = Math.min(...ids.map(i => (typeof current[i].p === 'number' ? current[i].p : 1)))
+      const nw = { w: rep.ins, start: current[a].start, end: current[z].end, p, fixed: true, src: 'relisten' }
+      next = [...current.slice(0, a), nw, ...current.slice(z + 1)]
+      if (a === 0 && next[0] && Math.abs(next[0].start - current[0].start) > 1e-6) { reject(span, r, v, '重说挪动了句子起点'); continue }
     } else if (rep.op === 'delete') {
       if (rep.eaten.some(e => !e.full)) { reject(span, r, v, '删字切在词中间，v1 不拆词'); continue }
       const ids = new Set(rep.eaten.map(e => e.i))
@@ -874,7 +1009,7 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
     ranges.push([Math.min(t0, widen) - 1e-6, t1 + 1e-6])
     section.applied += 1
     section.spans.push({
-      span, agree: true, text: r.text, mine: v.text, applied: true, op: rep.op,
+      span, agree: true, loose: r.loose || undefined, text: r.text, mine: v.text, applied: true, op: rep.op,
       tier: r.tier, model: r.model,
       added: rep.op === 'insert' ? rep.newWord.w : null,
       gap: rep.gap || null,
@@ -885,9 +1020,11 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
         ? '（补「' + rep.newWord.w + '」，放进 ' + rep.gap[0] + '–' + rep.gap[1] + 's 的静音缝隙）'
         : rep.op === 'sub'
           ? '（把「' + rep.parts.map(x => x.from).join('') + '」改成「' + rep.parts.map(x => x.to).join('') + '」，时间码不动）'
-          : '（删 ' + rep.eaten.length + ' 个词）') + '；两次听一致（强耳朵 ' + r.model + '，两个窗口）')
+          : rep.op === 'respeak'
+            ? '（「' + rep.eaten.map(e => e.core).join('') + '」整段重说成「' + rep.ins + '」，合成一个词、时间码不动）'
+            : '（删 ' + rep.eaten.length + ' 个词）') + '；两次听一致（强耳朵 ' + r.model + '，两个窗口）')
   }
-  section.delta = current.length - words.length
+  section.delta = current.length - startLen
   section.confirmedSpans = confirmed.length
   return { current, section, ranges, confirmed, delta: section.delta }
 }
@@ -904,7 +1041,7 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     at: new Date().toISOString(),
     hotwords: hotwordPrompt(terms),
     termSources: terms.sources || [],
-    glossary: { applied: g.hits, skipped: g.skipped },
+    glossary: { applied: g.hits, skipped: g.skipped, merged: (g.merged || []).length, wordCountDelta: g.delta || 0 },
     model: null,
     sentence: null,
     review: null,
@@ -1119,12 +1256,17 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
   //   · 改动那句**外面**的词，起止一个字节都不许动（原来要求全片逐词相等；
   //     听音复核补字会在这句里插词，全片相等就不再成立，所以按句子划界）；
   //   · 词数的变化必须正好等于听音复核插/删的词数，多一个少一个都算越权。
-  const inRange = w => aud.ranges.some(r => w.start >= r[0] && w.end <= r[1] + 1e-6)
+  // 英文碎片合并也改变了词边界（3 个词变 1 个），它占的那段时间同样算「允许变动」，
+  // 但只限那一段：合并之外的词，起止仍然一个字节都不许动。
+  const mergeRanges = (g.merged || []).map(h => [h.start - 1e-6, h.end + 1e-6])
+  const inRange = w => aud.ranges.some(r => w.start >= r[0] && w.end <= r[1] + 1e-6) ||
+    mergeRanges.some(r => w.start >= r[0] && w.end <= r[1])
   const slice = arr => JSON.stringify(arr.filter(w => !inRange(w)).map(w => [+w.start.toFixed(3), +w.end.toFixed(3)]))
   report.assertion = {
-    wordCount: current.length === words.length + (aud.delta || 0),
+    wordCount: current.length === words.length + (aud.delta || 0) + (g.delta || 0),
     timingUntouched: slice(words) === slice(current),
     audioRepairs: aud.section.applied,
+    mergeDelta: g.delta || 0,
     wordCountDelta: current.length - words.length,
   }
   if (!report.assertion.wordCount || !report.assertion.timingUntouched) {
@@ -1135,7 +1277,7 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     for (let i = 0; i < Math.min(outA.length, outB.length) && bad.length < 5; i++) {
       if (outA[i].start !== outB[i].start || outA[i].end !== outB[i].end) bad.push({ i, a: [outA[i].start, outA[i].end, outA[i].w], b: [outB[i].start, outB[i].end, outB[i].w] })
     }
-    report.assertion.detail = { ranges: aud.ranges, outA: outA.length, outB: outB.length, bad }
+    report.assertion.detail = { ranges: aud.ranges, mergeRanges, outA: outA.length, outB: outB.length, bad }
     throw new Error('纠错层动了时间码或词数，已中止（这是硬约束）：' + JSON.stringify(report.assertion))
   }
   report.stats = {

@@ -20,7 +20,7 @@
     { "kind": "term", "to": "视频号", "from": ["视频好", "是频号"] },
     { "kind": "term", "to": "小红书", "from": ["小虹书", "小红熟"] },
     { "kind": "term", "to": "GPT", "from": [] },
-    { "kind": "term", "to": "Claude", "from": [] },
+    { "kind": "term", "to": "Claude", "from": ["Cloud"], "onlyIfLowConfidence": true },
     { "kind": "term", "to": "Codex", "from": [] },
     { "kind": "term", "to": "OpenAI", "from": [] },
     { "kind": "term", "to": "DeepSeek", "from": [] },

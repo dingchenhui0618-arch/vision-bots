@@ -513,8 +513,11 @@ export async function createFilm({ media }) {
     // 满幅页的大字底边也在 0.775h、往上长，卡按原来的位置画就是字压字
     // （自测14 质检抓到 7 帧「big × block:check」重叠 36226px²）。有大字就让到大字上面去：
     // 参考片里图形块本来就在大字上方，卡在大字下面反而挤掉胸口那一片。
+    // 这条对**所有**版式都成立：小窗页的卡原来只在满幅页避让大字，
+    // 实测竖框页（frame）上大字也在下半区，卡落在 1484–1568px 正好压字
+    // （自测15 质检抓到 7 帧「big × block:check」11052px²）。有大字就一律让到大字上方。
     const bigNow = (S.bigs || []).find(b2 => t >= b2.f0 && t < b2.f1)
-    if (bigNow && shot.kind === 'full') {
+    if (bigNow) {
       const bl = bigNow.lines && bigNow.lines.length ? bigNow.lines : [bigNow.text]
       const bTop = h * 0.775 - bl.length * fitBigSize(bl) * (BGL.lineGap || 1.06)
       yBase = Math.max(h * 0.30, bTop - 22)

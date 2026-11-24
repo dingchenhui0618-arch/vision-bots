@@ -101,13 +101,20 @@ export async function runQc({ group, job, log, artifact, brief, state, narrate =
     // 两类都要进线索：①音频与字幕不一致（听错了）；②模型给了逐字改法但过不了逐词校验的
     // （「AI是带」→「AI时代」：两字都同音，只是跨了词，四遍纠错的逐词规则改不了）。
     // 线索只负责「把这几句重听一遍」，改不改由听音复核的证据说了算。
+    // 字数不一样的建议同样要写成线索：以前只收「等字数」的（因为四遍纠错只能等字数替换），
+    // 于是「指纹住在→真正在做」这类字数变了、又确实可能听错的句子，从来不会被重听。
+    // 线索只负责「把这句重听一遍」，能不能改由音频证据说了算——所以字数是不是一样不该是门槛。
     const diffs = (semantic.issues || []).filter(i =>
       (i.audioReview && i.audioReview.text && i.audioReview.tier === 'strong' && i.audioReview.contradicted === false) ||
-      (i.to && i.quote && String(i.to).length === String(i.quote).length))
+      (i.to && i.quote)).slice(0, 8)
+    report.hintWrite = { issues: (semantic.issues || []).length, hints: diffs.length, quotes: diffs.map(i => String(i.quote || '').slice(0, 20)) }
+    log('质检线索：语义层 ' + (semantic.issues || []).length + ' 条疑似，其中 ' + diffs.length + ' 条值得重听')
     if (diffs.length) {
       writeFileSync(join(group.dir, 'revise-hints.json'), JSON.stringify({
         at: new Date().toISOString(),
-        hints: diffs.map(i => ({ quote: i.quote, audio: i.audioReview.text, at: i.at })),
+        // 线索可能只是模型给的一条改法（没有听音信息），所以 audioReview 必须容错——
+        // 原来这里无条件下标 .text，一遇到纯语义线索就抛异常，线索一条都写不出去（静默失败）。
+        hints: diffs.map(i => ({ quote: i.quote, audio: (i.audioReview && i.audioReview.text) || null, at: i.at })),
       }, null, 1), 'utf8')
       log('质检线索：' + diffs.length + ' 处音频与字幕不一致，已写成返工线索（下次剪辑优先重听）')
     }

@@ -10,6 +10,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ff } from '../src/ffmpeg.mjs'
 import { qa, BAR, TARGET_TOLERANCE } from '../src/qa.mjs'
+import { adjudicateByAudio } from '../src/qa-semantic.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -148,6 +149,19 @@ console.log('\n[10] 门槛常量与容差')
   ok(BAR.confidence === 0.08, '低置信上限 8%')
   ok(TARGET_TOLERANCE === 0.12, '目标时长容差 12%')
   ok(BAR.zone.bodyTop === 0.56, '文字只在下半区（56% 以下）')
+}
+
+console.log('\n[11] 听不出来 ≠ 字幕错了')
+{
+  // 没有素材就不动结论（保持原状）：这一条保证「仲裁层不跑」不会被当成放行
+  const keep = await adjudicateByAudio({ issues: [{ severity: 'block', kind: 'homophone', quote: '甲', to: '乙' }], words: [{ w: '甲', start: 0, end: 0.3 }], media: null })
+  ok(keep[0].severity === 'block', '没有素材时结论不变（不会静默放行）')
+  // 语义建议但没给改法 → 只记录（实测连跑四轮报了四句不同的「语句不通」）
+  const noFix = await adjudicateByAudio({ issues: [{ severity: 'block', kind: 'semantic', quote: '一句', to: null }], words: [{ w: '一句', start: 0, end: 0.3 }], media: 'x.mp4' })
+  ok(noFix[0].severity === 'warn' && /没给具体改法/.test(String(noFix[0].why)), '没给改法的「语句不通」只记录')
+  // 建议与原文一字不差 → 等于没改
+  const same = await adjudicateByAudio({ issues: [{ severity: 'block', kind: 'homophone', quote: '甲乙', to: '甲乙' }], words: [{ w: '甲', start: 0, end: 0.3 }], media: 'x.mp4' })
+  ok(same[0].severity === 'warn' && /一字不差/.test(String(same[0].why)), '建议与原文相同的只记录')
 }
 
 console.log('\n' + (fail ? 'FAIL ' : 'PASS ') + pass + ' 条通过 / ' + fail + ' 条失败')

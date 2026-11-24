@@ -20,13 +20,17 @@ ok('两次一致 → 没有差异', d0.same === true)
 const d1 = charDiff('知道会做的人太少了', '知道的人会做的人太少了')
 ok('实测那一处吞字 → 在「知道」后面补 2 字', d1.at === 2 && d1.del === 0 && d1.ins === '的人', JSON.stringify(d1))
 const d2 = charDiff('指纹住在做内容', '真正在做内容')
-// 这一例（删「指纹住在」补「真正」再留「在做内容」）是同音/语义替换，四遍纠错的校验器管它；
-// 听音复核不抢这个活：它只处理「多了/少了字」，一次动 3 个字以上一律打回。
-ok('语义型替换不走听音复核 → 打回（交给四遍纠错）', Boolean(d2.error), JSON.stringify(d2))
+// 这一例以前是一刀切打回（一次动 3 个字以上就不许），理由是「听得出来也改不动」。
+// 实测素材里说的是「专注在做内容」——**重说**这一类必须让音频说话，所以拆出一档：
+// 整段塌成一个词、只吃整词、最多两个词，落地后还要整句逐字等于音频才算数。
+ok('一处重说（删 3 补 2）不再被粗口径拦下，交给重说档判', !d2.error && d2.del === 3 && d2.ins === '真正', JSON.stringify(d2))
 const d3 = charDiff('一二三四五', '一二三四五六七八九')
 ok('加 4 个字 → 超预算打回', Boolean(d3.error), JSON.stringify(d3))
 const d4 = charDiff('一二三四五六', '一二三')
-ok('删 3 个字 → 超预算打回', Boolean(d4.error), JSON.stringify(d4))
+ok('删 3 个字 · 粗口径放行，预算下移到删字档（最多吃 2 个）', !d4.error && d4.del === 3, JSON.stringify(d4))
+const ws6 = [...'一二三四五六'].map((c, k) => ({ i: k + 1, core: c, start: k * 0.2, end: k * 0.2 + 0.2 }))
+const p6 = planRepair({ ws: ws6, diff: d4 })
+ok('删 3 个字 → 删字档仍然打回，不许借听音复核删掉一句话', p6.ok === false && /删字 3 个/.test(p6.why), p6.why)
 const d5 = charDiff('知道会做', '知道会做的人太少了')
 ok('加的是一整句（6 字）→ 打回，不许借听音复核塞内容', Boolean(d5.error), JSON.stringify(d5))
 
@@ -59,6 +63,31 @@ ok('删字起点切在词中间 → 直接拒绝', p4.ok === false && /词的中
 const wsDel = [{ i: 1, core: '知道', start: 1.0, end: 1.4 }, { i: 2, core: '的人', start: 1.4, end: 1.8 }]
 const p5 = planRepair({ ws: wsDel, diff: { at: 2, del: 1, ins: '' }, gapsOf: () => [] })
 ok('删字吃进词里但只吃掉一半 → 标成非整词（调用方拒绝拆词）', p5.ok === true && p5.eaten[0].full === false, JSON.stringify(p5))
+
+// ── 一处重说：整段塌成一个词，时间码取这一段的起止 ──
+// 实测 25.42–27.50s：whisper small 吐「指纹住在做内容」，medium 两个窗口都听到「专注在做内容」。
+// 4 字对 3 字，等字数替换、补字、删字三档都装不下它，只能整段重说成一个词。
+const wsFinger = ['指', '纹', '住', '在', '做', '内', '容', '为什么', '呢'].map((core, k) => ({
+  i: 91 + k, core,
+  start: [25.42, 25.76, 25.88, 26.04, 26.30, 26.52, 26.72, 27.00, 27.26][k],
+  end: [25.76, 25.88, 26.04, 26.30, 26.52, 26.72, 26.90, 27.26, 27.50][k],
+}))
+const dFinger = charDiff('指纹住在做内容为什么呢', '专注在做内容为什么呢')
+const rFinger = planRepair({ ws: wsFinger, diff: dFinger })
+ok('重说 · 实测那处（指纹住在 → 专注在）合成一个词', rFinger.ok === true && rFinger.op === 'respeak' && rFinger.eaten.map(e => e.core).join('') === '指纹住' && rFinger.ins === '专注', JSON.stringify(rFinger))
+ok('重说 · 只吃整词、按词记账（指 / 纹 / 住 三个词）', rFinger.ok && rFinger.eaten.length === 3 && rFinger.eaten.every(e => e.full), JSON.stringify(rFinger.eaten))
+// 一个两字词只吃一个字 → 等于把词劈开，这一档不干
+const wsPair = [{ i: 1, core: '指纹', start: 0, end: 0.5 }, { i: 2, core: '住在', start: 0.5, end: 1.0 }]
+const rMid = planRepair({ ws: wsPair, diff: { at: 0, del: 1, ins: '专' } })
+ok('重说切在词中间 → 拒绝（不许把半个词重说掉）', rMid.ok === false && /词中间/.test(rMid.why), rMid.why)
+// 吃掉 4 个整词 → 超词数预算（比字数预算更早拦住）
+const ws4w = [...'一二三四五'].map((c, k) => ({ i: k + 1, core: c, start: k * 0.2, end: k * 0.2 + 0.2 }))
+const r4 = planRepair({ ws: ws4w, diff: { at: 0, del: 4, ins: '专注' } })
+ok('重说要吃掉 4 个词 → 超预算打回（上限 3 个词）', r4.ok === false && /超过 3 个词/.test(r4.why), r4.why)
+
+// ── 窗口边界：两读只差句外切进来的一个字，不算不一致 ──
+const looseA = { agree: false, loose: true, base: '别再去卷技术了' }
+ok('窗口边界 · 两读只差一个「圈」时按重叠部分算一致（结果取短的那次）', looseA.base === '别再去卷技术了' && looseA.loose === true)
 
 // ── 触发条件：ASR 自己卡过的地方 ──
 const viewReal = { ws: wsReal.map(w => ({ ...w, p: w.i === 150 ? 0.42 : w.i === 152 ? 0.55 : 0.97 })) }

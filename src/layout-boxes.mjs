@@ -99,10 +99,9 @@ export function layoutBoxes({ scene, template }) {
       const sk = shotAt(b.f0).kind
       if (b.kind === 'check') {
         let yb = sk === 'corner' ? h * 0.50 : sk === 'frame' ? h * 0.86 : h * 0.775
-        if (sk === 'full') {
-          const top = bigLineTopAt(b.f0)
-          if (top !== null) yb = Math.max(h * 0.30, top - 22)
-        }
+        // 对**所有**版式都让开大字（自测15：竖框页上大字也在下半区，卡 1484–1568px 压字）
+        const top = bigLineTopAt(b.f0)
+        if (top !== null) yb = Math.max(h * 0.30, top - 22)
         // 卡底不许越过字幕顶（和 film.js 的 checkCard 同一口径）
         const subPh = Math.round((TY.sub || 42) * 1.28 + SUB2.padY * 2)
         yb = Math.min(yb, h - SUB2.bottom - subPh - 12)

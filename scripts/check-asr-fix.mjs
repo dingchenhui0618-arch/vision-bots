@@ -2,7 +2,7 @@
  * 错字治理的自检：术语表、模型提案的校验器、句子回流、硬断言。
  * 模型提案用固定样本喂进来，不联网；拼音校验在本机有 uv 时额外验一遍。
  */
-import { applyTerms, applyToSegments, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, loadTerms, LEN_NUDGE } from '../src/asr-fix.mjs'
+import { applyTerms, applyToSegments, mergeAsciiRuns, breaksWord, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, loadTerms, LEN_NUDGE } from '../src/asr-fix.mjs'
 
 let pass = 0
 const fails = []
@@ -244,6 +244,38 @@ const M1 = await validateSpans([{ s: 1, from: '花一千的时间', to: '花一�
 ok('变更映射 · 只记真正改掉的字（千→天）', M1.rejected[0] && JSON.stringify(M1.rejected[0].map) === JSON.stringify([[4, '天']]), JSON.stringify(M1.rejected[0] && M1.rejected[0].map))
 const M2 = await validateSpans([{ s: 1, from: '一千', to: '一天' }], mw, mv, {})
 ok('变更映射 · 粒度更小的同一条改法映射相同', M2.rejected[0] && JSON.stringify(M2.rejected[0].map) === JSON.stringify([[4, '天']]), JSON.stringify(M2.rejected[0] && M2.rejected[0].map))
+
+// ── 17. 英文碎片合并与拉丁词放宽：ASR 把专有名词拆碎、拼错，靠术语表兜住 ──
+// 实测同一句「大家用GPT用Cloud用Codex这些工具」：GPT 被拆成「G」+「PT」，
+// Codex 被拆成「C」+「ode」+「x」（「ode」时长为 0），Cloud 拼错（p=0.21）。
+// 中文那套「等字数」在这里全都不适用：英文一个词就是一个词槽，字母数不占音节。
+const ascii = [W('C', 33.72, 0.88), W('ode', 33.92, 0.18), W('x', 34.14, 0.77)]
+const mg = mergeAsciiRuns(ascii, [{ to: 'Codex' }, { to: 'GPT' }])
+ok('英文碎片 · C+ode+x 合成一个 Codex', mg.words.length === 1 && mg.words[0].w === 'Codex', JSON.stringify(mg.words))
+ok('英文碎片 · 时间取这一段的起止（34.14 之后仍有长度）', mg.words[0].start === 33.72 && mg.words[0].end === 34.46, JSON.stringify(mg.words[0]))
+ok('英文碎片 · 净词数变化如实记账（3→1）', mg.delta === -2 && mg.hits.length === 1, mg.delta)
+const mg2 = mergeAsciiRuns([W('G', 31.28, 0.42), W('PT', 31.56, 0.97)], [{ to: 'GPT' }])
+ok('英文碎片 · G+PT 合成 GPT', mg2.words.length === 1 && mg2.words[0].w === 'GPT', JSON.stringify(mg2.words))
+ok('英文碎片 · 拼起来不是术语表里的词就不并', mergeAsciiRuns(ascii, [{ to: 'Claude' }]).words.length === 3)
+ok('英文碎片 · 两个词都很有把握、时长也正常 → 不并', mergeAsciiRuns([W('AI', 0, 0.98), W('GPT', 0.32, 0.99)], [{ to: 'AIGPT' }]).words.length === 2)
+const lt = applyTerms([W('Cloud', 32.54, 0.21)], [{ from: ['Cloud'], to: 'Claude', kind: 'term', onlyIfLowConfidence: true }])
+ok('拉丁词 · 低置信的 Cloud → Claude（多一个字母不占音节）', lt.words[0].w === 'Claude' && lt.hits.length === 1 && lt.hits[0].latin === true, JSON.stringify(lt.hits))
+ok('拉丁词 · 时间码一个字都不动', lt.words[0].start === 32.54 && lt.words[0].end === 32.86, JSON.stringify(lt.words[0]))
+const lt2 = applyTerms([W('Cloud', 32.54, 0.96)], [{ from: ['Cloud'], to: 'Claude', kind: 'term', onlyIfLowConfidence: true }])
+ok('拉丁词 · 识别得够准就不覆盖（真说「云」的时候不许改）', lt2.words[0].w === 'Cloud' && lt2.skipped.length === 1, JSON.stringify(lt2.skipped))
+const lt3 = applyTerms([W('视频', 0, 0.5)], [{ from: ['视频'], to: '短视频', kind: 'term' }])
+ok('中文 · 仍然不许改字数（会撑破字幕卡）', lt3.words[0].w === '视频' && /字数不一致/.test(lt3.skipped[0].why), JSON.stringify(lt3.skipped))
+
+// ── 18. 别把词改碎：同音只看一个字，看不见「时代」是个词 ──
+ok('分词 · AI时代 → AI是代 就是改碎', breaksWord('AI时代', 'AI是代') === true)
+ok('分词 · 画走 → 划走 是把碎字改整，放行', breaksWord('画走', '划走') === false)
+ok('分词 · 直到 → 知道 两边都是整词，放行', breaksWord('直到会做', '知道会做') === false)
+ok('分词 · 一千 → 一天 两边都是整词，放行', breaksWord('一千的时间', '一天的时间') === false)
+if (py) {
+  const wV = [W('AI', 0, 0.87), W('时', 0.46, 0.23), W('代', 0.92, 1), W('最', 1.2, 0.92), W('赚钱', 1.66, 0.98)]
+  const vV = await validate([{ i: 1, to: '是', kind: 'homophone', why: '同音' }], wV, { terms: [] })
+  ok('校验 · 低置信的「时→是」虽然同音，但会把「时代」改碎 → 打回', vV.accepted.length === 0 && /切碎/.test(String(vV.rejected[0] && vV.rejected[0].why)), JSON.stringify(vV.rejected[0]))
+}
 
 const total = pass + fails.length
 if (fails.length) {
