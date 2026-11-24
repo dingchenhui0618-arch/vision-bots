@@ -109,6 +109,8 @@ export function layoutBoxes({ scene, template }) {
         let cy = plate.y + Math.round(plate.h * 0.42)
         // 有红条/刻度卡/对勾卡占着板的上方时不盖上方的章（和 film.js 的 stamp() 同一条件）
         const blocked = (scene.blocks || []).some(x => (x.kind === 'banner' || x.kind === 'gauge' || x.kind === 'check') && b.f0 >= x.f0 && b.f0 < x.f1)
+        // 红条在场的整段都不盖（和 film.js 的 stamp() 同一条件）：它整幅宽，章一定叠上去
+        if ((scene.blocks || []).some(x => x.kind === 'banner' && b.f0 + 0.18 < x.f1 && x.f0 < b.f1)) continue
         let skip = false
         if (cx + rr > w - edge - 6) {
           if (blocked) skip = true

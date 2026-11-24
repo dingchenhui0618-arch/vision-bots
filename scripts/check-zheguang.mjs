@@ -121,12 +121,27 @@ for (const c of chips) {
   const src = scene.sections.find(s2 => s2.index === c.page)
   if (!src || !inside(c.text, src.text)) chipOut.push('词不接地「' + c.text + '」')
   if (segment(c.text).length !== 1) chipOut.push('不是单个词「' + c.text + '」')
-  if (!page || c.f0 < page.start - 0.01 || c.f1 > page.end + 0.01) chipOut.push('跨页「' + c.text + '」')
+  // 标签是画面上的注脚，允许跨页、跨版式继续挂着（参考片就是攒着不走的）；
+  // 只要求它的起点落在它标注的那一页里。
+  if (!page || c.f0 < page.start - 0.01 || c.f0 > page.end + 0.01) chipOut.push('起点不在本页「' + c.text + '」')
   if (c.f1 - c.f0 < 1.2 || c.f1 - c.f0 > 4.9) chipOut.push('时长 ' + (c.f1 - c.f0).toFixed(2) + 's「' + c.text + '」')
   const shot = scene.shots.find(s2 => c.f0 >= s2.f0 && c.f0 < s2.f1)
   if (!shot || !['full', 'frame', 'corner'].includes(shot.kind)) chipOut.push('排进了 ' + (shot ? shot.kind : '片外'))
 }
-ok('小标签的规矩（接地 / 单个词 / 不跨页 / 时长 / 版式）', chipOut.length === 0, chipOut.slice(0, 4).join('、'))
+ok('小标签的规矩（接地 / 单个词 / 起点在本页 / 时长 / 版式）', chipOut.length === 0, chipOut.slice(0, 4).join('、'))
+// 两个字的标签最容易是分词碎片（ICU 把「生产力」拆成「生产」、把「来去做」拆成「来去」）：
+// 两字词必须在全片被说过两遍以上才许挂，三四个字的词本身有信息量，说一遍也行。
+const gFreq = new Map()
+for (const s2 of scene.sections) for (const tok of segment(bare(s2.text || ''))) gFreq.set(tok, (gFreq.get(tok) || 0) + 1)
+const thin = chips.filter(c => bare(c.text).length === 2 && (gFreq.get(bare(c.text)) || 0) < 2)
+ok('两个字的标签都是全片说过两遍以上的词（不是分词碎片）', thin.length === 0, thin.map(c => c.text + '×' + (gFreq.get(bare(c.text)) || 0)).slice(0, 5).join('、'))
+// 密度下限：参考片每一屏都挂着几张，我们至少要做到「每页有标签挂着」这个量级，
+// 不然画面会退化成「人 + 一句大字」（自测22 全片只有 4 张，28 秒之后一张都没有）。
+ok('标签密度（不少于页数的四分之三）', chips.length >= Math.ceil(scene.pages.length * 0.75), chips.length + ' 张 / ' + scene.pages.length + ' 页')
+// 构图节奏：参考族的切点密度是 0.20–0.23/s。老规则「满幅连续 11 秒才换」在 8.8 秒一页的
+// 真实素材上永远触发不了，全片只有 8 个切点（0.13/s）。这条守住下限，别再退回去。
+const cutRate = (scene.shots.length - 1) / scene.duration
+ok('构图切点密度不低于 0.18/s（参考族 0.20–0.23）', cutRate >= 0.18 && cutRate <= 0.4, cutRate.toFixed(3) + '/s，' + scene.shots.length + ' 段 / ' + scene.duration.toFixed(1) + 's')
 // 同时在场最多 4 张（多了就是贴纸墙，不是标签）
 let peak = 0
 for (let t = 0; t <= scene.duration; t += 0.25) {

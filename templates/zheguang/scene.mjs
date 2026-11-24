@@ -118,6 +118,12 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     chars: (c.chars || []).map(k => ({ ch: k.ch, f0: round(k.f0), f1: round(k.f1) })),
   })).filter(c => c.text && c.f1 > c.f0)
 
+  // 全片词频：小标签只挂「这条片子里说过两次以上」的实词（说话人自己重复过的才是重点）。
+  const globalFreq = new Map()
+  for (const s of (segments || [])) {
+    for (const tok of segment(bare(s.text || ''))) globalFreq.set(tok, (globalFreq.get(tok) || 0) + 1)
+  }
+
   // ── 页：和分镜共用同一份骨架（src/pages.mjs），页边界只有一处 ──
   const pagesRaw = pageSkeleton({
     segments, plan, duration, hotwords: TERMS,
@@ -202,11 +208,15 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     }
   }
 
-  // ── 模型没给（或给了 full）的页：按内容补节奏，满幅连超过 11 秒就换一次构图 ──
+  // ── 模型没给（或给了 full）的页：按内容补节奏 ──
+  // 参考片的构图每 4–5 秒就变一次（切点密度 0.20–0.23/s）；我们原来把「满幅连续 11 秒」当触发线，
+  // 一页 8.8 秒根本触发不了，全片只有 8 个切点（0.13/s，自测22 唯一出档的一项）。
+  // 触发线放到 7.2 秒、步长 6 秒：一页说满六七秒就换一次构图呼吸，和参考片同一个量级；
+  // 仍然只在真有一句字幕卡落在那儿时才切，不硬切。
   for (const s of shots.filter(x => x.kind === 'full')) {
     let cursor = s.f0
-    while (s.f1 - cursor > 11) {
-      const at = cursor + 9
+    while (s.f1 - cursor > 7.2) {
+      const at = cursor + 6
       // 先看有没有金句能占一整屏（这是参考片最抓眼的那个动作），没有再换小窗
       const gold = beats.find(x => x.f0 >= at && x.f0 < at + 4.5 && cleanShort(x.text, 12) && x.f1 - x.f0 >= 0.8)
       if (gold && shots.filter(y => y.kind === 'card').length < 2) {
@@ -216,7 +226,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
       const b = beats.find(x => x.f0 >= at && x.f0 < at + 3.2)
       if (!b) break
       if (shots.filter(y => y.kind === 'corner').length >= 4) break
-      if (!cut(b.f0 - 0.15, Math.min(s.f1, b.f1 + 0.6), 'corner', '满幅超过 11 秒，换一次版式呼吸')) break
+      if (!cut(b.f0 - 0.15, Math.min(s.f1, b.f1 + 0.6), 'corner', '满幅超过 7 秒，换一次版式呼吸')) break
       cursor = b.f0 + 2.5
     }
   }
@@ -375,6 +385,9 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     '一定', '真的', '非常', '比较', '有点', '很多', '一些', '东西', '事情', '以后', '之前', '之后', '的话', '一样',
     '一起', '一直', '必须', '相当', '自己', '大家', '咱们', '别的', '起来', '出来', '进去', '知道', '看到', '结合',
     '你的', '我的', '他的', '说的', '做的', '很难', '越来', '就可', '就以', '这种话', '而言', '来说', '别再', '别去', '不用', '只要', '就能',
+    // 这些不是名词，是口播里最常出现的「功能块」：挂上去就等于把一句话的动词/副词抄上屏。
+    '都在', '在做', '是在', '才是', '才是', '我是', '也是', '都有', '真正', '越来越', '都能', '做出', '想要', '做的', '太少',
+    '抓住', '才有', '要花', '如果', '的话', '可以', '我们', '你们', '他们', '就是', '因为', '所以', '但是', '而且', '只有',
   ])
   const PUNCT = /[\s，。！？、；：,.!?;:""''…—~·\-]/
   const LATIN_SEG = /^[A-Za-z][A-Za-z0-9+#.]*$/
@@ -408,17 +421,42 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     for (const c of (p.cards || [])) {
       for (const tok of segment(bare(c.text || ''))) if (LATIN_SEG.test(tok) && tok.length >= 2) add(tok, 'latin')
     }
+    // 第四类：这一页自己的实词。折光的标签密度不是靠术语表堆出来的，是「一句话一个实词」——
+    // 术语表只覆盖 GPT / Claude 这类专名，一条普通中文口播全片挂不出几张（自测22 只有 4 张，
+    // 28 秒之后一张都没有，画面就退化成「人 + 一句大字」）。
+    // 补的这一档有三条硬约束，避免变成「为了热闹硬加」：
+    //   · 只从**整页原话**分词（不是从断行后的字幕卡切，那样会切出「生产」「结合」这种半截词）；
+    //   · 只要 2–4 字的整词，函数词、单字词、数字一律不挂；
+    //   · 同一页里被反复说到的词优先——重复本身就是说话人在强调它，不是我们替他挑的。
+    const freq = new Map()
+    for (const tok of segment(bare(text))) {
+      if (tok.length < 2 || tok.length > 4 || /^[0-9]/.test(tok)) continue
+      freq.set(tok, (freq.get(tok) || 0) + 1)
+    }
+    // 只用「这条片子里说过两次以上」的实词。说一次的词留在字幕里就够了，
+    // 挂成标签等于替说话人强调他其实没强调的东西；这一条顺带挡掉了 ICU 把
+    // 「生产力」拆成「生产」这种一次性的半截词（自测23 探针里真出现过）。
+    for (const [tok] of [...freq.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)) {
+      // 两个字的词最容易是分词碎片或功能词（「来去」「生产」「都在」），要求它在全片被说过两遍以上；
+      // 三四个字的词本身就有信息量，说一遍也能挂。
+      if (tok.length === 2 && (globalFreq.get(tok) || 0) < 2) continue
+      add(tok, 'word')
+    }
     return [...pool.values()]
   }
-  /** 这个词是在这一页的哪一刻被说出来的：按字符表对齐，返回第一个字的时间。 */
-  function spokenAt(list, word) {
-    for (const b of list) {
-      const chars = (b.chars || []).filter(x => x && x.ch && !PUNCT.test(x.ch))
-      const bag = chars.map(x => x.ch).join('')
-      const idx = bag.indexOf(word)
-      if (idx >= 0 && chars[idx]) return chars[idx].f0
-    }
-    return null
+  /** 这一页的字符表：把这一页所有字幕卡的逐字时间拼成一条，跨卡片的词也能找到。 */
+  function pageChars(list) {
+    const out = []
+    for (const b of list) for (const x of (b.chars || [])) if (x && x.ch && !PUNCT.test(x.ch)) out.push(x)
+    return out
+  }
+  /** 这个词在这一页被说过几次：按字符表对齐，返回每一次的起始时间。 */
+  function spokenTimes(chars, word) {
+    const bag = chars.map(x => x.ch).join('')
+    const out = []
+    let i = bag.indexOf(word)
+    while (i >= 0) { if (chars[i]) out.push(chars[i].f0); i = bag.indexOf(word, i + 1) }
+    return out
   }
 
   const chips = []
@@ -436,32 +474,57 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     const bigList = bigs.filter(b => b.page === p.index)
     const title = bare(p.title || '')
     const cands = []
-    for (const c of chipPool(p, bigList, pageText)) {
-      if (title && (title.includes(c.text) || c.text.includes(title))) continue
-      const at = spokenAt(list, c.text)
+    const chars = pageChars(list)
+    const pool = chipPool(p, bigList, pageText)
+    // 「说过就挂」：这一页里它被说过好几次时，取第一个落在可用窗口里的那一次，
+    // 不是死取第一次——第一次常常正好压在章节卡上，取不到就等于整页不挂。
+    const atOf = w => spokenTimes(chars, w).find(t => t >= p.start + 1.75 && t <= p.end - 1.2)
+    const borrowed = []
+    for (const c of pool) {
+      const at = atOf(c.text)
       if (at == null) continue
-      if (at < p.start + 1.75 || at > p.end - 1.2) continue
+      // 已经印在章节标题那行小字里的词不再挂标签：同一屏出现两次是重复，不是密度。
+      if (title && (title.includes(c.text) || c.text.includes(title))) { borrowed.push({ ...c, f0: at }); continue }
       cands.push({ ...c, f0: at })
     }
-    const rank = c => (c.kind === 'term' ? 3 : c.kind === 'latin' ? 2 : 1)
+    const rank = c => (c.kind === 'term' ? 3 : c.kind === 'latin' ? 2 : c.kind === 'hot' ? 1 : 0)
     cands.sort((a, b) => (rank(b) - rank(a)) || (a.f0 - b.f0))
     const picked = []
-    for (const c of cands) {
-      if (picked.length >= 4) break
-      if (picked.some(x => Math.abs(x.f0 - c.f0) < 1.0)) continue
-      if (picked.some(x => x.text.includes(c.text) || c.text.includes(x.text))) continue
+    const take = c => {
+      if (picked.length >= 4) return
+      if (picked.some(x => Math.abs(x.f0 - c.f0) < 1.0)) return
+      if (picked.some(x => x.text.includes(c.text) || c.text.includes(x.text))) return
       picked.push(c)
     }
+    for (const c of cands) take(c)
+    // 密度下限：这一页真正能挂的词不到两张时，从标题里借——那行小字已经在屏上，
+    // 借它算重复一次，但比「整整两页一个标签都没有」更接近参考片的密度；
+    // 借的仍然是这一页说过的整词，一个字都不是我们编的。补到两张为止，不再往上借。
+    if (picked.length < 2) for (const c of borrowed.sort((a, b) => b.text.length - a.text.length)) { take(c); if (picked.length >= 2) break }
+
     picked.sort((a, b) => a.f0 - b.f0)
     for (const c of picked) {
       const f0 = round(c.f0)
       const s0 = shots.find(s => f0 >= s.f0 && f0 < s.f1)
       if (!s0 || s0.kind === 'card' || s0.kind === 'outro') continue
-      if (f0 + 0.5 > s0.f1) continue                              // 马上切版式，别贴边起
-      // 「说过就留着」：留 4.6 秒，后面的词再叠上来，任何一帧都有两三张在场
-      const f1 = round(Math.min(f0 + chipLife, p.end - 0.15, s0.f1 - 0.12, duration - 0.2))
+      // 「说过就留着」：标签是画面上的注脚，不跟着版式切——参考片的标签就是攒着不走的。
+      // 所以它跨页、跨版式都可以，只在遇到全屏色卡/结尾时收掉（那两块画面是留白的）。
+      const hard = round(Math.min(f0 + chipLife, duration - 0.2))
+      // 收在三种东西之前：全屏色卡 / 结尾、以及下一页的章节卡。
+      // 章节卡是整幅宽的板，标签骑上去就是两块东西叠着（自测23 质检在 7 帧上抓到 block:chip × chapter）。
+      const stops = []
+      const blocked = shots.find(s => (s.kind === 'card' || s.kind === 'outro') && s.f0 > f0 && s.f0 < hard)
+      if (blocked) stops.push(blocked.f0)
+      const nextPage = pagesRaw.find(x => x.start > f0 + 0.05 && x.start < hard && bare(x.title))
+      if (nextPage) stops.push(nextPage.start)
+      const f1 = stops.length ? round(Math.min(hard, Math.min(...stops) - 0.05)) : hard
       if (f1 - f0 < 1.2) continue
       if (blocks.some(b => (b.kind === 'tagwall' || b.kind === 'banner') && f0 < b.f1 && b.f0 < f1)) continue
+      // 一屏最多 4 张：折光一屏三五张是上限，再多就是贴纸墙。这里在落盘前就守住，
+      // 不指望质检事后拦——密度要涨，但涨到「糊满」就是另一个方向错了。
+      let aliveMax = 0
+      for (let tt = f0; tt < f1; tt += 0.25) aliveMax = Math.max(aliveMax, chips.filter(c => tt >= c.f0 && tt < c.f1).length)
+      if (aliveMax >= 4) continue
       const sides = s0.kind === 'corner' ? [0] : [0, 1]           // 小窗页右边是人物窗口，标签只走左边
       const order = chips.length % 2 ? slotOrderB : slotOrderA
       let key = null

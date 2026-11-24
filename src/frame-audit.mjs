@@ -47,12 +47,15 @@ export async function grabFilmFrames({ file, frames, size = [216, 384] }) {
   const list = [...new Set(frames)].sort((a, b) => a - b)
   if (!list.length) return []
   const sel = list.map(n => 'eq(n\\,' + n + ')').join('+')
+  // 一次抽 150 多帧、每帧 540×960×3 ≈ 1.5MB，合计 240MB 上下——默认 64MB 的 maxBuffer 会抛
+  // 「stdout maxBuffer length exceeded」，对比度这项就变成「没取到成片像素」的假失败
+  // （自测23 第一次跑就是这么挂的）。上限按帧数算，别让采样大小和片子长度互相打架。
+  const bytes = size[0] * size[1] * 3
   const { stdout } = await ff([
     '-v', 'error', '-i', file,
     '-vf', "select='" + sel + "',scale=" + size[0] + ':' + size[1],
     '-fps_mode', 'passthrough', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-',
-  ], { encoding: 'buffer' })
-  const bytes = size[0] * size[1] * 3
+  ], { encoding: 'buffer', maxBuffer: bytes * list.length + (16 << 20) })
   const out = []
   for (let i = 0; i < list.length; i++) {
     const buf = stdout.subarray(i * bytes, (i + 1) * bytes)

@@ -245,7 +245,10 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
       prune.delta = Number((cur.outDuration - targetSec).toFixed(2))
       prune.hit = fit(cur.outDuration)
       // 删完还是不达标、而上一轮说「可删的都删完了」，才算真删不动（质检靠这一条放过超时）
-      prune.exhausted = !prune.hit && Boolean(last && last.exhausted)
+      // 「能删的都删完了」有两种形态：上一轮自己判定删完了，或者最后一轮一句都没删成
+      // （模型提的都被规则挡了 / 模型没再提）。只看 last.exhausted 会漏掉后一种，
+      // 于是质检把「真删不动」判成「还有整句可删，没删够」——自测23 第一次跑就是这样。
+      prune.exhausted = !prune.hit && Boolean(last && (last.exhausted || !(last.picks || []).length))
       plan = cur
     }
   }

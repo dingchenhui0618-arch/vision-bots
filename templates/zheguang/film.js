@@ -291,6 +291,9 @@ export async function createFilm({ media }) {
   function stamp(c, b, plate, size, t) {
     const hot = bare(b.hot || '')
     if (hot.length < 2 || hot.length > 3) return
+    // 红条整幅宽，章压在板右边会和它叠在一起（自测23 质检在 15 帧上抓到 block:stamp × block:banner）。
+    // 章是装饰、块是内容：块在场的那几秒不盖，宁可这一条没有章。
+    if (blockAt(t).some(x => x.kind === 'banner')) return
     const r = Math.round(Math.min(96, Math.max(62, size * 0.44)))
     const edge = Math.max(M, (L.safe && L.safe.right) || 150)
     let cx = plate.x + plate.w + r + 14
@@ -367,10 +370,18 @@ export async function createFilm({ media }) {
     const page = pageAt(t)
     // 小字眉和大字是同一句话时不画：试过「● 泼一瓶冷水」压着「泼一瓶冷水」，
     // 同一句话在一屏上写了两遍，看着像渲染重了。
+    // 参考片那一行是 2–4 字的短眉（「技术门槛」「内容红利」），不是整句章节名。
+    // 原来把整句章节名（「大街都是在做AI模型」）压在大字上面，两级字挤成一片，
+    // 层次就没了——自测22 的抽帧里最明显的一处。短眉 + 一道荧光绿竖线，才是参考片的那个动作。
+    const eyeText = b.pageEyebrow && bare(b.pageEyebrow).length <= 6 ? b.pageEyebrow : ''
     const dupEye = b.pageTitle && (bare(b.text).includes(bare(b.pageTitle)) || bare(b.pageTitle).includes(bare(b.text)))
-    if (page && page.title && !dupEye && t > page.start + 1.6 && b.pageTitle) {
-      const eye = '● ' + b.pageTitle
-      txt(c, eye, BGL.left, top - 18, { size: TY.eyebrow, family: F.disp, weight: 600, color: R(P.lime, 0.85), spacing: 2.6 })
+    if (page && !dupEye && t > page.start + 1.6 && eyeText) {
+      c.save()
+      c.fillStyle = R(P.lime, 0.85)
+      const barW = Math.max(4, Math.round(TY.eyebrow * 0.16))
+      c.fillRect(BGL.left, top - 18 - TY.eyebrow * 0.82, barW, TY.eyebrow * 0.95)
+      txt(c, eyeText, BGL.left + barW + 12, top - 18, { size: TY.eyebrow, family: F.disp, weight: 600, color: R(P.lime, 0.85), spacing: 2.6 })
+      c.restore()
     }
     c.textBaseline = 'alphabetic'
     lines.forEach((ln, li) => {
