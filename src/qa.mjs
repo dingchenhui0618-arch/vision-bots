@@ -177,16 +177,31 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
       clashes.length ? `${clashes.length} 帧上文字/图形互相压（${clashes[0].a} × ${clashes[0].b}，第 ${clashes[0].frame} 帧）` : `${[...perFrame.keys()].length} 个采样帧上，文字与图形互不重叠`,
       { clashes: clashes.slice(0, 6) })
 
-    // 2. 版式契约：文字只占画面下半区，头部区（上 56%）一个字都不许进。
+    // 2. 版式契约：满幅版式里，大字/图形块不许进头部区（上 56%）。
     //    光轨穿脸那条 bug 的根因就是没这条规则——轨道可以放在任何高度，谁也不知道脸在哪。
+    //    折光版式要分开看：
+    //      · HUD 与章节卡按设计就住在上方（参考片一样），不是越界；
+    //      · 小窗 / 竖框 / 结尾版式里人物只占一个小窗，大字压在窗口下面的胸口是对的。
+    //    以前不看版式一律按上 56% 判，小窗版式的 3 行大字被判失败——那是假失败。
     const zoneTop = Math.round(outSize[1] * BAR.zone.bodyTop)
-    const inHeadZone = unions.filter(b => b.tag !== 'hud:rec' && b.tag !== 'hud:sec' && b.y < zoneTop)
-    const hudLow = unions.filter(b => (b.tag === 'hud:rec' || b.tag === 'hud:sec') && b.y + b.h > Math.round(outSize[1] * BAR.zone.hudBottom))
-    add('layout_zone', inHeadZone.length === 0 && hudLow.length === 0,
-      inHeadZone.length
-        ? `${inHeadZone.map(b => b.tag + '@' + Math.round(b.y) + 'px').join('、')} 进了头部区（上 56% 从 0 到 ${zoneTop}px）`
-        : `大字/轨道/字幕都在 ${zoneTop}px 以下的带子里，HUD 在顶部 ${Math.round(outSize[1] * BAR.zone.hudBottom)}px 内`,
-      { zoneTop, bad: inHeadZone.map(b => ({ tag: b.tag, y: Math.round(b.y) })), hudLow: hudLow.map(b => b.tag) })
+    const headTags = new Set(['hud:rec', 'hud:sec', 'hud:page', 'hud:brand', 'hud:progress', 'chapter'])
+    const inHead = new Map()
+    for (const b of boxes) {
+      if (headTags.has(b.tag)) continue
+      if (b.shot && b.shot !== 'full') continue
+      if (b.y < zoneTop) inHead.set(b.tag, Math.round(b.y))
+    }
+    // 只有「顶部」那几件（页码、品牌胶囊）受 hudBottom 约束；底部进度线本来就在底下。
+    const topHud = new Set(['hud:rec', 'hud:sec', 'hud:page', 'hud:brand'])
+    const hudLow = unions.filter(b => topHud.has(b.tag) && b.y + b.h > Math.round(outSize[1] * BAR.zone.hudBottom))
+    add('layout_zone', inHead.size === 0 && hudLow.length === 0,
+      inHead.size || hudLow.length
+        ? [
+          inHead.size ? `${[...inHead].map(([t, y]) => t + '@' + y + 'px').join('、')} 进了满幅版式的头部区（上 56% 从 0 到 ${zoneTop}px）` : '',
+          hudLow.length ? `顶部 HUD 掉到了 ${Math.round(outSize[1] * BAR.zone.hudBottom)}px 以下：${hudLow.map(b => b.tag + '@' + Math.round(b.y)).join('、')}` : '',
+        ].filter(Boolean).join('；')
+        : `满幅版式的大字/图形块都在 ${zoneTop}px 以下；HUD 与章节卡在上方（按设计不在此列）`, 
+      { zoneTop, bad: [...inHead].map(([tag, y]) => ({ tag, y })), hudLow: hudLow.map(b => b.tag) })
 
     // 3. 人物蒙版接上之后，这条会换成真判定（alpha 轮廓）；现在如实标成未接入，不冒充通过。
     if (band && band.ok && source && source.width) {
@@ -251,7 +266,11 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
   if (layout && layout.conflict) {
     add('layout_conflict', false, '轨道避让人物失败：' + layout.conflict, layout)
   } else if (layout) {
-    add('layout_conflict', true, `轨道在 ${(layout.railY / (vstr ? vstr.height : 1920) * 100).toFixed(0)}% 高度，字幕 pill 上沿 ${layout.subTop}px`, layout)
+    add('layout_conflict', true,
+      layout.railY
+        ? `轨道在 ${(layout.railY / (vstr ? vstr.height : 1920) * 100).toFixed(0)}% 高度，字幕 pill 上沿 ${layout.subTop}px`
+        : `${layout.mode} 版式：大字底边 ${layout.bigBottom}px，字幕 pill 上沿 ${layout.subTop}px`,
+      layout)
   }
 
   // 语义层：模型读交付文本找数值查不出的错（同音错、整句崩、重复句、跑题）。

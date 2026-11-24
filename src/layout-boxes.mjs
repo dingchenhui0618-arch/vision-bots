@@ -35,12 +35,17 @@ export function layoutBoxes({ scene, template }) {
     for (const b of scene.bigs || []) {
       const shot = shotAt(b.f0)
       const lines = Math.max(1, (b.lines && b.lines.length) || 1)
-      const size = (b.lines && Math.max(...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))) ? Math.max(TY.bigMin || 62, Math.min(TY.big || 96, Math.floor((w - L.big.left - L.big.right) / Math.max(...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))))) : (TY.big || 96)
+      const longest = Math.max(1, ...b.lines.map(l => [...l].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)))
+      // 三行缩一档，和 film.js 的 fitBigSize 同一口径（不然盒子说 96、画面画 90，量出来的高度是假的）
+      const capSize = lines >= 3 ? Math.min(TY.big || 96, 90) : (TY.big || 96)
+      const size = Math.max(TY.bigMin || 62, Math.min(capSize, Math.floor((w - L.big.left - L.big.right) / longest)))
       const bh = lines * size * ((L.big && L.big.lineGap) || 1.06)
-      const bottom = shot.kind === 'frame' ? h * 0.80 : shot.kind === 'corner' ? h * 0.50 : h * 0.71
+      const bottom = shot.kind === 'frame' ? h * 0.80 : shot.kind === 'corner' ? h * 0.74 : h * 0.71
       const x = (L.big && L.big.left) || 62
-      const maxW = shot.kind === 'corner' ? w * 0.55 : w - x - ((L.big && L.big.right) || 150)
-      items.push({ tag: 'big', x, y: Math.round(bottom - bh), w: Math.round(maxW), h: Math.round(bh), t0: b.f0, t1: b.f1 })
+      // 小窗版式的大字以前被压窄到 0.55w（怕撞小窗），结果字号掉到 62、左边一片死黑；
+      // 小窗只占上方右侧（0.10–0.50h），大字压在 0.56h 以下的胸口，两者从不重叠，用满宽。
+      const maxW = w - x - ((L.big && L.big.right) || 150)
+      items.push({ tag: 'big', x, y: Math.round(bottom - bh), w: Math.round(maxW), h: Math.round(bh), t0: b.f0, t1: b.f1, shot: shot.kind })
     }
     // 字幕：和 film.js 同一个字宽公式
     for (const s of scene.subs || []) {
@@ -51,11 +56,26 @@ export function layoutBoxes({ scene, template }) {
     }
     // 图形块：按种类给保守的整块范围
     for (const b of scene.blocks || []) {
-      if (b.kind === 'check') items.push({ tag: 'block:check', x: 56, y: Math.round(h * 0.775) - 84, w: Math.min(w - 112, 620), h: 84, t0: b.f0, t1: b.f1 })
-      else if (b.kind === 'banner') items.push({ tag: 'block:banner', x: 0, y: Math.round(h * 0.42), w, h: Math.round(h * 0.16), t0: b.f0, t1: b.f1 })
-      else if (b.kind === 'gauge') items.push({ tag: 'block:gauge', x: w - 56 - 430, y: Math.round(h * 0.575), w: 430, h: 210, t0: b.f0, t1: b.f1 })
-      else if (b.kind === 'tagwall') items.push({ tag: 'block:tag', x: 0, y: Math.round(h * 0.10), w, h: Math.round(h * 0.62), t0: b.f0, t1: b.f1 })
-      else if (b.kind === 'avatar') items.push({ tag: 'block:avatar', x: 56, y: Math.round(h * 0.32), w: 560, h: 132, t0: b.f0, t1: b.f1 })
+      const sk = shotAt(b.f0).kind
+      if (b.kind === 'check') items.push({ tag: 'block:check', x: 56, y: Math.round(sk === 'corner' ? h * 0.50 : sk === 'frame' ? h * 0.86 : h * 0.775) - 84, w: Math.min(w - 112, 620), h: 84, t0: b.f0, t1: b.f1, shot: sk })
+      else if (b.kind === 'banner') items.push({ tag: 'block:banner', x: 0, y: Math.round(h * 0.42), w, h: Math.round(h * 0.16), t0: b.f0, t1: b.f1, shot: sk })
+      else if (b.kind === 'gauge') items.push({ tag: 'block:gauge', x: w - 56 - 430, y: Math.round(h * 0.575), w: 430, h: 210, t0: b.f0, t1: b.f1, shot: sk })
+      else if (b.kind === 'tagwall') items.push({ tag: 'block:tag', x: 0, y: Math.round(h * 0.10), w, h: Math.round(h * 0.62), t0: b.f0, t1: b.f1, shot: sk })
+      else if (b.kind === 'avatar') items.push({ tag: 'block:avatar', x: 56, y: Math.round(h * 0.32), w: 560, h: 132, t0: b.f0, t1: b.f1, shot: sk })
+    }
+    // HUD 三件 + 章节卡：以前没进盒子表，等于质检看不见页码/胶囊/进度线/章节卡，
+    // 「章节卡压大字」「小字眉压亮背景读不清」这类问题全都漏检。
+    const M2 = L.margin || 56
+    const HUDY = (L.hud && L.hud.y) || 92
+    const HUDH = (L.hud && L.hud.h) || 42
+    items.push({ tag: 'hud:page', x: M2, y: HUDY, w: 240, h: HUDH, t0: 0, t1: scene.duration })
+    items.push({ tag: 'hud:brand', x: w - M2 - 320, y: HUDY, w: 320, h: HUDH, t0: 0, t1: scene.duration })
+    const PG = L.progress || { y: h - 68, h: 2 }
+    items.push({ tag: 'hud:progress', x: M2, y: PG.y - 6, w: w - M2 * 2, h: 12, t0: 0, t1: scene.duration })
+    const CH2 = L.chapter || { y: 260 }
+    for (const p of scene.pages || []) {
+      if (!p.title) continue
+      items.push({ tag: 'chapter', x: M2, y: Math.round(CH2.y - 90), w: w - M2 * 2, h: 170, t0: p.start, t1: Math.min(p.end, p.start + 2.0) })
     }
     return { ok: true, items, layout: { mode: 'zheguang', bigBottom: Math.round(h * 0.71), subTop: Math.round(h - SUB2.bottom - 90), shots: shots.length } }
   }

@@ -11,7 +11,9 @@
  */
 import { createHash } from 'node:crypto'
 import { writeFileSync, rmSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { ff } from './ffmpeg.mjs'
+import { probe } from './probe.mjs'
 
 /** 内容指纹：模板 / 引擎 / 声波 / scene 都靠它判断「还是不是同一版」 */
 export function hashOf(...parts) {
@@ -62,14 +64,18 @@ export function planPatch({ prev, next, fps }) {
 
 // 切母版走流拷贝，不重编码：FFV1 每帧都是关键帧，所以能精确到帧。
 // 一开始用 trim 滤镜重编码，17s 的片子切两刀要 24s，比重新渲还贵。
+// 每段都要从 pts=0 起：concat 是按各文件自己的时间基拼的，尾段带着原始 pts（比如
+// 从第 900 帧起 = 30.000s）进去，拼出来就会多出一帧的空档——成片 66.93s 变 66.97s，
+// 声音和画面对不上 33ms（自测08 实测踩到）。和编码切片同一个坑。
+const PTS0 = 'setts=pts=PTS-STARTPTS'
 async function sliceHead(src, out, count) {
-  await ff(['-y', '-loglevel', 'error', '-i', src, '-frames:v', String(count), '-c', 'copy', out])
+  await ff(['-y', '-loglevel', 'error', '-i', src, '-frames:v', String(count), '-c', 'copy', '-bsf:v', PTS0, out])
 }
 
 async function sliceTail(src, out, startFrame, count, fps) {
   if (count <= 0) return null
   await ff(['-y', '-loglevel', 'error', '-ss', (startFrame / fps).toFixed(6), '-i', src,
-    '-frames:v', String(count), '-c', 'copy', out])
+    '-frames:v', String(count), '-c', 'copy', '-bsf:v', PTS0, out])
   return out
 }
 
@@ -92,13 +98,22 @@ export async function spliceMaster({ master, patch, from, to, frames, fps = 30, 
       parts.push(tmpB)
     }
     const list = out + '.txt'
-    writeFileSync(list, parts.map(p => "file '" + String(p).replace(/\\/g, '/') + "'").join('\n'), 'utf8')
+    // concat 列表里的相对路径是按「列表文件所在目录」解析的，不是进程 cwd——
+    // 母版在 cache/<tpl>/ 下时，写相对路径会被拼成 cache/<tpl>/groups/... 这种双层前缀。
+    // 一律写成绝对路径。
+    writeFileSync(list, parts.map(p => "file '" + resolve(String(p)).replace(/\\/g, '/') + "'").join('\n'), 'utf8')
     await ff(['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', out])
     rmSync(list, { force: true })
   } finally {
     rmSync(tmpA, { force: true })
     rmSync(tmpB, { force: true })
   }
-  log('拼回母版：切 ' + (from > 0 ? from + ' 帧' : '0 帧') + ' + 新渲 ' + (to - from + 1) + ' 帧 + 切 ' + Math.max(0, frames - 1 - to) + ' 帧')
+  // 拼完必须对账：时长对不上就是拼错了，宁可报错让上层整条重渲，也不许把错片子交出去。
+  const got = await probe(out)
+  const want = frames / fps
+  if (Math.abs(got.duration - want) > 1.5 / fps) {
+    throw new Error('拼回的母版时长不对：' + got.duration.toFixed(3) + 's，应为 ' + want.toFixed(3) + 's（' + frames + ' 帧）')
+  }
+  log('拼回母版：切 ' + (from > 0 ? from + ' 帧' : '0 帧') + ' + 新渲 ' + (to - from + 1) + ' 帧 + 切 ' + Math.max(0, frames - 1 - to) + ' 帧 · 时长 ' + got.duration.toFixed(2) + 's 对账通过')
   return out
 }

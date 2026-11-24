@@ -2,7 +2,7 @@
  * 错字治理的自检：术语表、模型提案的校验器、句子回流、硬断言。
  * 模型提案用固定样本喂进来，不联网；拼音校验在本机有 uv 时额外验一遍。
  */
-import { applyTerms, applyToSegments, validate, correct, hotwordPrompt, pinyinOf, loadTerms } from '../src/asr-fix.mjs'
+import { applyTerms, applyToSegments, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, loadTerms } from '../src/asr-fix.mjs'
 
 let pass = 0
 const fails = []
@@ -126,7 +126,7 @@ if (py) {
 }
 const cwFixed = cw.map((w, i) => i === 1 ? { ...w, fixed: true } : w)
 const s6 = await validate([{ i: 1, n: 2, to: '划走', kind: 'homophone' }], cwFixed, { terms: [], pinyin: null })
-ok('跨词 · 术语表改过的词位不许再动', s6.accepted.length === 0 && /术语表改过/.test(s6.rejected[0].why), JSON.stringify(s6.rejected[0]))
+ok('跨词 · 术语表改过的词位不许再动', s6.accepted.length === 0 && /术语表或整句纠错改过/.test(s6.rejected[0].why), JSON.stringify(s6.rejected[0]))
 
 // ── 11. 近音：「千」和「天」本来就不同音，必须有低置信词做独立证据 ──
 const nw = [W('我', 0), W('要', 1), W('花', 2), W('一', 3, 0.54), W('千', 4, 0.83), W('的', 5), W('时间', 6)]
@@ -147,11 +147,42 @@ if (py) {
   console.log('· mkdir 拼音不可用，近音 5 条跳过')
 }
 
+// ── 12. 整句复读：整段等字数替换（第二遍），证据只认「这一段都是低置信词」 ──
+const sw = [W('指', 0, 0.33), W('纹', 0.4, 0.55), W('住', 0.8, 0.31), W('在', 1.2, 0.62), W('做', 1.6), W('内容', 2.0), W('为什么', 2.4)]
+const sv = sentenceView(sw, [{ start: 0, end: 3.0, text: '指纹住在做内容为什么' }])
+const S = (items, opts) => validateSpans(items, sw, sv, opts)
+const p1 = await S([{ s: 1, from: '指纹住在', to: '真正在做', why: '听成了指纹' }])
+ok('整句 · 整段等字数替换放行', p1.accepted.length === 1 && p1.accepted[0].kind === 'span' && p1.accepted[0].n === 4, JSON.stringify(p1.rejected[0] || {}))
+ok('整句 · 换完字数没变（字幕卡不会撑破）', p1.accepted.length === 1 && p1.accepted[0].parts.join('').length === 4, JSON.stringify(p1.accepted[0] && p1.accepted[0].parts))
+// 「内容」是一个词：只取里面的「容」就切在词中间（这种改法会把半个词改掉）
+const p2 = await S([{ s: 1, from: '容', to: '差' }])
+ok('整句 · 首尾切在词中间就拦', p2.accepted.length === 0 && /词中间/.test(p2.rejected[0].why), JSON.stringify(p2.rejected[0]))
+const p3 = await S([{ s: 1, from: '没有这段', to: '同样字数吧' }])
+ok('整句 · from 不在句子里就拦', p3.accepted.length === 0 && /逐字出现/.test(p3.rejected[0].why), JSON.stringify(p3.rejected[0]))
+const p4 = await S([{ s: 1, from: '指纹住在', to: '真正在' }])
+ok('整句 · 字数不一致就拦', p4.accepted.length === 0 && /字数变了/.test(p4.rejected[0].why), JSON.stringify(p4.rejected[0]))
+const sureSpan = sw.map((w, i) => i === 1 ? { ...w, p: 0.93 } : w)
+const sv2 = sentenceView(sureSpan, [{ start: 0, end: 3.0 }])
+const p5 = await validateSpans([{ s: 1, from: '指纹住在', to: '真正在做' }], sureSpan, sv2, {})
+ok('整句 · 段里有识别很确定的词就不许整段改', p5.accepted.length === 0 && /识别得很确定/.test(p5.rejected[0].why), JSON.stringify(p5.rejected[0]))
+const p6 = await S([{ s: 1, from: '指纹住在', to: '真正在做' }], { skip: new Set([0, 1, 2, 3]) })
+ok('整句 · 已经改过的段不再动（和术语表/第一遍不打架）', p6.accepted.length === 0 && /已经改过/.test(p6.rejected[0].why), JSON.stringify(p6.rejected[0]))
+const dup = [W('看', 0, 0.4), W('看', 0.4, 0.4), W('这', 0.8, 0.4), W('个', 1.2, 0.4)]
+const dsv = sentenceView(dup, [{ start: 0, end: 2.0 }])
+const p7 = await validateSpans([{ s: 1, from: '看', to: '听' }], dup, dsv, {})
+ok('整句 · from 出现两次以上定位不了', p7.accepted.length === 0 && /两次以上/.test(p7.rejected[0].why), JSON.stringify(p7.rejected[0]))
+const manySpans = [
+  { s: 1, from: '指纹住在', to: '真正在做' },
+  { s: 1, from: '住在做', to: '在装配' },
+]
+const p8 = await S(manySpans)
+ok('整句 · 同一段只认一条', p8.accepted.length === 1 && p8.rejected.some(r => /已经改过/.test(r.why)), p8.accepted.length + '/' + p8.rejected.length)
+
 const total = pass + fails.length
 if (fails.length) {
   console.log('FAIL · ' + fails.length + '/' + total + ' 条没过')
   for (const f of fails) console.log('  · ' + f)
   process.exitCode = 1
 } else {
-  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2 / 跨词 6 / 近音 5' + (py ? ' / 拼音 4' : '') + '）')
+  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2 / 跨词 6 / 近音 5 / 整句 8' + (py ? ' / 拼音 4' : '') + '）')
 }

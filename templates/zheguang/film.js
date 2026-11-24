@@ -156,6 +156,15 @@ export async function createFilm({ media }) {
     const num = String(page.index).padStart(2, '0')
     c.save()
     c.globalAlpha *= a
+    // 章节卡压在实拍上：先铺一条柔和的暗底带。没有它，亮背景（白帽子、白墙）上的
+    // 小字眉和绿数字就糊在一起——这不是审美问题，是读不出来。
+    const sc = c.createLinearGradient(0, y - 150, 0, y + 130)
+    sc.addColorStop(0, R(P.void, 0))
+    sc.addColorStop(0.32, R(P.void, 0.66))
+    sc.addColorStop(0.78, R(P.void, 0.56))
+    sc.addColorStop(1, R(P.void, 0))
+    c.fillStyle = sc
+    c.fillRect(0, y - 150, w, 280)
     // 顶部一条短绿线，压住章节卡的起点
     line(c, M, y - 104, M + 64 * E.outExpo(k0), y - 104, R(P.lime, 0.95), 4)
     txt(c, 'CHAPTER ' + num + ' / ' + String(page.total).padStart(2, '0'), M, y - 66, { size: TY.eyebrow, family: F.disp, weight: 600, color: R(P.ash, 0.95), spacing: 3 })
@@ -171,19 +180,28 @@ export async function createFilm({ media }) {
   function fitBigSize(lines) {
     const avail = w - BGL.left - BGL.right
     const longest = Math.max(1, ...lines.map(l => textEm(l)))
-    return Math.max(TY.bigMin, Math.min(TY.big, Math.floor(avail / longest)))
+    // 三行大字要缩一档：整块高度 = 行数 × 字号 × 行距，三行按 96 排会顶穿到
+    // 头部区（实测 top=1058px，禁区线 1075px）。宁可小一号，也不让字爬到脸上。
+    const cap = lines.length >= 3 ? Math.min(TY.big, 90) : TY.big
+    return Math.max(TY.bigMin, Math.min(cap, Math.floor(avail / longest)))
   }
 
   /** 大字的底边（不是顶边）：满幅压在胸口，竖框在小窗下面，小窗在左侧中下部。
    *  参考片的大字基本落在 0.5–0.72 这一段，字幕在 0.84——两者永远不重叠。 */
   function bigBottom(shot) {
     if (shot.kind === 'frame') return h * 0.80
-    if (shot.kind === 'corner') return h * 0.50
+    // 小窗只占上方右侧（0.10–0.50h），大字压到窗口下面的胸口，和满幅同一个位置。
+    // 以前放在 0.50h：既贴着小窗底边，又因为要避开窗口被压窄到 0.4w，字号掉到 62、左边一片死黑。
+    if (shot.kind === 'corner') return h * 0.74
     return h * 0.71
   }
 
   function drawBig(c, b, t, shot) {
     if (t < b.f0 || t >= b.f1) return
+    // 章节卡占着开场这 2 秒：两套文字同屏会打架（自测07 抽帧里「01 最赚钱的不是技术」
+    // 和大字「赚钱不是技术」上下叠着，说的是同一句话）。参考片开场只给章节卡。
+    const pg0 = pageAt(t)
+    if (pg0 && pg0.title && t < pg0.start + 2.0) return
     const lines = b.lines && b.lines.length ? b.lines : [b.text]
     const size = fitBigSize(lines)
     const lh = size * (BGL.lineGap || 1.06)
@@ -372,7 +390,9 @@ export async function createFilm({ media }) {
     const tw = Math.min(w - M * 2, measure(c, b.text, size, F.sans, 800) + 128)
     const cw = tw, chh = 84
     const shot = shotAt(t)
-    const yBase = shot.kind === 'corner' ? h * 0.585 : shot.kind === 'frame' ? h * 0.86 : h * 0.775
+    // 小窗版式的大字现在压在 0.74h 的胸口（以前在 0.50h），对勾卡跟着让到 0.50h：
+    // 小窗只到 0.50h，卡正好落在窗口下面、大字上面那块空处。
+    const yBase = shot.kind === 'corner' ? h * 0.50 : shot.kind === 'frame' ? h * 0.86 : h * 0.775
     const x = M, y = Math.round(yBase) - chh
     c.save()
     c.globalAlpha *= Math.min(1, k)

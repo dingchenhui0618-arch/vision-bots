@@ -10,7 +10,7 @@ import { buildPlan } from '../plan.mjs'
 import { envelope16 } from '../energy.mjs'
 import { paramsOf } from '../bots/config.mjs'
 import { buildCaptions, toSRT } from '../captions.mjs'
-import { correct, loadTerms, hotwordPrompt, applyToSegments } from '../asr-fix.mjs'
+import { correct, loadTerms, hotwordPrompt, applyToSegments, FIXER_VERSION } from '../asr-fix.mjs'
 import { sectionsOf } from '../sections.mjs'
 import { titleSentences } from '../headlines.mjs'
 import { pageSkeleton } from '../pages.mjs'
@@ -34,7 +34,7 @@ function bigBudget(templateId, ratio) {
   } catch { return 0 }
 }
 
-const KIND_LABEL = { homophone: '同音字', term: '专有名词', number: '数字' }
+const KIND_LABEL = { homophone: '同音字', near: '近音字', span: '整段纠错', term: '专有名词', number: '数字' }
 
 export async function runCut({ group, job, log, artifact, brief, state, narrate = true }) {
   const input = group.meta.assets[0]
@@ -61,32 +61,46 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   let words, segments, fixReport, language
   let asrSeconds = 0
   let reused = false
-  if (cached) {
+  // 两级缓存：原始转写只跟素材/术语表/识别模型有关，纠错结果还跟纠错层版本有关。
+  // 以前缓存键里没有纠错层版本——改了纠错规则，返工照样拿回旧的错字结果（静默失效）。
+  // 现在改规则只重跑纠错，不从零听一遍素材（70s 真素材要 10 分钟，本机还会 OOM）。
+  let raw = null
+  let rawSegments = null
+  if (cached && cached.fixHit) {
     words = cached.words
     segments = cached.segments
     fixReport = cached.fixReport
     language = cached.language || 'zh'
     asrSeconds = cached.asrSeconds || 0
     reused = true
-    log(`复用上次转写：${words.length} 词（素材、术语表、识别模型都没变）`)
-  } else {
-    if (hot) log('热词注入：' + hot)
-    const t0 = Date.now()
-    log('转写中（faster-whisper，本地 CPU）')
-    // 原始转写留一份给审计，纠错后的才是下游真正用的 transcript.json
-    const asr = await transcribe(wav, { out: join(work, 'asr-raw.json'), model: brief.asrModel || 'small', hotwords: hot })
-    const raw = asr.json.words
-    asrSeconds = (Date.now() - t0) / 1000
-    language = asr.json.language || 'zh'
-    log(`转写完成：${raw.length} 词 · ${asrSeconds.toFixed(1)}s`)
-
+    log(`复用上次转写：${words.length} 词（素材、术语表、识别模型、纠错层版本都没变）`)
+  } else if (cached && cached.rawHit) {
+    raw = cached.raw.words
+    rawSegments = cached.raw.segments
+    language = cached.raw.language || 'zh'
+    asrSeconds = cached.raw.asrSeconds || 0
+    log(`复用上次的原始转写：${raw.length} 词；纠错层换过版本（${cached.fixer || '旧版'} → ${FIXER_VERSION}），只重跑纠错`)
+  }
+  if (!words) {
+    if (!raw) {
+      if (hot) log('热词注入：' + hot)
+      const t0 = Date.now()
+      log('转写中（faster-whisper，本地 CPU）')
+      // 原始转写留一份给审计，纠错后的才是下游真正用的 transcript.json
+      const asr = await transcribe(wav, { out: join(work, 'asr-raw.json'), model: brief.asrModel || 'small', hotwords: hot })
+      raw = asr.json.words
+      rawSegments = asr.json.segments
+      asrSeconds = (Date.now() - t0) / 1000
+      language = asr.json.language || 'zh'
+      log(`转写完成：${raw.length} 词 · ${asrSeconds.toFixed(1)}s`)
+    }
     // 第二层治理：受约束纠错。只改词文本，时间码和词数由模块内部断言
-    const fix = await correct({ words: raw, terms, log })
+    const fix = await correct({ words: raw, terms, log, segments: rawSegments })
     words = fix.words
     fixReport = fix.report
     // 句子文本也要跟着纠错走，否则大字用的还是错的（字幕改了、片子里没改）
-    segments = applyToSegments(words, asr.json.segments)
-    writeCutCache({ dir: group.dir, input, terms, brief, words, segments, fixReport, asrSeconds, language })
+    segments = applyToSegments(words, rawSegments)
+    writeCutCache({ dir: group.dir, input, terms, brief, raw: { words: raw, segments: rawSegments, language, asrSeconds }, words, segments, fixReport })
   }
   const fixPath = join(work, 'fix-report.json')
   writeFileSync(fixPath, JSON.stringify(fixReport, null, 2), 'utf8')
@@ -240,12 +254,13 @@ function readCutCache({ dir, input, terms, brief }) {
   if (!c.asset || c.asset.size !== st.size || Math.abs(c.asset.mtimeMs - st.mtimeMs) > 1) return null
   if (c.terms !== termsHash(terms)) return null
   if ((c.asrModel || 'small') !== (brief.asrModel || 'small')) return null
-  if (!Array.isArray(c.words) || !Array.isArray(c.segments)) return null
-  if (!c.fixReport || !c.fixReport.stats) return null
-  return c
+  const fixHit = c.fixer === FIXER_VERSION && Array.isArray(c.words) && Array.isArray(c.segments) && c.fixReport && c.fixReport.stats
+  const rawHit = !fixHit && c.raw && Array.isArray(c.raw.words) && c.raw.words.length && Array.isArray(c.raw.segments)
+  if (!fixHit && !rawHit) return null
+  return { ...c, fixHit, rawHit }
 }
 
-function writeCutCache({ dir, input, terms, brief, words, segments, fixReport, asrSeconds, language }) {
+function writeCutCache({ dir, input, terms, brief, raw, words, segments, fixReport }) {
   const st = statSync(input)
   const p = join(dir, 'work', 'cut-cache.json')
   writeFileSync(p, JSON.stringify({
@@ -254,7 +269,10 @@ function writeCutCache({ dir, input, terms, brief, words, segments, fixReport, a
     asset: { size: st.size, mtimeMs: st.mtimeMs },
     terms: termsHash(terms),
     asrModel: brief.asrModel || 'small',
-    language, asrSeconds,
+    fixer: FIXER_VERSION,
+    language: raw.language || 'zh',
+    asrSeconds: raw.asrSeconds || 0,
+    raw: { words: raw.words, segments: raw.segments, language: raw.language || 'zh', asrSeconds: raw.asrSeconds || 0 },
     words, segments, fixReport,
   }), 'utf8')
 }

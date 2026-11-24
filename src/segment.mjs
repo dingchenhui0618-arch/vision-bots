@@ -163,6 +163,18 @@ export function wrapWords(text, per = 10, { asciiHalf = false } = {}) {
     }
   }
 
+  // 单字起行也是机器切的：「一周工作 / 量OPC」把「工作量」劈成了两截
+  // （ICU 把「工作量」切成「工作」+「量」，均衡断行正好断在中间）。字宽多一个字，
+  // 大字会自动缩字号，观感没有代价——和上面那条同一套办法。
+  const lw0 = line => line.reduce((s, x) => s + width(x, w), 0)
+  for (let i = 1; i < lines.length; i++) {
+    const head = lines[i][0]
+    if (!head || head.length !== 1) continue
+    if (lines[i].length < 2) continue
+    if (lw0(lines[i - 1]) + width(head, w) > perW) continue
+    lines[i - 1].push(lines[i].shift())
+  }
+
   const lw = line => line.reduce((s, x) => s + width(x, w), 0)
   let guard = 0
   while (lines.length > 1 && guard++ < 4) {

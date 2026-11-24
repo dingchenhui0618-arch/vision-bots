@@ -21,6 +21,7 @@
  * 而且全片最多 2 处。没有这条证据，近音一律打回。
  */
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -58,9 +59,14 @@ const MAX_FIXES = words => Math.max(4, Math.ceil(words.length * 0.08))
 const NEAR_WINDOW = 3
 const NEAR_CAP = 2
 const NEAR_P = 0.65
+// 整段纠错（第二遍，按句子读）：ASR 的真错常常是一整段
+// （「指纹住在做内容」实际说的是「真正在做内容」），按词一个个看永远看不出来。
+// 约束不放松：字数不变、词数不变、时间码不动；全片最多 SPAN_CAP 处，逐条写进交付报告。
+const SPAN_CAP = 3
+const SPAN_P = 0.85
 // 标点字符集（不带 g，避免 test() 的 lastIndex 状态）
 const PUNCT_CH = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/u
-const KINDS = ['homophone', 'term', 'number', 'near', 'punct']
+const KINDS = ['homophone', 'term', 'number', 'near', 'span', 'punct']
 
 // 模型配置、凭证和超时统一在 llm.mjs：制片人和错字治理不能各配一套。
 
@@ -227,6 +233,148 @@ function nearWitness(words, i, n) {
   return null
 }
 
+// ── 第二遍：句子视图 ──
+// 只保留能被词完整覆盖的句子（词落在段的时间范围内），句子文本用词的核心字拼，
+// 标点留在 affix 里不参与替换——和 applySpan 的口径一致。
+
+export function sentenceView(words, segments) {
+  const out = []
+  for (const s of segments || []) {
+    const ws = []
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i]
+      if (w.start >= s.start - 0.02 && w.end <= s.end + 0.02) {
+        ws.push({ i, core: splitAffixes(w.w).core, p: w.p })
+      }
+    }
+    if (!ws.length) continue
+    const text = ws.map(x => x.core).join('')
+    if (text.length < 4) continue
+    out.push({ s, ws, text })
+  }
+  return out
+}
+
+/** from 在句子里定位到词区间；切在词中间就不认（那会把半个词改成别的字）。 */
+function locateInSentence(v, from) {
+  const at = v.text.indexOf(from)
+  if (at < 0) return { error: 'from 不在这句里逐字出现' }
+  if (v.text.indexOf(from, at + 1) >= 0) return { error: 'from 在这句里出现两次以上，定位不了' }
+  const bounds = [0]
+  for (const w of v.ws) bounds.push(bounds[bounds.length - 1] + w.core.length)
+  if (!bounds.includes(at)) return { error: 'from 起点切在词中间' }
+  const end = at + from.length
+  if (!bounds.includes(end)) return { error: 'from 终点切在词中间' }
+  const a = bounds.indexOf(at)
+  const b = bounds.indexOf(end) - 1
+  if (b < a) return { error: 'from 是空的' }
+  return { a, b }
+}
+
+async function callSentenceReview(view) {
+  const lines = view.map((v, k) => `${k + 1}|${v.text}`).join('\n')
+  const t0 = Date.now()
+  try {
+    const r = await chat({ prompt: SENT_PROMPT(lines), maxTokens: 1200, model: LLM.models.fast, temperature: 0 })
+    if (!r.ok) return { skipped: r.skipped, detail: r.detail || null }
+    const m = r.content.match(/\[[\s\S]*\]/)
+    const proposals = m ? JSON.parse(m[0]) : []
+    return { proposals, ms: Date.now() - t0, model: r.model, tokens: r.tokens }
+  } catch (err) {
+    return { skipped: 'unreachable', detail: String(err.message).slice(0, 160) }
+  }
+}
+
+/**
+ * 整段替换的校验。证据分三档，从强到弱：
+ *
+ *   1. 整段同音（逐字拼音全等，声调、声母、韵母都不管）——「直到」→「知道」、「网道」→「王道」。
+ *      这一档不需要置信度证据。whisper 对这种错恰恰很自信（实测 0.90–0.99），
+ *      拿「低置信」当门槛等于把对的改法挡在门外（自测07 实测：对的 5 处全被这条挡掉）。
+ *   2. 改出来的是术语表里的词（GDP → GPT）。
+ *   3. 整段都是 ASR 自己没把握的词（语义型：捡→搞、指纹住在→真正在做）。
+ *      这一档最弱：能改对也能改坏，所以全片最多 SPAN_CAP 处，逐条写进交付报告让人能复核。
+ *
+ * 硬约束一条都不放松：等字数、词数不变、时间码不动、from 必须逐字出现且落在词边界上。
+ */
+export async function validateSpans(proposals, words, view, { skip = new Set(), cap = SPAN_CAP, terms = [], pinyin, strongOnly = false } = {}) {
+  const accepted = []
+  const rejected = []
+  const seen = new Set(skip)
+  const cand = []
+  for (const p of Array.isArray(proposals) ? proposals : []) {
+    const k = Number(p && p.s)
+    if (!Number.isInteger(k) || k < 1 || k > view.length) { rejected.push({ ...p, why: '句子序号越界' }); continue }
+    const from = String((p && p.from) ?? '')
+    const to = String((p && p.to) ?? '').trim()
+    if (!from || !to) { rejected.push({ s: k, why: 'from / to 是空的' }); continue }
+    if (/\s/.test(to)) { rejected.push({ s: k, from, to, why: '改成的内容里有空格' }); continue }
+    const v = view[k - 1]
+    const loc = locateInSentence(v, from)
+    if (loc.error) { rejected.push({ s: k, from, to, why: loc.error }); continue }
+    const i = v.ws[loc.a].i
+    const n = loc.b - loc.a + 1
+    let clash = false
+    for (let j = 0; j < n; j++) if (seen.has(i + j)) clash = true
+    if (clash) { rejected.push({ s: k, from, to, why: '这一段已经改过（术语表或第一遍）' }); continue }
+    const span = applySpan(words, i, n, to)
+    if (span.error) { rejected.push({ s: k, from, to, why: span.error }); continue }
+    if (span.text === span.cores.join('')) { rejected.push({ s: k, from, to, why: '改完和原来一样' }); continue }
+    // 证据只对「真正改掉的那几个字」提要求，不对整段提。
+    // 「花一千的时间」→「花一天的时间」只改了「千→天」，其余七个字原样，
+    // 拿「花/的/时间」的置信度来拦这条改法是错的口径（自测07 实测：对的改法就这么被挡掉的）。
+    const bounds = [0]
+    for (const w of v.ws.slice(loc.a, loc.b + 1)) bounds.push(bounds[bounds.length - 1] + w.core.length)
+    const changed = new Set()
+    for (let c = 0; c < from.length; c++) if (from[c] !== to[c]) changed.add(c)
+    const sure = []
+    for (const c of changed) {
+      let j = 0
+      while (j < bounds.length - 1 && !(c >= bounds[j] && c < bounds[j + 1])) j++
+      const w = v.ws[loc.a + j]
+      if (w && typeof w.p === 'number' && w.p >= SPAN_P) sure.push(w)
+    }
+    const uniqSure = [...new Map(sure.map(w => [w.i, w])).values()]
+    cand.push({ s: k, from, to, i, n, span, v, a: loc.a, b: loc.b, sure: uniqSure, why: String((p && p.why) || '').slice(0, 40) })
+    for (let j = 0; j < n; j++) seen.add(i + j)
+  }
+
+  // 同音证据一次查完（本机没有拼音能力就退到第 2、3 档）
+  let pyOk = pinyin !== null
+  let vals = null
+  if (pyOk && cand.length) {
+    vals = await phoneticOf(cand.flatMap(x => [x.from, x.to]))
+    if (!vals) pyOk = false
+  }
+
+  for (let idx = 0; idx < cand.length; idx++) {
+    const x = cand[idx]
+    let verified = ''
+    if (pyOk && vals) {
+      const a = vals[idx * 2]
+      const b = vals[idx * 2 + 1]
+      if (a && b && a.py === b.py) verified = '整段同音：' + a.py + ' 逐字一致'
+    }
+    if (!verified && terms.length && terms.some(t => t.to === x.to)) verified = '命中术语表：' + x.to
+    if (!verified && strongOnly) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '复核这一遍只认同音/术语证据，低置信推断不改' }); continue }
+    if (!verified && !x.sure.length) verified = '整段都是低置信词，等字数替换'
+    if (!verified) {
+      rejected.push({
+        s: x.s, from: x.from, to: x.to,
+        why: '证据不够：不是同音、不是术语，被改掉的字所在的词识别得很确定（' +
+          x.sure.map(w => '「' + words[w.i].w + '」' + w.p.toFixed(2)).join('、') + '），不改',
+      })
+      continue
+    }
+    if (accepted.length >= cap) { rejected.push({ s: x.s, from: x.from, to: x.to, why: '整段纠错全片最多 ' + cap + ' 处' }); continue }
+    accepted.push({
+      i: x.i, n: x.n, at: +words[x.i].start.toFixed(2), from: x.from, to: x.to,
+      parts: x.span.parts, kind: 'span', why: x.why, verified,
+    })
+  }
+  return { accepted, rejected }
+}
+
 function wordsForPrompt(words) {
   const lines = []
   for (let i = 0; i < words.length; i++) {
@@ -265,6 +413,37 @@ ${nudge}
 
 输出 JSON 数组，元素为 {"i": 词位数字, "n": 词数(可省略), "to": "改好的文字", "kind": "homophone|near|term|number", "why": "不超过 12 字的理由"}。
 没有要改的输出 []。不要输出任何其他文字。`
+
+/**
+ * 第二遍：把词连成句子再读一遍。
+ *
+ * 为什么要第二遍：第一遍喂给模型的是「词位:词」的流水，它只能一个词一个词地改，
+ * 看到的永远是碎片；真正的错往往是整段（「指纹住在做内容」→「真正在做内容」、
+ * 「捡内容生产力才是网道」→「搞内容生产力才是王道」）。质检的语义审读能看到这类错，
+ * 但它只有报告权、没有回写通道，所以错字照样出厂。这一遍就是补上那条通道：
+ * 用句子视图重读，允许整段等字数替换，校验不过照样打回。
+ */
+export const SENT_PROMPT = (lines, nudge = '') => `你是中文口播的校对。下面是转写并纠正过一轮的句子，每行「序号|句子」。把每句当人话读一遍，只挑读不通的。
+
+${lines}
+
+对每个读不通的地方报一个整段替换：
+{"s": 句子序号, "from": "句子里逐字抄下来的原片段", "to": "改好的片段", "why": "不超过 12 字的理由"}
+
+规则：
+1. from 必须在这一句里逐字出现、只出现一次，首尾落在词的边界上（不能切在词的中间）；
+2. to 的字数必须和 from 完全一样，不许带标点或空格；
+3. 只改错的地方，不许顺句子、换说法、加字删字；
+4. 读得通的句子不要动；没把握就不要报——漏一个错字可以忍，改错一个字是事故。
+
+${nudge}
+
+输出 JSON 数组。没有要改的输出 []。不要输出任何其他文字。`
+
+/** 纠错层版本：进了转写缓存的键。改了规则就该重新纠错，不许静默复用旧结果。 */
+export const FIXER_VERSION = createHash('sha1')
+  .update([PROMPT('x'), SENT_PROMPT('x'), KINDS.join(','), String(SPAN_CAP), String(SPAN_P), String(NEAR_CAP), String(NEAR_P)].join('|'))
+  .digest('hex').slice(0, 12)
 
 /**
  * 只问模型要提案，接不接受由 validate 说了算。
@@ -309,7 +488,7 @@ export async function validate(proposals, words, { terms, pinyin }) {
     // 区间里已经有词被术语表改过，就不再动，避免两套改法打架
     let touched = false
     for (let k = 0; k < n; k++) if (words[i + k] && words[i + k].fixed) touched = true
-    if (touched) { rejected.push({ i, from: w.w, to, why: '这一段里有词已被术语表改过' }); continue }
+    if (touched) { rejected.push({ i, from: w.w, to, why: '这一段里有词已被术语表或整句纠错改过' }); continue }
     const span = applySpan(words, i, n, to)
     if (span.error) { rejected.push({ i, from: w.w, to, why: span.error }); continue }
     if (span.text === span.cores.join('')) { rejected.push({ i, from: w.w, to, why: '改完和原来一样' }); continue }
@@ -404,7 +583,7 @@ export function applyToSegments(words, segments) {
 /**
  * 主入口。返回 {words, report}。
  */
-export async function correct({ words, terms, log = () => {}, askModel = true }) {
+export async function correct({ words, terms, log = () => {}, askModel = true, segments = null }) {
   const t0 = Date.now()
   const baseline = JSON.stringify(words.map(w => [w.start, w.end]))
 
@@ -416,10 +595,41 @@ export async function correct({ words, terms, log = () => {}, askModel = true })
     termSources: terms.sources || [],
     glossary: { applied: g.hits, skipped: g.skipped },
     model: null,
+    sentence: null,
+    review: null,
     applied: [...g.hits],
     rejected: [],
     pending: [],
     assertion: null,
+  }
+
+  // 先按整句改，再按词位补。
+  //
+  // 顺序反过来会出事：逐词同音规则会把「直到」改成「只到」——每个字都对、整句更糟，
+  // 它只看一个词，没有能力判断整句。整句视图先落地，被改过的词逐词层就不许再碰（validate 里 fixed 检查）。
+  if (askModel && segments && segments.length) {
+    const touched = new Set()
+    for (const a of report.applied) for (let k = 0; k < (a.n || 1); k++) touched.add(a.i + k)
+    const view = sentenceView(current, segments)
+    if (view.length) {
+      const r2 = await callSentenceReview(view)
+      if (r2.skipped) {
+        report.sentence = { skipped: r2.skipped, detail: r2.detail || null }
+        log('整句纠错：模型没接上（' + r2.skipped + '），只做了第一遍')
+      } else {
+        const v2 = await validateSpans(r2.proposals || [], current, view, { skip: touched, terms })
+        report.sentence = { ok: true, model: r2.model, ms: r2.ms, tokens: r2.tokens, proposals: (r2.proposals || []).length, sentences: view.length }
+        report.applied.push(...v2.accepted)
+        report.rejected.push(...v2.rejected)
+        const by2 = new Map()
+        for (const a of v2.accepted) {
+          const parts = a.parts || [a.to]
+          for (let k = 0; k < (a.n || 1); k++) by2.set(a.i + k, parts[k])
+        }
+        current = current.map((w, i) => by2.has(i) ? { ...w, w: by2.get(i), w0: w.w0 || w.w, fixed: true } : w)
+        log('整句纠错：' + view.length + ' 句，' + (r2.proposals || []).length + ' 提案 / ' + v2.accepted.length + ' 采纳 / ' + v2.rejected.length + ' 打回')
+      }
+    }
   }
 
   if (askModel) {
@@ -452,6 +662,35 @@ export async function correct({ words, terms, log = () => {}, askModel = true })
     }
   }
 
+  // 第三遍：改完之后再按句子读一遍。
+  // 逐词层只看得见一个词，它可以把「直到」改成「只到」、「时代」改成「是代」——
+  // 每个字都同音、整句却更糟。人改完会回读一遍，这里也一样：允许把上一步改坏的整段改回来，
+  // 但这一遍只认同音 / 术语这种硬证据，不再用「低置信」去推断。
+  if (askModel && segments && segments.length) {
+    const termIdx = new Set()
+    for (const a of g.hits) for (let k = 0; k < (a.n || 1); k++) termIdx.add(a.i + k)
+    const view3 = sentenceView(current, segments)
+    if (view3.length) {
+      const r3 = await callSentenceReview(view3)
+      if (r3.skipped) {
+        report.review = { skipped: r3.skipped, detail: r3.detail || null }
+        log('回读：模型没接上（' + r3.skipped + '）')
+      } else {
+        const v3 = await validateSpans(r3.proposals || [], current, view3, { skip: termIdx, terms, strongOnly: true })
+        report.review = { ok: true, model: r3.model, ms: r3.ms, tokens: r3.tokens, proposals: (r3.proposals || []).length, sentences: view3.length }
+        report.applied.push(...v3.accepted)
+        report.rejected.push(...v3.rejected)
+        const by3 = new Map()
+        for (const a of v3.accepted) {
+          const parts = a.parts || [a.to]
+          for (let k = 0; k < (a.n || 1); k++) by3.set(a.i + k, parts[k])
+        }
+        current = current.map((w, i) => by3.has(i) ? { ...w, w: by3.get(i), w0: w.w0 || w.w, fixed: true } : w)
+        log('回读：' + view3.length + ' 句，' + (r3.proposals || []).length + ' 提案 / ' + v3.accepted.length + ' 回改 / ' + v3.rejected.length + ' 打回')
+      }
+    }
+  }
+
   const appliedIdx = new Set()
   for (const a of report.applied) for (let k = 0; k < (a.n || 1); k++) appliedIdx.add(a.i + k)
   report.pending = current
@@ -473,9 +712,10 @@ export async function correct({ words, terms, log = () => {}, askModel = true })
     pending: report.pending.length,
     spans: report.applied.filter(a => (a.n || 1) > 1).length,
     near: report.applied.filter(a => a.kind === 'near').length,
+    span: report.applied.filter(a => a.kind === 'span').length,
     ms: Date.now() - t0,
   }
   const aiAccepted = report.applied.length - g.hits.length
-  log(`错字治理：术语表 ${g.hits.length} 处 · 模型 ${report.model && report.model.ok ? report.model.proposals + ' 提案 / ' + aiAccepted + ' 采纳' : '未接'} · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
+  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}） · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
   return { words: current, report }
 }
