@@ -143,6 +143,55 @@ export async function createFilm({ media }) {
     cornerTicks(c, M, Math.round(h * 0.085), w - M * 2, Math.round(h * 0.50), 22, R(P.paper, 0.22), 2)
   }
 
+  /**
+   * 背景巨字：参考片开场那半个出画的「技术」。满幅页 0.10–0.50h 这块一直是空的，
+   * 折光在那儿压一层巨大的半出画字当底纹。字只取这一条大字自己的关键词，不新增任何内容；
+   * 透明度压到 0.10，每页只出一条，当纹理不当信息（所以不进质检盒子统计，见 docs/WHY.md）。
+   */
+  let SEG = null
+  /** 巨字取哪个词：优先大字的高亮词，否则这一行里最长的 2–3 字词块。
+   *  用浏览器自带的 Intl.Segmenter（和 src/segment.mjs 同一套 ICU 分词），不另引依赖，
+   *  也不许自己按字数硬截——截出来会是「一周的」这种半句。 */
+  function bleedWord(b) {
+    const hot = bare(b.hot || '')
+    if (hot.length >= 2) return [...hot].slice(0, 3).join('')
+    const line = bare((b.lines && b.lines[0]) || b.text || '')
+    if (!line) return ''
+    try {
+      if (!SEG) SEG = new Intl.Segmenter('zh', { granularity: 'word' })
+      const ws = [...SEG.segment(line)].map(x => x.segment).filter(x => /^[\u4e00-\u9fa5]{2,3}$/.test(x))
+      if (ws.length) return ws.sort((a, c) => c.length - a.length || line.indexOf(a) - line.indexOf(c))[0]
+    } catch (e) { /* 没有 ICU 就算了 */ }
+    return ''
+  }
+
+  function backWord(c, t, shot) {
+    if (shot.kind !== 'full') return
+    const b = (S.bigs || []).find(x => t >= x.f0 && t < x.f1)
+    if (!b) return
+    const page = pageAt(t)
+    if (!page || t < page.start + 1.6) return
+    // 每页只出一次（参考片也是开场压一次巨字，不是每条大字都压）。
+    // 试过每条大字都压：满屏都在渗字，读起来像糊了一层。
+    if ((S.bigs || []).some(x => x.page === b.page && x.f0 < b.f0 - 0.01)) return
+    const word = bleedWord(b)
+    if (word.length < 2) return
+    const k = E.outCubic(clamp(seg(t, b.f0, b.f0 + 0.55)))
+    if (k <= 0.01) return
+    const size = Math.round(w * (word.length >= 3 ? 0.26 : 0.34))
+    c.save()
+    c.globalAlpha *= k
+    c.font = font(size, F.sans, 900)
+    c.textAlign = 'left'
+    c.textBaseline = 'middle'
+    // 深灰单色、不加描边：参考片的巨字是「压在墙上的暗字」，不是发光的水印。
+    // 加过一版描边，1080 宽上直接糊成几块灰砖，比不画还脏。
+    // 位置压到 0.20h：抬到 0.155h 会迎头撞上右上角那枚品牌胶囊。
+    c.fillStyle = R(P.void, 0.20)
+    c.fillText(word, w * 0.46, h * 0.20 + (1 - k) * 22)
+    c.restore()
+  }
+
   // ───────── HUD：页码 / 品牌胶囊 / 进度线 ─────────
   function timecode(t) {
     const fr = Math.floor(t * FPS)
@@ -187,7 +236,7 @@ export async function createFilm({ media }) {
     const page = pageAt(t)
     if (!page || !page.title) return
     const k0 = seg(t, page.start, page.start + 0.34)
-    const k1 = 1 - seg(t, page.start + 1.55, page.start + 2.0)
+    const k1 = 1 - seg(t, page.start + 1.18, page.start + 1.5)
     const a = E.outExpo(k0) * k1
     if (a <= 0.01) return
     const y = CH.y
@@ -236,10 +285,12 @@ export async function createFilm({ media }) {
 
   function drawBig(c, b, t, shot) {
     if (t < b.f0 || t >= b.f1) return
-    // 章节卡占着开场这 2 秒：两套文字同屏会打架（自测07 抽帧里「01 最赚钱的不是技术」
-    // 和大字「赚钱不是技术」上下叠着，说的是同一句话）。参考片开场只给章节卡。
+    // 章节卡在的时候不放大字：两套文字同屏会打架（自测07 抽帧里「01 最赚钱的不是技术」
+    // 和大字「赚钱不是技术」上下叠着，说的是同一句话）。但压 2 秒压过头了——章节卡自己
+    // 只活 1.7 秒，剩下那半秒小窗页的下半屏是全黑的（自测11 抽帧 7.0s）。现在章节卡收到
+    // 1.5 秒，大字从 1.5 秒起，两者不同屏也不再留空。
     const pg0 = pageAt(t)
-    if (pg0 && pg0.title && t < pg0.start + 2.0) return
+    if (pg0 && pg0.title && t < pg0.start + 1.5) return
     const lines = b.lines && b.lines.length ? b.lines : [b.text]
     const size = fitBigSize(lines)
     const lh = size * (BGL.lineGap || 1.06)
@@ -248,7 +299,10 @@ export async function createFilm({ media }) {
     c.save()
     // 小字眉：换页之后才出现，避免和章节卡打架
     const page = pageAt(t)
-    if (page && page.title && t > page.start + 2.0 && b.pageTitle) {
+    // 小字眉和大字是同一句话时不画：试过「● 泼一瓶冷水」压着「泼一瓶冷水」，
+    // 同一句话在一屏上写了两遍，看着像渲染重了。
+    const dupEye = b.pageTitle && (bare(b.text).includes(bare(b.pageTitle)) || bare(b.pageTitle).includes(bare(b.text)))
+    if (page && page.title && !dupEye && t > page.start + 1.6 && b.pageTitle) {
       const eye = '● ' + b.pageTitle
       txt(c, eye, BGL.left, top - 18, { size: TY.eyebrow, family: F.disp, weight: 600, color: R(P.lime, 0.85), spacing: 2.6 })
     }
@@ -395,6 +449,9 @@ export async function createFilm({ media }) {
     })
   }
 
+  // 刻度卡：柱高从「过去」到「现在」逐格下降——这是「门槛越来越低」的形状。
+  // 自测11 画成了从左往右涨的进度条，标签却写「越来越低」，画面自己说错了话（抽帧对参考片才看出来）。
+  // 参考片的柱是五根递减的短柱 + 两端 过去 / 现在 小标，不带任何数值。
   function gauge(c, b, t) {
     const k = clamp(seg(t, b.f0 + 0.2, b.f0 + 0.9))
     const cw = Math.min(430, w - M * 2), chh = 210
@@ -402,21 +459,30 @@ export async function createFilm({ media }) {
     c.save()
     c.globalAlpha *= k
     blockCard(c, x, y, cw, chh, 18)
-    txt(c, 'BARRIER', x + 24, y + 40, { size: TY.blockSmall - 2, family: F.disp, weight: 700, color: R(P.ash, 0.9), spacing: 3 })
-    txt(c, b.label || '门槛', x + 24, y + 82, { size: TY.block + 2, family: F.sans, weight: 900, color: R(P.paper, 1) })
+    txt(c, 'BARRIER', x + 24, y + 34, { size: TY.blockSmall - 2, family: F.disp, weight: 700, color: R(P.ash, 0.9), spacing: 3 })
+    txt(c, b.label || '门槛', x + 24, y + 74, { size: TY.block + 2, family: F.sans, weight: 900, color: R(P.paper, 1) })
     const cells = 5, gap = 10, cellW = (cw - 48 - gap * (cells - 1)) / cells
+    const base = y + 136, tall = 44
     const fill = E.outCubic(k)
     for (let i = 0; i < cells; i++) {
-      const cx = x + 24 + i * (cellW + gap), cy = y + 116
-      rrect(c, cx, cy, cellW, 16, 5)
-      c.fillStyle = R(P.paper, 0.14); c.fill()
-      const on = clamp((fill * cells - i) / 1)
-      if (on > 0) {
-        rrect(c, cx, cy, cellW * on, 16, 5)
+      const cx = x + 24 + i * (cellW + gap)
+      // 底槽：整格高，说明这一格「曾经」能到的高度
+      rrect(c, cx, base - tall, cellW, tall, 4)
+      c.fillStyle = R(P.paper, 0.10); c.fill()
+      const hRatio = 1 - i * 0.17
+      const on = clamp(fill * 1.6 - i * 0.15)
+      const hh = tall * hRatio * clamp(on)
+      if (hh > 1) {
+        rrect(c, cx, base - hh, cellW, hh, 4)
         c.fillStyle = R(i < 2 ? P.green : P.lime, 0.95); c.fill()
+        // 柱顶一道亮线：参考片的柱有边，不是一块糊上去的色块
+        line(c, cx, base - hh, cx + cellW, base - hh, R(P.paper, 0.85), 2)
       }
     }
-    txt(c, '越来越低', x + 24, y + 176, { size: TY.blockSmall + 2, family: F.sans, weight: 700, color: R(P.lime, 0.95) })
+    txt(c, '过去', x + 24, base + 20, { size: TY.blockSmall - 6, family: F.sans, weight: 600, color: R(P.ash, 0.85) })
+    const nowW = measure(c, '现在', TY.blockSmall - 6, F.sans, 600)
+    txt(c, '现在', x + cw - 24 - nowW, base + 20, { size: TY.blockSmall - 6, family: F.sans, weight: 600, color: R(P.ash, 0.85) })
+    txt(c, '越来越低 ↓', x + 24, y + 190, { size: TY.blockSmall + 2, family: F.sans, weight: 700, color: R(P.lime, 0.95) })
     c.restore()
     reg(x, y, cw, chh, 'block:gauge')
   }
@@ -559,6 +625,7 @@ export async function createFilm({ media }) {
       else {
         drawPerson(c, img, shot)
         scrim(c, shot, t)
+        backWord(c, t, shot)
         frameMarks(c, shot)
       }
       const onCard = shot.kind === 'card'

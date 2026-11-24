@@ -313,7 +313,18 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
       continue
     }
     const hit = cards.find(c => b.text && bare(c.text).includes(bare(b.text))) || cards[0]
-    const at = hit ? hit.f0 : p.start + 0.4
+    // 图形块不能排进全屏字卡里：色卡是一整块纯底 + 一句大字，上面不叠任何块
+    // （film.js 的 draw() 里也是直接跳过）。以前只按「这一页的第一张卡」定时，
+    // 卡刚好落在色卡区间时，块就被排进色卡——白排一个，而且自检只看数据是看不出来的。
+    const at0 = hit ? hit.f0 : p.start + 0.4
+    const atCard = shots.find(s => at0 >= s.f0 && at0 < s.f1)
+    let at = at0
+    if (atCard && atCard.kind === 'card') {
+      const next = shots.find(s => s.f0 >= atCard.f1 && s.kind !== 'card')
+      const prev = [...shots].reverse().find(s => s.f1 <= atCard.f0 && s.kind !== 'card')
+      at = next ? next.f0 + 0.15 : prev ? Math.max(prev.f0 + 0.2, prev.f1 - 3.2) : null
+    }
+    if (at == null) continue
     if (b.kind === 'check') blocks.push({ kind: 'check', f0: at + 0.15, f1: Math.min(at + 3.0, duration - 0.6), text: b.text, at: 'bottom' })
     else if (b.kind === 'banner') {
       // 红条是横向满宽的一条，只能压在满幅上；这一页如果换了版式，就挪到最近的一段满幅
@@ -327,7 +338,14 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
   // 分镜一条都没给（模型不可用）时的确定性兜底：别让画面从头到尾一个构图
   if (!shotPlan.length) {
     const gaugeBeat = beats.find(x => /门槛|越来越低|越来越难/.test(x.text))
-    if (gaugeBeat) blocks.push({ kind: 'gauge', f0: gaugeBeat.f0 + 0.1, f1: Math.min(gaugeBeat.f1 + 3.6, duration - 0.6), label: '门槛', at: 'mid' })
+    if (gaugeBeat) {
+      // 同一条规矩：兜底路径也不许把块排进全屏字卡（06 群就是兜底路径撞上的）
+      const c0 = gaugeBeat.f0 + 0.1
+      const hitCard = shots.find(s => c0 >= s.f0 && c0 < s.f1 && s.kind === 'card')
+      const next = hitCard && shots.find(s => s.f0 >= hitCard.f1 && s.kind !== 'card')
+      if (!hitCard) blocks.push({ kind: 'gauge', f0: c0, f1: Math.min(gaugeBeat.f1 + 3.6, duration - 0.6), label: '门槛', at: 'mid' })
+      else if (next) blocks.push({ kind: 'gauge', f0: next.f0 + 0.15, f1: Math.min(next.f0 + 4.0, duration - 0.6), label: '门槛', at: 'mid' })
+    }
     const banBeat = beats.find(x => /^(别再|不要|别去|不用)/.test(bare(x.text)) && bare(x.text).length <= 10)
     if (banBeat) {
       const full = shots.find(s => s.kind === 'full' && banBeat.f0 >= s.f0 && banBeat.f0 < s.f1)
