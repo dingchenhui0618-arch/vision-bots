@@ -224,6 +224,7 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     // picks 是各轮累加的，如果 model 块取最后一轮，报告里就只剩 picked:0 / 票数空，
     // 「哪几句在摇、几票对几票」这份证据当场丢掉（自测24 第一次重跑就是这样）。
     let evidence = null
+    const detail = []   // 每一轮删了什么：报告要能自证，前后两轮的句子下标不是同一套编号
     for (let k = 0; k < rounds; k++) {
       if (fit(cur.outDuration)) {
         if (k === 0) log('选句删：成片 ' + cur.outDuration.toFixed(2) + 's 已经在目标 ' + targetSec + 's 以内，不删内容')
@@ -239,6 +240,7 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
           else if (!evidence) evidence = pr
         }
       }
+      detail.push({ round: k + 1, before: Number(cur.outDuration.toFixed(2)), picks: (pr && pr.picks || []).length, refused: (pr && pr.refusedCount) || 0, units: (pr && pr.units) || [], notes: (pr && pr.notes) || [] })
       if (!pr || !pr.picks || !pr.picks.length) break
       const ranges = pr.picks.map(x => ({ i0: Number(x.i0), i1: Number(x.i1), reason: 'content', text: x.text }))
       const bad = ranges.find(r => !Number.isInteger(r.i0) || !Number.isInteger(r.i1))
@@ -249,8 +251,13 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
       log('选句删第 ' + (k + 1) + ' 轮：删 ' + applied.length + ' 句后成片 ' + cur.outDuration.toFixed(2) + 's（目标 ' + targetSec + 's）')
       if (fit(cur.outDuration)) break
     }
-    prune = last
-      ? { ...last, model: (evidence && evidence.model) || last.model, before, after: Number(cur.outDuration.toFixed(2)), picks: all, rounds: applied.length ? (last.rounds || 1) : 0 }
+    // 报告里的「挡了哪几句」必须和「删了哪几句」来自**同一轮**：句子下标每轮都会变
+    // （删掉词之后分句会重排），混用两轮的 refused / picks 会让报告自相矛盾。
+    // 自测24 的内容预算报告就是这样：picks 说 idx 6 是「我最近研究了一圈」，
+    // refused 里 idx 6 却是「真正的机会是在OPC结合内容」——两个编号体系。
+    const ev = evidence || last
+    prune = ev
+      ? { ...ev, model: ev.model || null, before, after: Number(cur.outDuration.toFixed(2)), picks: all, rounds: applied.length ? (last.rounds || 1) : 0, roundsDetail: detail }
       : null
     if (prune) {
       prune.delta = Number((cur.outDuration - targetSec).toFixed(2))

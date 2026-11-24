@@ -3,7 +3,7 @@
  * 这里验的是「模型说的话能不能被采信」，模型本身的质量靠真素材跑片看。
  */
 import { checkTitle, validateBatch, TITLE } from '../src/section-titles.mjs'
-import { groundIssues, verifyHomophones, judgeSemantic, confirmsReading, adjudicateByAudio, KINDS, SEMANTIC, semanticBudget } from '../src/qa-semantic.mjs'
+import { groundIssues, verifyHomophones, judgeSemantic, confirmsReading, adjudicateByAudio, KINDS, SEMANTIC, semanticBudget, reviewText } from '../src/qa-semantic.mjs'
 import { sectionsOf, applyTitles } from '../src/sections.mjs'
 import { mergeSections } from '../src/chapters.mjs'
 
@@ -142,6 +142,23 @@ ok(TITLE.groundRatio >= 0.8, '门槛：接地比例不得低于 80%')
   const done = await adjudicateByAudio({ issues: [{ ...issue, severity: 'warn' }], words: words1, media: 'x.mp4', cap: 2 })
   ok(done[0].severity === 'warn', '仲裁 · 已经降级的原样留着', done[0].severity)
 }
+
+
+// ── 模型回了个空 JSON：换一个采样重问一次，别把空回答当成「查过了、没问题」（自测25） ──
+// 真素材上连跑两次质检都报「没给 checkedCaps，模型返回空」：空回答会被缓存，不换采样就一直是空的。
+const scards = { cards: [{ start: 0, text: '今天说个事' }, { start: 2, text: '内容红利来了' }] }
+const goodAns = { ok: true, ms: 1, model: 'fake', content: '{"checkedCaps":2}', value: { checkedCaps: 2, firstQuote: '今天说个', lastQuote: '内容红利', verdict: 'ok', issues: [] } }
+const emptyAns = { ok: true, ms: 1, model: 'fake', content: '', value: {} }
+let calls1 = 0
+const retry = await reviewText({ captions: scards, brief: { platform: '抖音', duration: 60 }, propose: async () => { calls1++; return calls1 === 1 ? emptyAns : goodAns } })
+ok('第一次回空 → 换采样重问一次就采信', retry.ok === true && calls1 === 2, JSON.stringify({ ok: retry.ok, calls: calls1, skipped: retry.skipped }))
+let calls2 = 0
+const twice = await reviewText({ captions: scards, brief: { platform: '抖音', duration: 60 }, propose: async () => { calls2++; return emptyAns } })
+ok('两次都回空 → 判不通过，不装作查过了', twice.ok === false && twice.skipped === 'reading-unverified' && calls2 === 2, JSON.stringify({ ok: twice.ok, skipped: twice.skipped, calls: calls2 }))
+ok('两次回空时，两次的原因都写进 detail（能查）', /没给 checkedCaps/.test(String(twice.detail || '')) && /重问一次/.test(String(twice.detail || '')), String(twice.detail).slice(0, 120))
+let calls3 = 0
+const direct = await reviewText({ captions: scards, brief: { platform: '抖音', duration: 60 }, propose: async () => { calls3++; return goodAns } })
+ok('第一次就读全 → 不多问一次（不白花 token）', direct.ok === true && calls3 === 1, JSON.stringify({ ok: direct.ok, calls: calls3 }))
 
 console.log(fails.length ? 'FAIL ' + fails.length + ' / ' + (pass + fails.length) : 'PASS ' + pass)
 if (fails.length) { for (const f of fails) console.log('  ✗ ' + f); process.exit(1) }

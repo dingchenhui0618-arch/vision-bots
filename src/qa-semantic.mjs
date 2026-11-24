@@ -292,7 +292,7 @@ export function judgeSemantic(semantic, { cards = 0 } = {}) {
  * 一次语义审读。返回 {ok:true, issues, dropped, ...} 或 {ok:false, skipped}。
  * 判断合不合法由 groundIssues / verifyHomophones 负责，这里只负责把话说给模型。
  */
-export async function reviewText({ words = [], captions = null, sections = [], brief = {}, terms = null, log = () => {}, model = null, media = null, relistenDir = null } = {}) {
+export async function reviewText({ words = [], captions = null, sections = [], brief = {}, terms = null, log = () => {}, model = null, media = null, relistenDir = null, propose = null } = {}) {
   const cards = (captions && captions.cards) || []
   if (!cards.length) return { ok: false, skipped: 'no-captions' }
 
@@ -331,13 +331,16 @@ export async function reviewText({ words = [], captions = null, sections = [], b
   // 别在这里硬写 fast——自测 19 里「最可能抓到错字的那一层没跑成」就是这类硬写留下的坑。
   const call = taskCall('qc', { maxTokens: budget0, timeoutMs: SEMANTIC.timeoutMs })
   const opts = model ? { ...call, model } : call
-  let r = await chatJSONCached({ prompt, ...opts })
+  // propose 是自检用的注入口（和 src/prune.mjs 同一套做法）：离线断言不许联网，
+  // 但「第一次回空、换采样再问」这条行为必须能测。
+  const ask = o => (typeof propose === 'function' ? propose(o) : chatJSONCached(o))
+  let r = await ask({ prompt, ...opts })
   let budget = budget0
   const salvaged = v => v === null || v === undefined || Array.isArray(v)
   if (salvaged(r.ok ? r.value : null)) {
     const budget1 = Math.min(SEMANTIC.tokensCap, Math.round(budget0 * SEMANTIC.retryFactor))
     log('语义审读：这次输出被截断（预算 ' + budget0 + ' token），抬到 ' + budget1 + ' 重试一次')
-    const r2 = await chatJSONCached({ prompt, ...opts, maxTokens: budget1 })
+    const r2 = await ask({ prompt, ...opts, maxTokens: budget1 })
     budget = budget1
     if (!salvaged(r2.ok ? r2.value : null)) r = r2
     else if (!r.ok) r = r2
@@ -349,10 +352,24 @@ export async function reviewText({ words = [], captions = null, sections = [], b
 
   // 只认条数不够：模型不读也能数出条数。还要它逐字报第一张和最后一张卡的开头，
   // 这两处只有真读完整个列表才答得对——这是「它到底看没看全」的实证。
-  const seen = confirmsReading(r.value, cards)
+  let seen = confirmsReading(r.value, cards)
   if (!seen.ok) {
-    log('语义审读：读全性验证没过（' + seen.why + '），采信不了')
-    return { ok: false, skipped: 'reading-unverified', detail: seen.why + '；模型返回：' + String(r.content || '').slice(0, 160), model: r.model }
+    // 模型这次没给「读全了」的证据——最常见的是回了个空 JSON（content 也是空的）。
+    // 这跟输出被截断是同一类问题：这个**结论**不能用，但这个**样本**说明不了任何事，
+    // 所以换一个采样重问一次，别把同一个空回答当成「查过了、没问题」。
+    // 自测25 实测：同一个提问连跑两次质检都报「没给 checkedCaps，模型返回空」，
+    // 加这一层之后一次就过——空回答会被缓存，不换盐重问会一直空下去。
+    const budget1 = Math.min(SEMANTIC.tokensCap, Math.max(budget0, Math.round(budget0 * SEMANTIC.retryFactor)))
+    log('语义审读：读全性验证没过（' + seen.why + '），换一个采样再问一次')
+    const r2 = await ask({ prompt, ...opts, maxTokens: budget1, salt: 'recheck:1' })
+    const seen2 = r2.ok ? confirmsReading(r2.value, cards) : { ok: false, why: r2.skipped || '没接上' }
+    budget = budget1
+    if (!seen2.ok) {
+      log('语义审读：重问一次还是没读全（' + seen2.why + '），采信不了')
+      return { ok: false, skipped: 'reading-unverified', detail: seen.why + '；重问一次：' + seen2.why + '；模型返回：' + String((r2.content || r.content) || '').slice(0, 160), model: r2.model || r.model }
+    }
+    r = r2
+    seen = seen2
   }
 
   const raw = Array.isArray(r.value && r.value.issues) ? r.value.issues.slice(0, SEMANTIC.maxIssues) : []

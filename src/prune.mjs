@@ -34,6 +34,8 @@ export const DEFAULT_PRUNE = {
   mode: 'score',      // score = 逐句表态（默认）；pick = 自由挑几句（保留做对照）
   samples: 3,         // 同一个问题独立判读几次，取多数票：温度钉 0 在这个网关上也不保证一致
   minVotes: null,     // 默认 samples 的过半票
+  maxSpan: 4,         // 一个删除单元最多连着几句（相邻、都够票的句子并成一段）
+  clauseSoft: true,   // 「不许连说两个但是」是风格偏好，不是破坏：硬解不存在时才放开，并记进报告
 }
 
 /** 主张句：这一句是论点不是铺垫，删了观点就没了。 */
@@ -78,6 +80,21 @@ const CLAUSE_START = /^(但是|可是|不过|所以|因此|于是|而且|因为)
 
 const round2 = n => Math.round(n * 100) / 100
 const round3 = n => Math.round(n * 1000) / 1000
+
+/** 把选中的句子按「连着删的是同一个单元」并起来：报告里要说清楚删掉的是几段，不是几句。 */
+function unitsOf(picks) {
+  const out = []
+  for (const x of picks) {
+    const last = out[out.length - 1]
+    if (last && x.idx === last.idx[last.idx.length - 1] + 1) {
+      last.idx.push(x.idx)
+      last.dur = round2(last.dur + x.dur)
+      last.texts.push(x.text)
+      last.why.push(x.why)
+    } else out.push({ idx: [x.idx], dur: round2(x.dur), texts: [x.text], why: [x.why] })
+  }
+  return out
+}
 
 /** 最长公共子串 / 较短串长度。整句重复用这个最灵敏（和质检口径一致）。 */
 export function similarity(a, b) {
@@ -269,7 +286,9 @@ export function chooseSubset({ candidates, sentences, current, target, params = 
     if (chars > maxChars) continue
     if (drop > maxDrop + 1e-6) continue
     if (longestRun(picked) > (p.maxConsecutive ?? 2)) continue
-    if (adjacencyProblem(picked, sentences)) continue
+    // 「连说两个但是」是风格问题，不是破坏：默认照样拦，但调用方可以先按硬约束找解、
+    // 找不到再放开它（allowBothClause），并在报告里写明放开了什么。
+    if (!p.allowBothClause && adjacencyProblem(picked, sentences)) continue
     // 碎片句：不许单独删自己的前半句，也不许只删前半句把碎片吊在空中
     const drop2 = new Set(picked)
     let fragBad = false
@@ -298,16 +317,30 @@ export function chooseSubset({ candidates, sentences, current, target, params = 
  *   重复   → 前面必须真说过一句一样的
  *   过渡/废话/口头 → 这句得真像过渡（以「就是/然后/其实/我最近」起头，或者很短）
  */
-export function reasonFits(s, why, sentences, dups = []) {
+export function reasonFits(s, why, sentences, dups = [], unit = null) {
   const w = String(why || '')
   if (!w) return { ok: true }
+  // 单元级核对：相邻的几句一起删时，理由说的是**这一段**，不是其中某一句。
+  // 自测25 的根因就在这里：模型对「大家在看这些满大街都是在做AI模型 / 做AI工具的」说了「铺垫」，
+  // 规则按单句核、两句都判「这不是过渡句」，于是这段唯一干净的 4.5 秒没删成，成片停在 64.9s。
+  // 理由能对上的前提也变了：「铺垫」不再靠开头像不像，而看这一段后面是不是紧接转折或反问。
+  const group = (unit && Array.isArray(unit.idx) && unit.idx.length > 1)
+    ? unit.idx.map(i => sentences[i]).filter(Boolean)
+    : [s]
+  const inGroup = new Set(group)
   if (/重复|复读/.test(w)) {
-    const dup = dups.includes(s.idx) || sentences.some(x => x.idx !== s.idx && isDup(x.bare, s.bare))
-    return dup ? { ok: true } : { ok: false, why: '模型说这句是重复，但前面没说过一样的话' }
+    const dup = dups.includes(s.idx) || group.some(g => sentences.some(x => !inGroup.has(x) && isDup(x.bare, g.bare)))
+    return dup ? { ok: true, ...(group.length > 1 ? { unit: true } : {}) }
+      : { ok: false, why: '模型说这句是重复，但前面没说过一样的话' }
   }
   if (/(过渡|铺垫|废话|口头|水词|填充)/.test(w)) {
-    const looks = /^(就是|就是说|然后|那个|其实|我最近|所以说|所以|那么|呃|嗯|啊|好)/.test(s.bare) || s.bare.length <= 6
-    return looks ? { ok: true } : { ok: false, why: '模型说这句是过渡/废话，但这句不是过渡句（它带观点或信息）' }
+    const looks = group.some(x => /^(就是|就是说|然后|那个|其实|我最近|所以说|所以|那么|呃|嗯|啊|好)/.test(x.bare) || x.bare.length <= 6)
+    const nx = unit && unit.next
+    const pivot = Boolean(nx) && (CLAUSE_START.test(nx.bare) || /[呢吗吧？?]$/.test(String(nx.text || nx.bare || '').trim()))
+    if (looks || pivot) {
+      return { ok: true, ...(pivot && !looks ? { by: '后面紧接转折/反问，这段在给它铺垫' } : {}), ...(group.length > 1 ? { unit: true } : {}) }
+    }
+    return { ok: false, why: '模型说这句是过渡/废话，但这句不是过渡句（它带观点或信息）' }
   }
   return { ok: true, unverified: true }
 }
@@ -442,21 +475,40 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
   // 离线注入口一次给一份答案时按 1 票算（老断言不受影响）；要测投票就显式给 samples / minVotes，
   // 并让 propose 一次返回一组答案（数组＝几次判读），这样离线也能复现「同一输入三次判得不一样」。
   const minVotes = Math.max(1, Math.min(wantSamples, Number(p.minVotes) || (typeof propose === 'function' ? 1 : Math.ceil(wantSamples / 2))))
+  // saltSeed 只做一件事：换一批缓存指纹，强制重新采样。默认空 = 产品行为不变；
+  // 量「同一份输入独立采三遍，判定稳不稳」时用它（自测25 起，也算 Opus 的验收手法）。
+  const seed = String(p.saltSeed || '')
+  const saltOf = k => (seed ? seed + ':' : '') + (k ? 'sample:' + k : '')
   const askOnce = (note, list, allow, k) => (typeof propose === 'function'
     ? propose(list, note)
     // 走剪辑 bot 的配置（模型、温度）。salt 只进缓存指纹、不进提问：同一份问题采几次样，
     // 每次各存一份缓存，所以同一个群重跑时这几票全是原样命中，结果不会自己变。
     : (mode === 'pick'
-      ? chatJSONCached({ prompt: PROMPT({ target, current, need, list, note }), ...taskCall('cutter', { maxTokens: 760 }), salt: k ? 'sample:' + k : '' })
-      : chatJSONCached({ prompt: SCORE_PROMPT({ target, current, need, list, allow, note }), ...taskCall('cutter', { maxTokens: 1200 }), salt: k ? 'sample:' + k : '' })))
+      ? chatJSONCached({ prompt: PROMPT({ target, current, need, list, note }), ...taskCall('cutter', { maxTokens: 760 }), salt: saltOf(k) })
+      : chatJSONCached({ prompt: SCORE_PROMPT({ target, current, need, list, allow, note }), ...taskCall('cutter', { maxTokens: 1200 }), salt: saltOf(k) })))
 
   const modelYes = new Map()   // 模型点名可以删的句子（多轮累加）
   const modelWeak = new Map()  // 模型提了、但理由对不上句子的（降一档用）
   const modelBad = []          // 上面那些，带理由留在报告里
   const blocked = []           // 模型想删、被规则挡住的（原话片段）
-  const modelInfo = { rounds: 0, mode, samples: wantSamples, asks: 0, minVotes, picked: 0, votes: [], unstable: [], blocked, skipped: null }
+  const modelInfo = { rounds: 0, mode, samples: wantSamples, asks: 0, minVotes, picked: 0, votes: [], units: [], proposed: [], unstable: [], blocked, skipped: null }
   let widened = false
   let best = null
+  const notes = []   // 为了让时长落地、放开了哪条风格规则——照实写进报告
+  // 选一组：先按硬规则挑；挑不出（或挑不出够近的）才放开「连说两句但是」这种风格偏好。
+  // 规则分两级——破坏（悬空、丢唯一信息、删出半句）不能放，风格（重复用词）可以让。
+  const pickSubset = cands2 => {
+    const hard = chooseSubset({ candidates: cands2, sentences, current, target, params: p, fragments })
+    if (hard && current - hard.drop <= upper) return hard
+    if (p.clauseSoft !== false) {
+      const soft = chooseSubset({ candidates: cands2, sentences, current, target, params: { ...p, allowBothClause: true }, fragments })
+      if (soft) {
+        soft.soft = '为了落进目标时长，允许删除后连着出现两句「但是」开头的话'
+        if (current - soft.drop <= upper) return soft
+      }
+    }
+    return hard || null
+  }
 
   // 最多问两轮：第一轮问「规则允许的每一句能不能删」；不够就告诉它「上一轮被规则挡住了哪几句」再问一次。
   // 「删哪句读得通」是判断力问题，交给模型；「哪些句不许删」是规则问题，留在规则里。
@@ -505,42 +557,73 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
       if (round === 0) log('选句：模型没接上（' + modelInfo.skipped + '），按确定性价值排序删')
       break
     }
-    let added = 0
+    // 第一遍只按票数收「够票、规则也允许」的句子，理由留到删除单元拼好之后一起核。
+    const approved = []
     for (const [i, v] of votes) {
       if (modelYes.has(i) || modelWeak.has(i)) continue
       const why = v.whys[0] || ''
-      const row = { idx: i, text: sentences[i].bare.slice(0, 14), yes: v.yes, no: v.no }
       const ref = refused.find(x => x.idx === i)
-      if (ref) {
-        // 模型想删、规则不许：这是「模型提了什么、哪条规则打回」的证据，同时驱动第二轮
-        if (v.yes >= minVotes) {
+      if (v.yes >= minVotes) {
+        if (ref) {
+          // 模型想删、规则不许：这是「模型提了什么、哪条规则打回」的证据，同时驱动第二轮
           ref.byModel = ref.byModel || why
           if (!blocked.includes(ref.text)) blocked.push(ref.text)
         }
+        modelInfo.proposed.push({ idx: i, text: sentences[i].bare.slice(0, 14), yes: v.yes, no: v.no, why, refused: ref ? ref.why : null })
+        if (!ref) approved.push({ i, v, why })
         continue
       }
-      if (v.yes >= minVotes) {
-        const fit = reasonFits(sentences[i], why, sentences, dups)
-        if (!fit.ok) {
-          // 主张句（「才是」「真正的」「不是」…）连降档都不给：模型给的理由对不上，
-          // 说明它没读懂这句在片子里的位置，这时候按「降一档也能删」处理，删掉的常是论点。
-          const claim = CLAIM.find(c => sentences[i].bare.includes(c))
-          if (claim) {
-            modelBad.push({ idx: i, text: sentences[i].bare.slice(0, 18), why: '主张句（含「' + claim + '」）不走降档，理由又对不上', said: why })
-            continue
-          }
-          // 理由对不上不等于这句不能删：把它降一档（只在「对得上的那几句不够」时才用），照实记下来
-          modelBad.push({ idx: i, text: sentences[i].bare.slice(0, 18), why: fit.why, said: why })
-          modelWeak.set(i, why)
+      if (v.yes > 0) {
+        // 有票但不够票：这就是「同一输入两次判得不一样」落在哪几句上的直接证据
+        modelInfo.unstable.push({ idx: i, text: sentences[i].bare.slice(0, 14), yes: v.yes, no: v.no, why })
+      }
+    }
+    // 碎片句：转写把一句话切成两段（「…都是在做AI模型」/「做AI工具的」），后半截不能单独删，
+    // 前半截删了后半截就吊在空中——它们是一个删除单元。模型常常只对后半截表态，
+    // 前半句要一起带上，前提是规则本来就允许删它（硬拦的句子不许带）。
+    for (const a of approved.slice()) {
+      if (!fragments[a.i]) continue
+      const prevIdx = a.i - 1
+      if (prevIdx < 0 || approved.some(x => x.i === prevIdx) || refused.some(x => x.idx === prevIdx)) continue
+      approved.push({ i: prevIdx, v: a.v, why: '碎片前半句', carrier: true })
+    }
+    approved.sort((x, y) => x.i - y.i)
+    // 第二遍：相邻的、都够票的句子并成一个删除单元，理由按**这一段**核。
+    // 这一步是自测25 的核心：模型的判读粒度本来就是「一段话」，规则的核对粒度也得跟它对齐。
+    const inApproved = new Set(approved.map(a => a.i))
+    const spanCap = Math.max(1, Math.min(Number(p.maxSpan) || 4, Number(p.maxConsecutive ?? 2) || 2))
+    const seenUnit = new Set()
+    let added = 0
+    for (const a of approved) {
+      if (seenUnit.has(a.i)) continue
+      let lo = a.i, hi = a.i
+      // 单元不许重叠：已经并进前一个单元的句子不再重复计入（否则三句连着时会拼出 [2,3] 和 [3,4]）
+      while (inApproved.has(lo - 1) && !seenUnit.has(lo - 1) && hi - lo + 1 < spanCap) lo--
+      while (inApproved.has(hi + 1) && !seenUnit.has(hi + 1) && hi - lo + 1 < spanCap) hi++
+      const unitIdx = []
+      for (let k = lo; k <= hi; k++) { unitIdx.push(k); seenUnit.add(k) }
+      // 单元的理由取模型自己给的那条；「碎片前半句」是规则补的载体，不能当理由用（它不是判断）
+      const why = unitIdx.map(k => approved.find(y => y.i === k)).filter(x => x && !x.carrier && x.why).map(x => x.why)[0] || ''
+      const fit = reasonFits(sentences[a.i], why, sentences, dups, { idx: unitIdx, next: sentences[hi + 1] || null })
+      if (!fit.ok) {
+        // 主张句（「才是」「真正的」「不是」…）连降档都不给：模型给的理由对不上，
+        // 说明它没读懂这一段在片子里的位置，这时候按「降一档也能删」处理，删掉的常是论点。
+        const claim = unitIdx.map(k => CLAIM.find(c => sentences[k].bare.includes(c))).find(Boolean)
+        if (claim) {
+          modelBad.push({ idx: a.i, text: unitIdx.map(k => sentences[k].bare).join('/').slice(0, 18), why: '主张句（含「' + claim + '」）不走降档，理由又对不上', said: why })
           continue
         }
-        modelYes.set(i, why || '模型判为可删')
-        added++
-        modelInfo.votes.push({ ...row, why })
-      } else if (v.yes > 0) {
-        // 有票但不够票：这就是「同一输入两次判得不一样」落在哪几句上的直接证据
-        modelInfo.unstable.push({ ...row, why })
+        // 理由对不上不等于不能删：把它降一档（只在「对得上的那几句不够」时才用），照实记下来
+        modelBad.push({ idx: a.i, text: unitIdx.map(k => sentences[k].bare).join('/').slice(0, 18), why: fit.why, said: why })
+        for (const k of unitIdx) modelWeak.set(k, why)
+        continue
       }
+      for (const k of unitIdx) {
+        modelYes.set(k, why || '模型判为可删')
+        added++
+        modelInfo.votes.push({ idx: k, text: sentences[k].bare.slice(0, 14), yes: a.v.yes, no: a.v.no, why })
+      }
+      if (unitIdx.length > 1) modelInfo.units.push({ idx: unitIdx, texts: unitIdx.map(k => sentences[k].bare), why, by: fit.by || null })
     }
     modelInfo.picked = modelYes.size
     if (round === 0 && !modelYes.size && !blocked.length) {
@@ -554,7 +637,7 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
     }
     if (round > 0 && !added) break
     const strong = cands.filter(s => modelYes.has(s.idx) || dups.includes(s.idx))
-    best = chooseSubset({ candidates: strong, sentences, current, target, params: p, fragments })
+    best = pickSubset(strong)
     if (best && current - best.drop <= upper) break
   }
 
@@ -563,11 +646,12 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
   // 那是全片的论点。删内容是编辑判断，判断没有就是没有，不能靠公式凑。
   if (!best || current - best.drop > upper) {
     const weak = cands.filter(s => modelWeak.has(s.idx) && !modelYes.has(s.idx))
-    const b2 = chooseSubset({ candidates: [...cands.filter(s => modelYes.has(s.idx) || dups.includes(s.idx)), ...weak], sentences, current, target, params: p, fragments })
+    const b2 = pickSubset([...cands.filter(s => modelYes.has(s.idx) || dups.includes(s.idx)), ...weak])
     if (b2 && (!best || b2.drop > best.drop)) { best = b2; widened = true }
     if (widened) log('选句：理由对得上的句子不够，动用了 ' + weak.length + ' 句「模型提了但理由对不上」的，成片 ' + round2(current - b2.drop) + 's')
   }
 
+  if (best && best.soft && !notes.includes(best.soft)) notes.push(best.soft)
   const sourceOf = s => (dups.includes(s.idx) ? 'repeat' : (modelYes.has(s.idx) ? 'model' : (modelWeak.has(s.idx) ? 'model-weak' : 'rules')))
   const picks = best
     ? best.picked.map(i => {
@@ -596,7 +680,8 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
     (modelBad.length ? '；理由对不上句子被拒 ' + modelBad.length + ' 条' : '') +
     '；要删 ' + round2(need) + 's，选中 ' + picks.length + ' 句 ' + round2(drop) + 's' +
     (picks.length ? '：' + picks.map(x => '「' + x.text.slice(0, 10) + '」').join('、') : '') +
-    '；成片 ' + round2(after) + 's / 目标 ' + target + 's' + (hit ? '' : '（还差 ' + round2(after - target) + 's，没有可删的整句了）'))
+    '；成片 ' + round2(after) + 's / 目标 ' + target + 's' + (hit ? '' : '（还差 ' + round2(after - target) + 's，没有可删的整句了）') +
+    (notes.length ? '；' + notes.join('；') : ''))
 
   return {
     ok: true,
@@ -615,5 +700,8 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
     rejectedByReason: modelBad.slice(0, 20),
     model: modelInfo,
     candidatesAllowed: cands.length,
+    // 删除单元：连着删的两句是一个单元（碎片的前后半句、或两句一起才说得通的一段）
+    units: unitsOf(picks),
+    notes,
   }
 }

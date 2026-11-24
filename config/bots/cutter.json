@@ -27,7 +27,9 @@
       "maxRounds": 2,
       "mode": "score",
       "samples": 3,
-      "minVotes": 2
+      "minVotes": 2,
+      "maxSpan": 4,
+      "clauseSoft": true
     },
     "gap": {
       "period": 0.3,

@@ -6,7 +6,7 @@
  * 模型说「应该是知道怎么做」不算证据（自测13 实测那条建议是错的，音频里只有「会」），
  * 换一个更强的模型在同一段音频上听到「的人」才算——因为它听的是素材本身。
  */
-import { alignCrop, charDiff, planRepair, silentGaps, modelAvailable, relistenSentence, enabled, slotAnomaly, R, strip } from '../src/relisten.mjs'
+import { alignCrop, charDiff, planRepair, silentGaps, modelAvailable, relistenSentence, enabled, slotAnomaly, voteTexts, R, strip } from '../src/relisten.mjs'
 import { lowConfidenceClusters } from '../src/asr-fix.mjs'
 import { phraseAround } from '../src/qa-semantic.mjs'
 
@@ -144,6 +144,21 @@ ok('VISION_BOTS_RELISTEN=0 → 整层关掉', enabled() === false)
 process.env.VISION_BOTS_RELISTEN = old ?? ''
 ok('strip 去掉标点后能逐字比', strip('知道的人，会做的人太少了') === '知道的人会做的人太少了')
 
+
+// ── 多个窗口的读数：多数一致才采信（自测25） ──
+// 实测 62.52–64.16s「卷内容生产力」：三个窗口 ['卷','剪','卷']。只开两个窗口、且正好听成 ['剪','卷'] 时，
+// 老规矩判「两次不一致、不算证据」，一处音频确凿的错字就永久留在片子里（自测23、24 两版都带着）。
+const v1 = voteTexts(['卷内容生产力', '剪内容生产力', '卷内容生产力'])
+ok('三个窗口 2:1 → 采信多数那读', v1.majorityOk === true && v1.topText === '卷内容生产力', JSON.stringify(v1))
+ok('票数写进结果（几比几可查）', v1.votes.length === 2 && v1.votes[0].n === 2 && v1.votes[1].n === 1, JSON.stringify(v1.votes))
+const v2 = voteTexts(['剪内容生产力', '卷内容生产力'])
+ok('两个窗口各读一半（1:1）→ 不采信（不挑顺眼的）', v2.majorityOk === false, JSON.stringify(v2))
+const v3 = voteTexts(['卷内容生产力', '卷内容生产力', '剪内容生产力'])
+ok('三个窗口 2:1 的另一边 → 同样采信', v3.majorityOk === true && v3.topText === '卷内容生产力', JSON.stringify(v3))
+const v4 = voteTexts(['甲', '乙', '丙'])
+ok('三个窗口各读一样 → 不采信', v4.majorityOk === false, JSON.stringify(v4))
+const v5 = voteTexts(['卷', '卷', '卷'])
+ok('三个窗口全一致 → 采信，且只有一读', v5.majorityOk === true && v5.votes.length === 1, JSON.stringify(v5))
 const total = pass + fails.length
 console.log(fails.length ? 'FAIL ' + fails.length + '/' + total : 'PASS ' + total + ' 条')
 for (const f of fails) console.log('  ✗ ' + f)

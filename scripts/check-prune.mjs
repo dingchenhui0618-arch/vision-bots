@@ -302,6 +302,47 @@ const claimRun = await planPrune({
 ok('主张句 + 理由对不上 → 连降档都不给（删掉的常是论点）', claimRun.picks.length === 0, JSON.stringify(claimRun.picks.map(p => [p.text, p.source])))
 ok('被挡的那条留在 rejectedByReason 里，理由可查', claimRun.rejectedByReason.some(r => r.idx === iClaim && /主张句/.test(r.why)), JSON.stringify(claimRun.rejectedByReason))
 
+
+// ── 删除单元：模型的判读粒度本来就是「一段」，规则的核对粒度也得跟它对齐（自测25） ──
+// 真实素材里模型对「大家在看这些满大街都是在做AI模型 / 做AI工具的」说了「铺垫」，规则按单句核，
+// 两句都不像过渡句，于是这段唯一干净的 4.48 秒没删成，成片停在 64.9s（目标 60s，+8.2%）。
+// 换的不是模型，是核对的单位：相邻、都够票的句子是一个删除单元，理由按这一段核。
+const U_LINES = ['今天大家都在卷AI技术', '但是我今天就要给大家泼一瓶冷水', '大家在看这些满大街都是在做AI模型', '做AI工具的人特别多', '真正赚钱的又有几个人呢', '真正的机会是在内容', '我们可以聊一聊']
+const F_LINES = ['今天大家都在卷AI技术', '但是我今天就要给大家泼一瓶冷水', '大家在看这些满大街都是在做AI模型', '做AI工具的', '但是真正赚钱的有几个呢', '真正的机会是在内容', '我们可以聊一聊']
+const N_LINES = ['今天大家都在卷AI技术', '但是我今天就要给大家泼一瓶冷水', '大家在看这些满大街都是在做AI模型', '做AI工具的人特别多', '真正的机会是在内容', '我们可以聊一聊']
+const U_PARAMS = { samples: 3, minVotes: 2, maxChars: 0.6, maxSentences: 0.5 }
+const say = rows => Array.from({ length: 3 }, () => ({ ok: true, ms: 1, model: 'fake', value: { 每句: rows } }))
+const mkCorpus = lines => { const c = corpus(lines); return { c, plan: buildPlan(c.words, c.duration, {}), s: buildSentences({ segments: c.segments, words: c.words }) } }
+const A = mkCorpus(U_LINES), F = mkCorpus(F_LINES), N = mkCorpus(N_LINES)
+const pairOf = x => x.s[2].dur + x.s[3].dur
+const unitRun = await planPrune({ segments: A.c.segments, words: A.c.words, plan: A.plan, target: A.plan.outDuration - pairOf(A), params: U_PARAMS, propose: async () => say([{ index: 2, cut: true, why: '铺垫' }, { index: 3, cut: true, why: '铺垫' }, { index: 4, cut: false, why: '观点' }]) })
+ok('两句连判可删 → 并成一个删除单元删掉（不是两句各删各的）',
+  unitRun.picks.length === 2 && unitRun.units.length === 1 && unitRun.units[0].idx.join(',') === '2,3',
+  JSON.stringify(unitRun.units))
+ok('单元理由「铺垫」靠「后面紧接反问」核对通过（单句看不出铺垫）',
+  unitRun.model.units.length === 1 && /铺垫/.test(unitRun.model.units[0].why) && /反问|转折/.test(unitRun.model.units[0].by || ''),
+  JSON.stringify(unitRun.model.units))
+ok('删掉这段就落进目标', unitRun.hit === true, unitRun.after + ' / ' + unitRun.target)
+ok('单元删的票也记在 votes 里（几句、几票）', unitRun.model.votes.length === 2 && unitRun.model.votes.every(v => v.yes === 3), JSON.stringify(unitRun.model.votes))
+ok('硬规则能找到解时不放开风格规则 → notes 空', unitRun.notes.length === 0, JSON.stringify(unitRun.notes))
+// 「连说两句但是」是风格问题不是破坏：先按硬规则找解，找不到才放开，并写进报告
+const softRun = await planPrune({ segments: F.c.segments, words: F.c.words, plan: F.plan, target: F.plan.outDuration - pairOf(F), params: U_PARAMS, propose: async () => say([{ index: 1, cut: true, why: '铺垫' }, { index: 3, cut: true, why: '铺垫' }]) })
+ok('只有放开风格规则才删得动时，这一组删成了', softRun.picks.length === 2 && softRun.model.units.length === 1, JSON.stringify(softRun.picks.map(p => p.text)))
+ok('放开的风格规则写进 notes（连说两句「但是」）', softRun.notes.some(n => /但是/.test(n)), JSON.stringify(softRun.notes))
+ok('模型只判了碎片后半句 → 前半句一起带上（否则会删出半句话）', softRun.picks.some(p => p.text.includes('满大街')), JSON.stringify(softRun.picks.map(p => p.text)))
+ok('模型提了、规则挡下的句子进 proposed，带挡下的理由（报告要能自证）', softRun.model.proposed.some(p => p.idx === 1 && /钩子/.test(p.refused || '')), JSON.stringify(softRun.model.proposed))
+const hardOnly = await planPrune({ segments: F.c.segments, words: F.c.words, plan: F.plan, target: F.plan.outDuration - pairOf(F), params: { ...U_PARAMS, clauseSoft: false }, propose: async () => say([{ index: 3, cut: true, why: '铺垫' }]) })
+ok('关掉软规则 → 这一组一句都不删（硬规则不放行就是不放行）', hardOnly.picks.length === 0, JSON.stringify(hardOnly.picks.map(p => p.text)))
+// 后面那句既不是转折也不是反问：这段就不是「铺垫」，理由对不上只能进降档
+const nRun = await planPrune({ segments: N.c.segments, words: N.c.words, plan: N.plan, target: N.plan.outDuration - pairOf(N), params: U_PARAMS, propose: async () => say([{ index: 2, cut: true, why: '铺垫' }, { index: 3, cut: true, why: '铺垫' }]) })
+ok('后面不是转折/反问 → 单元理由对不上，只能按降档用（source=model-weak）',
+  nRun.picks.length === 2 && nRun.picks.every(p => p.source === 'model-weak') && nRun.model.units.length === 0,
+  JSON.stringify({ picks: nRun.picks.map(p => [p.text, p.source]), units: nRun.model.units }))
+// 单元不许无限长：连着三句都够票时按 maxConsecutive 截断，第三句单独核（主张句不走降档）
+const capRun = await planPrune({ segments: A.c.segments, words: A.c.words, plan: A.plan, target: A.plan.outDuration - pairOf(A), params: U_PARAMS, propose: async () => say([{ index: 2, cut: true, why: '铺垫' }, { index: 3, cut: true, why: '铺垫' }, { index: 4, cut: true, why: '铺垫' }]) })
+ok('单元最多两句（再长观众觉得跳），第三句单独核', capRun.model.units.every(u => u.idx.length <= 2), JSON.stringify(capRun.model.units))
+ok('单元里含主张句、理由又对不上 → 不走降档（主张句是论点）', capRun.rejectedByReason.some(r => /主张句/.test(r.why)), JSON.stringify(capRun.rejectedByReason))
+ok('units / notes / proposed 在报告里始终是数组（没有也要有字段）', Array.isArray(capRun.units) && Array.isArray(capRun.notes) && Array.isArray(capRun.model.proposed))
 const total = pass + fails.length
 console.log(fails.length ? 'FAIL ' + fails.length + '/' + total : 'PASS ' + total + ' 条')
 for (const f of fails) console.log('  ✗ ' + f)

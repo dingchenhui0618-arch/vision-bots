@@ -1039,9 +1039,10 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       log('听音复核：' + span.join('–') + 's 没听成（' + r.skipped + '），这条不改')
       continue
     }
-    if (!r.agree && !r.loose) {
-      section.spans.push({ span, agree: false, decodes: r.decodes })
-      log('听音复核：' + span.join('–') + 's 两次听的不一致（' + (r.decodes || []).map(d => '「' + d.text + '」').join(' vs ') + '），不算证据')
+    // 采信条件：逐字一致，或者多数窗口一致（votes 里有几比几）。只差句外切进来一两个字时走 loose。
+    if (!r.agree && !r.loose && !r.majority) {
+      section.spans.push({ span, agree: false, decodes: r.decodes, votes: r.votes || [] })
+      log('听音复核：' + span.join('–') + 's 几个窗口听的读数不一致（' + (r.votes || []).map(v => '「' + v.text + '」×' + v.n).join(' vs ') + '），不算证据')
       continue
     }
     const diff = charDiff(v.text, r.text)

@@ -13,7 +13,10 @@
  * 规矩（和四遍纠错一样硬，破了就不许改）：
  *   1. 只在**同一句**里动字：整句起止时间不变，句外的词一个字节都不许动。
  *   2. 加字必须有「静音缝隙」接住：新词落进那个词槽内的数字静音段，不去挤占已有语音。
- *   3. 两次听必须逐字一致（不同左上下文，独立的两次解码），不一致就不算证据。
+ *   3. 多个左上下文各听一遍（现在三条窗口），至少两条逐字一致且过半数才采信；
+ *      读数不一致时不许挑「顺眼」的那条——每一轮的读数都要写进报告（votes）。
+ *      为什么要三条：实测 62.52–64.16s「卷内容生产力」，pad1.2 听成「剪」、pad2.4 听成「卷」，
+ *      而另外三个窗口都听成「卷」——只开两个窗口、且正好是这两个，就把一处确凿的错字永久放过去了。
  *   4. 本机没有更强的模型就明说没跑，绝不拿 small 冒充第二意见——small 正是犯错的那个。
  */
 
@@ -44,8 +47,9 @@ export const R = {
   slotAnomaly: 2.0,
   charSecNominal: 0.16,
   compute: 'int8',
-  // 两次听用不同的左上下文长度（同一个词在两个窗口里的位置不同，解码路径就不同）
-  pads: [1.2, 2.4],
+  // 多个左上下文长度（同一个词在不同窗口里的位置不同，解码路径就不同）。
+  // 0.4 这条短的专门用来破「两个长窗口各听成一个字」的僵局：短窗口切进来的句外字更少。
+  pads: [0.4, 1.2, 2.4],
   // 句尾要多留一截：两个模型对词的起止时间能差 0.3–0.5s，只按句子末词 +0.8s 会把
   // 最后一个字切出窗口（实测「都是在做」的「做」在 pad 1.2 的窗口外，两次听就此不一致）
   tailPad: 0.8,
@@ -212,6 +216,23 @@ export function alignCrop(expect, words, cfg = R, span = null) {
   return best
 }
 
+/**
+ * 多个窗口的读数怎么算一致：至少两条逐字一致、且严格多于其他任何一读，才采信这一读。
+ * 纯函数（离线可测）：实测 62.52–64.16s 是 ['卷','剪','卷'] → 采信「卷」；
+ * 两条窗口各读一半（1 比 1）时不采信——那样等于挑顺眼的，和「不算证据」是一回事。
+ */
+export function voteTexts(texts = []) {
+  const list = Array.isArray(texts) ? texts : []
+  const tally = new Map()
+  for (const t of list) if (t) tally.set(t, (tally.get(t) || 0) + 1)
+  const ranked = [...tally].sort((a, b) => b[1] - a[1])
+  const topText = ranked.length ? ranked[0][0] : ''
+  const majorityOk = Boolean(ranked.length) &&
+    ranked[0][1] >= Math.max(2, Math.ceil(list.length / 2)) &&
+    (!ranked[1] || ranked[0][1] > ranked[1][1])
+  return { majorityOk, topText, votes: ranked.map(([text, n]) => ({ text, n })) }
+}
+
 /** 窗口里落在 [t0, t1] 的词（按词的中点归属，避免边界把半个词算进来）。 */
 export function cropWords(words, t0, t1) {
   return (words || []).filter(w => {
@@ -248,11 +269,12 @@ export async function relistenSentence({ media, span, cacheDir, model = R.model,
     if (!decodes.length) return { ok: false, skipped: (lastErr && lastErr.skipped) || 'decode-failed', detail: lastErr && lastErr.detail, model: m }
     const texts = decodes.map(d => d.text)
     const agree = decodes.every(d => d.text === decodes[0].text) && decodes[0].text.length > 0
+    const { majorityOk, topText, votes } = voteTexts(texts)
     // 两个窗口只差**句外**切进来的一两个字时（实测「圈」被窗口边界带进来、因此两读不同），
     // 按重叠部分算一致：以最短的那次为准，其余必须包含它，且多出来的字只能贴在两端。
     const base = texts.slice().sort((x, y) => x.length - y.length)[0] || ''
     const loose = !agree && base.length >= 2 && texts.every(t => t === base || t.endsWith(base) || t.startsWith(base))
-    return { ok: true, agree, loose, base, decodes, single: decodes.length < R.pads.length }
+    return { ok: true, agree, loose, base, decodes, single: decodes.length < R.pads.length, majorityOk, topText, votes }
   }
 
   // 先用强耳朵。装不上（没下模型 / 内存不够起不来）就退到弱耳朵，并且如实标出来是哪一档——
@@ -281,7 +303,8 @@ export async function relistenSentence({ media, span, cacheDir, model = R.model,
   return {
     ok: true, tier: used.tier, model: used.model, compute: used.compute, span,
     agree: used.agree, single: Boolean(used.single), loose: Boolean(used.loose),
-    text: used.agree ? used.decodes[0].text : (used.loose ? used.base : null),
+    majority: Boolean(used.majorityOk), votes: used.votes || [],
+    text: used.agree ? used.decodes[0].text : (used.loose ? used.base : (used.majorityOk ? used.topText : null)),
     decodes: used.decodes.map(d => ({ pad: d.pad, text: d.text, cached: d.cached })),
     words: used.decodes[0].words,
     note: used.tier === 'weak'
