@@ -1,0 +1,13 @@
+{
+  "_note": "每个 bot 一份配置。改谁只碰谁：这里动的是「包装」这个 bot 自己的模型、采样和参数，其他三个 bot 不受影响。",
+  "_why": "包装只报模板和耗时，不需要判断力，用 fast 档；温度钉 0 是因为它偶尔要报一串数字，不希望同一版报两个数。",
+  "model": "fast",
+  "temperature": 0,
+  "maxTokens": 700,
+  "maxSteps": 6,
+  "timeoutMs": 90000,
+  "params": {
+    "reuseMaster": true,
+    "patchMaxShare": 0.45
+  }
+}

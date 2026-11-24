@@ -16,6 +16,8 @@ import { runQc } from '../handlers/qc.mjs'
 import { BotSession } from './session.mjs'
 import { FactBook } from './facts.mjs'
 import { runAgent } from './loop.mjs'
+import { callProfile } from '../llm.mjs'
+import { paramsOf } from '../bots/config.mjs'
 import { toolsFor, inspectProject } from './tools.mjs'
 import { parseEdit, locate, applyEdit, assertUntouched, loadPipeline, loadScene, savePipeline } from '../revise.mjs'
 import { buildCaptions } from '../captions.mjs'
@@ -97,6 +99,8 @@ export class Director {
           try {
             return await runAgent({
               session, bot, task, tools, facts,
+              // 这个 bot 自己的模型、温度、步数预算（config/bots/<id>.json）
+              profile: callProfile(botId),
               context: this.contextText(info),
               log: (t, m) => ctx.log(t, m),
               ...(this.chatFn ? { chatFn: this.chatFn } : {}),
@@ -116,6 +120,8 @@ export class Director {
     }
     const times = (this._dispatched.get(botId) || 0) + 1
     this._dispatched.set(botId, times)
+    // 第几次派活就该提醒「这是第几次」，是制片人自己的配置，不是写死的 2
+    const warnAt = Number(paramsOf('producer').warnAfterDispatch) || 2
     return {
       bot: botId, name: bot.name, ok: Boolean(r.ok),
       said: r.text || null,
@@ -125,7 +131,7 @@ export class Director {
       ms: r.ms || null,
       // 同一个问题派第二遍还派回来，多半不是它不干活，是素材或规格的物理限制
       times,
-      ...(times >= 2 ? { warn: '这是第 ' + times + ' 次派给它。如果问题还是同一个，那是素材或规格的限制，不是它没干。别拿同一个要求再派第三遍。' } : {}),
+      ...(times >= warnAt ? { warn: '这是第 ' + times + ' 次派给它。如果问题还是同一个，那是素材或规格的限制，不是它没干。别拿同一个要求再派第三遍。' } : {}),
     }
   }
 
@@ -143,8 +149,8 @@ export class Director {
         try {
           return await runAgent({
             session, bot, task, tools, facts,
+            profile: callProfile('producer'),
             context: this.contextText(info),
-            maxSteps: 10,
             log: (t, m) => ctx.log(t, m),
             ...(this.chatFn ? { chatFn: this.chatFn } : {}),
           })
@@ -170,7 +176,9 @@ export class Director {
     if (factValues) facts.addAll(factValues, 'context')
     const r = await runAgent({
       session, bot, task, tools: [], facts,
+      profile: callProfile(botId),
       context: this.contextText(info),
+      // 只让它说一句话：步数和预算是这一次的临时覆盖，压过配置里的值
       maxSteps: 2, maxTokens: 500,
       ...(this.chatFn ? { chatFn: this.chatFn } : {}),
     })

@@ -8,8 +8,16 @@ const PUNCT = /[，。！？、；：,.!?;:""''（）()《》…—~·\s]/gu
 const CONNECTORS = ['但是', '所以', '因为', '然后', '而且', '不过', '就是', '其实', '如果', '只有', '或者', '还是', '可是', '于是', '另外', '这种', '这个', '现在', '今天', '就是']
 const SENTENCE_END = /[。！？!?]$/
 
-export function buildCaptions(words, plan, { maxChars = 14, maxLines = 2, maxGap = 0.55, sentenceGap = 0.25 } = {}) {
+export function buildCaptions(allWords, plan, { maxChars = 14, maxLines = 2, maxGap = 0.55, sentenceGap = 0.25 } = {}) {
   const map = makeMapper(plan)
+
+  // 被剪掉的词（删词、重复、口头语）不进字幕：音频里没有了，字幕上还挂着就成了「说了两遍」。
+  // 判据是中点在某个保留区间里——用保留区间而不是切口，因为片头片尾被删的词不在任何切口里。
+  const keep = (plan && plan.keep) || []
+  const words = keep.length ? allWords.filter(w => {
+    const mid = (w.start + w.end) / 2
+    return keep.some(([a, b]) => mid >= a && mid <= b)
+  }) : allWords
 
   // 1) 先切句：whisper 中文经常不带标点，标点不能当唯一依据——停顿（> sentenceGap）就是句子边界。
   //    以前不切句，字幕会攒到 14 字硬断：「我最近研究了一」/「圈真正的机会是在OPC结合内」这种
@@ -86,7 +94,7 @@ export function buildCaptions(words, plan, { maxChars = 14, maxLines = 2, maxGap
     }
   }
 
-  // 一个字都不许丢：与原文逐字核对
+  // 一个字都不许丢：与「留下的词」逐字核对（被剪掉的词本来就不该出现）
   const original = words.map(w => w.w).join('').replace(PUNCT, '')
   const shown = cards.map(c => c.text).join('')
   const missing = original.length - shown.length

@@ -11,6 +11,7 @@ import { runAgent, buildSystem } from '../src/agent/loop.mjs'
 import { Director } from '../src/agent/director.mjs'
 import { toolsFor } from '../src/agent/tools.mjs'
 import { BOTS, byId } from '../src/bots/roster.mjs'
+import { callProfile } from '../src/llm.mjs'
 
 const ROOT = join(process.cwd(), '.test', 'agent-tmp')
 rmSync(ROOT, { recursive: true, force: true })
@@ -114,11 +115,12 @@ console.log('\n[3] 一轮循环')
   ok('标出来的数看得见', r3.text.includes('999') && r3.text.includes('没出处'))
 }
 
-// ── 4. 同一个 AI、不同会话：红线各自不同 ──
-console.log('\n[4] 四个 bot 是一套 AI 的四个会话')
+// ── 4. 同一套工具、不同会话和不同配置：红线各自不同 ──
+console.log('\n[4] 四个 bot 是一套工具代码的四个会话，配置各管各的')
 {
   const g = group('名册')
-  ok('四个 bot 用同一个模型档', BOTS.every(b => b.model === 'same'))
+  ok('模型不在名册里写死（各自在 config/bots/<id>.json）', BOTS.every(b => b.model === undefined))
+  ok('四个 bot 各自解析出模型', BOTS.every(b => { const m = callProfile(b.id).model; return typeof m === 'string' && m.length > 0 }))
   ok('每个 bot 都有自己的红线', BOTS.every(b => Array.isArray(b.contract) && b.contract.length >= 3))
   const sp = buildSystem(byId('qc'), { notes: [{ key: 'k', text: 'v' }], context: '素材 24.9s' })
   ok('system 里有红线', sp.includes('红线') && sp.includes('没有证据不许判通过'))

@@ -1,0 +1,55 @@
+{
+  "_note": "每个 bot 一份配置。改谁只碰谁：这里动的是「剪辑」这个 bot 自己的模型、采样和参数，其他三个 bot 不受影响。",
+  "_why": "剪辑的所有判断口径都在 params 里：剪辑点阈值、停机目标、去重与口头语规则。改剪辑的口味只改这个文件，不用碰代码和别的 bot。",
+  "model": "smart",
+  "temperature": 0,
+  "maxTokens": 700,
+  "maxSteps": 6,
+  "timeoutMs": 90000,
+  "params": {
+    "pauseThreshold": 0.45,
+    "keepHead": 0.1,
+    "keepTail": 0.14,
+    "minSegment": 0.6,
+    "leadIn": 0.15,
+    "tailOut": 0.3,
+    "maxDeleteShare": 0.3,
+    "gap": {
+      "period": 0.3,
+      "comma": 0.22,
+      "cut": 0.08,
+      "none": 0.2
+    },
+    "seam": {
+      "searchMs": 250,
+      "quietMs": 25,
+      "thresholdDb": -34,
+      "nudge": 0.012
+    },
+    "dedupe": {
+      "enabled": true,
+      "minWords": 3,
+      "minChars": 4,
+      "maxGapSec": 0.8
+    },
+    "filler": {
+      "enabled": true,
+      "minGapSec": 0.12,
+      "words": [
+        "嗯",
+        "啊",
+        "呃",
+        "哎",
+        "哦",
+        "唉"
+      ],
+      "markers": [
+        "那个",
+        "就是说",
+        "你知道吧",
+        "然后就是",
+        "这个这个"
+      ]
+    }
+  }
+}

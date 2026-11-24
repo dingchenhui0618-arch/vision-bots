@@ -7,6 +7,8 @@ import { probe } from '../probe.mjs'
 import { extractAudio } from '../ffmpeg.mjs'
 import { transcribe } from '../asr.mjs'
 import { buildPlan } from '../plan.mjs'
+import { envelope16 } from '../energy.mjs'
+import { paramsOf } from '../bots/config.mjs'
 import { buildCaptions, toSRT } from '../captions.mjs'
 import { correct, loadTerms, hotwordPrompt, applyToSegments } from '../asr-fix.mjs'
 import { sectionsOf } from '../sections.mjs'
@@ -43,6 +45,10 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   log(`素材 ${info.duration.toFixed(2)}s · ${info.width}×${info.height} · ${info.fps.toFixed(0)}fps · 音轨${info.hasAudio ? '有' : '无'}`)
   if (!info.hasAudio) throw new Error('素材没有音轨，没法转写')
 
+  // 音频只抽一次：转写要用，接缝吸附也要用（在刀口附近找最安静的下刀点）
+  const wav = join(work, 'audio.wav')
+  await extractAudio(input, wav)
+
   // 第一层治理：转写前把术语表当热词喂进去，让它一开始就别写错
   const terms = loadTerms(group.dir)
   const hot = hotwordPrompt(terms)
@@ -62,8 +68,6 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     reused = true
     log(`复用上次转写：${words.length} 词（素材、术语表、识别模型都没变）`)
   } else {
-    const wav = join(work, 'audio.wav')
-    await extractAudio(input, wav)
     if (hot) log('热词注入：' + hot)
     const t0 = Date.now()
     log('转写中（faster-whisper，本地 CPU）')
@@ -86,7 +90,37 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   writeFileSync(fixPath, JSON.stringify(fixReport, null, 2), 'utf8')
   artifact('fix', fixPath, { changed: fixReport.stats.changed, pending: fixReport.stats.pending, reused })
 
-  const plan = buildPlan(words, info.duration, { speed: brief.speed ?? 1, pauseThreshold: brief.pauseThreshold ?? 0.45 })
+  // 剪辑的所有口径来自它自己的配置（config/bots/cutter.json），不是散在代码里的常量。
+  // 只有用户明确说的东西（语速）才算覆盖。
+  const cutParams = paramsOf('cutter')
+  let envelope = null
+  try {
+    envelope = envelope16(wav)
+  } catch (err) {
+    // 包络读不出来只影响接缝精度，不该让整条片子停下
+    log('能量包络没算出来（' + String(err.message).slice(0, 60) + '），接缝按名义值切')
+  }
+  const plan = buildPlan(words, info.duration, {
+    pauseThreshold: brief.pauseThreshold ?? cutParams.pauseThreshold,
+    keepHead: cutParams.keepHead,
+    keepTail: cutParams.keepTail,
+    minSegment: cutParams.minSegment,
+    leadIn: cutParams.leadIn,
+    tailOut: cutParams.tailOut,
+    gap: cutParams.gap,
+    seam: cutParams.seam,
+    dedupe: cutParams.dedupe,
+    filler: cutParams.filler,
+    maxDeleteShare: cutParams.maxDeleteShare,
+    envelope,
+    speed: brief.speed ?? 1,
+  })
+  const delLabel = { repeat: '重复', filler: '口头语', mistake: '口误' }
+  if (plan.deletions.length) {
+    const by = Object.entries(plan.byReason).map(([k, n]) => (delLabel[k] || k) + ' ' + n).join(' / ')
+    log('删词 ' + plan.deletions.length + ' 处（' + by + '），' + plan.deletedChars + ' 字、约 ' + plan.deletedSec + 's：' +
+      plan.deletions.slice(0, 6).map(d => '「' + d.text + '」@' + d.from + 's').join('、') + (plan.deletions.length > 6 ? ' 等' : ''))
+  }
   const captions = buildCaptions(words, plan, { maxChars: brief.maxChars ?? 14 })
 
   writeFileSync(join(work, 'plan.json'), JSON.stringify(plan, null, 1), 'utf8')
@@ -137,7 +171,9 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
   const fixed = fixReport.applied
   const pending = fixReport.pending
   if (narrate) group.say('cutter',
-    `读完了：${info.duration.toFixed(1)}s 素材，${words.length} 个词，剪掉 ${plan.cutSeconds.toFixed(1)}s（${plan.removedPauses} 个长停顿），成片 ${plan.outDuration.toFixed(1)}s，${plan.keep.length} 段。` +
+    `读完了：${info.duration.toFixed(1)}s 素材，${words.length} 个词，剪掉 ${plan.cutSeconds.toFixed(1)}s（${plan.removedPauses} 个长停顿` +
+    (plan.deletions.length ? ` + ${plan.deletions.length} 处删词：` + Object.entries(plan.byReason).map(([k, n]) => (delLabel[k] || k) + ' ' + n).join('、') : '') +
+    `），成片 ${plan.outDuration.toFixed(1)}s，${plan.keep.length} 段。` +
     (fixed.length
       ? `\n错字改了 ${fixed.length} 处：` + fixed.slice(0, 3).map(f => `「${f.from}」→「${f.to}」@${f.at}s（${KIND_LABEL[f.kind] || f.kind}，${f.verified || '命中术语表'}）`).join('、') + (fixed.length > 3 ? ' 等' : '') + '。'
       : '\n没有需要改的错字。') +
@@ -157,6 +193,10 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     cutSec: Number(plan.cutSeconds.toFixed(1)),
     pauses: plan.removedPauses,
     segments: plan.keep.length,
+    deletions: plan.deletions.length,
+    deletedChars: plan.deletedChars,
+    deletedSec: plan.deletedSec,
+    byReason: plan.byReason,
     sections: secs.length,
     fixed: fixed.map(f => ({ from: f.from, to: f.to, at: f.at, kind: f.kind })),
     pending: pending.map(w => ({ w: w.w, at: w.at })),

@@ -12,6 +12,8 @@ import { extractAudio } from '../src/ffmpeg.mjs'
 import { qa } from '../src/qa.mjs'
 import { correct, loadTerms, hotwordPrompt } from '../src/asr-fix.mjs'
 import { assertTools } from '../src/env.mjs'
+import { envelope16 } from '../src/energy.mjs'
+import { paramsOf } from '../src/bots/config.mjs'
 
 const { values: a } = parseArgs({
   options: {
@@ -71,11 +73,23 @@ writeFileSync(join(work, 'transcript.json'), JSON.stringify(transcript, null, 1)
 writeFileSync(join(work, 'fix-report.json'), JSON.stringify(fix.report, null, 1))
 for (const f of fix.report.applied) step(`改字 ${f.at}s ${f.from} → ${f.to}（${f.kind}，${f.verified}）`)
 
+// 剪辑口径来自剪辑自己的配置；命令行只覆盖语速和显式给的停顿阈值
+const cutParams = paramsOf('cutter')
+let envelope = null
+try { envelope = envelope16(join(work, 'audio.wav')) } catch (err) { step('能量包络没算出来：' + String(err.message).slice(0, 60)) }
 const plan = buildPlan(transcript.words, info.duration, {
   speed: Number(a.speed),
-  pauseThreshold: Number(a.pause),
+  pauseThreshold: a.pause ? Number(a.pause) : cutParams.pauseThreshold,
+  keepHead: cutParams.keepHead, keepTail: cutParams.keepTail, minSegment: cutParams.minSegment,
+  leadIn: cutParams.leadIn, tailOut: cutParams.tailOut,
+  gap: cutParams.gap, seam: cutParams.seam, dedupe: cutParams.dedupe, filler: cutParams.filler,
+  maxDeleteShare: cutParams.maxDeleteShare, envelope,
 })
-step(`剪辑决策：${plan.keep.length} 段，剪掉 ${plan.cutSeconds.toFixed(1)}s（${plan.removedPauses} 个长停顿）${plan.speedSaved > 0.1 ? `，加速再省 ${plan.speedSaved.toFixed(1)}s` : ''}，成片约 ${plan.outDuration.toFixed(1)}s`)
+if (plan.deletions.length) {
+  const label = { repeat: '重复', filler: '口头语', mistake: '口误' }
+  step('删词 ' + plan.deletions.length + ' 处：' + plan.deletions.map(d => '「' + d.text + '」@' + d.from + 's（' + (label[d.reason] || d.reason) + '）').join('、'))
+}
+step(`剪辑决策：${plan.keep.length} 段，剪掉 ${plan.cutSeconds.toFixed(1)}s（${plan.removedPauses} 个长停顿 / ${plan.seamCuts} 个删词接缝）${plan.speedSaved > 0.1 ? `，加速再省 ${plan.speedSaved.toFixed(1)}s` : ''}，成片约 ${plan.outDuration.toFixed(1)}s`)
 writeFileSync(join(work, 'plan.json'), JSON.stringify(plan, null, 1))
 
 const cap = buildCaptions(transcript.words, plan)

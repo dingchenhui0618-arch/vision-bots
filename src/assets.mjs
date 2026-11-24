@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { BOTS, TEMPLATES, specOf } from './bots/roster.mjs'
+import { modelFor } from './llm.mjs'
 import { segment, resetLexicon } from './segment.mjs'
 import { applyTerms, hotwordPrompt, pinyinOf as realPinyin } from './asr-fix.mjs'
 
@@ -272,7 +273,8 @@ export function botRoster() {
     order: b.order,
     role: b.role,
     voice: b.voice,
-    model: b.model === 'same' ? '同一个模型 · 独立会话' : b.model,
+    // 每个 bot 实际连的模型（来自它自己的配置）；独立会话那句是说「同名模型也不是同一个上下文」
+    model: modelFor(b.id) + ' · 独立会话',
     tools: b.tools || [],
     templates: (b.templates || []).map(id => {
       const t = TEMPLATES.find(x => x.id === id)

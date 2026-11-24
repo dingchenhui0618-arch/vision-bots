@@ -64,11 +64,19 @@ export async function runAgent({
   context = '',
   log = () => {},
   chatFn = realChat,
-  maxSteps = MAX_STEPS,
+  // 这个 bot 自己的调用口径（模型 / 温度 / 步数 / 预算），由 llm.mjs 的 callProfile 解析。
+  // 没给就退回这个函数的默认值——离线自测不需要配置文件。
+  profile = null,
+  // 这三个是「这一次调用」的临时覆盖（比如只让它说一句话）；没给就用 bot 自己的配置
+  maxSteps = null,
   maxRepairs = MAX_REPAIRS,
-  maxTokens = 700,
-  timeoutMs = undefined,
+  maxTokens = null,
+  timeoutMs = null,
 } = {}) {
+  const prof = profile || {}
+  const stepsCap = maxSteps ?? (Number.isInteger(prof.maxSteps) ? prof.maxSteps : MAX_STEPS)
+  const tokenCap = maxTokens ?? (Number.isInteger(prof.maxTokens) ? prof.maxTokens : 700)
+  const timeCap = timeoutMs ?? (Number.isFinite(prof.timeoutMs) ? prof.timeoutMs : undefined)
   const book = facts || new FactBook(bot.id)
   const schemas = tools.map(t => ({
     type: 'function',
@@ -90,8 +98,16 @@ export async function runAgent({
   let lastText = ''
   let lastCheck = null
 
-  for (let step = 0; step < maxSteps; step++) {
-    const r = await chatFn({ messages, tools: schemas, maxTokens, ...(timeoutMs ? { timeoutMs } : {}) })
+  for (let step = 0; step < stepsCap; step++) {
+    // 模型、温度都来自这个 bot 自己的配置：同一个群里四个 bot 可以连不同模型
+    const r = await chatFn({
+      messages,
+      tools: schemas,
+      maxTokens: tokenCap,
+      ...(prof.model ? { model: prof.model } : {}),
+      ...(prof.temperature === null || prof.temperature === undefined ? {} : { temperature: prof.temperature }),
+      ...(timeCap ? { timeoutMs: timeCap } : {}),
+    })
     if (!r.ok) {
       return { ok: false, skipped: r.skipped, detail: r.detail || null, ms: Date.now() - t0, stepsUsed: step, used, toolResults, facts: book }
     }
@@ -156,5 +172,5 @@ export async function runAgent({
   // 步数用尽
   const text = lastText || '这轮我没跑出结论（工具调到上限）。'
   session.push({ role: 'assistant', kind: 'say', content: text, tools: used.map(u => u.name), check: lastCheck })
-  return { ok: Boolean(lastText), skipped: lastText ? undefined : 'step-limit', text, ms: Date.now() - t0, stepsUsed: maxSteps, used, toolResults, facts: book, check: lastCheck }
+  return { ok: Boolean(lastText), skipped: lastText ? undefined : 'step-limit', text, ms: Date.now() - t0, stepsUsed: stepsCap, used, toolResults, facts: book, check: lastCheck }
 }

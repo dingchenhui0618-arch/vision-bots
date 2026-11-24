@@ -1,0 +1,14 @@
+{
+  "_note": "每个 bot 一份配置。改谁只碰谁：这里动的是「质检」这个 bot 自己的模型、采样和参数，其他三个 bot 不受影响。",
+  "_why": "质检的结论要能复现，温度钉 0；门槛（时长容差、低置信占比）在 params 里，加严一项只改这个文件。",
+  "model": "fast",
+  "temperature": 0,
+  "maxTokens": 700,
+  "maxSteps": 6,
+  "timeoutMs": 90000,
+  "params": {
+    "tolerance": 0.12,
+    "minWordConfidence": 0.25,
+    "maxLowConfidenceShare": 0.08
+  }
+}

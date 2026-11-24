@@ -1,0 +1,13 @@
+{
+  "_note": "每个 bot 一份配置。改谁只碰谁：这里动的是「制片人」这个 bot 自己的模型、采样和参数，其他三个 bot 不受影响。",
+  "_why": "制片人要做判断（能不能验收、要不要返工），用 smart 档；温度留空表示用服务端默认，只有需要可复现的地方才钉死。",
+  "model": "smart",
+  "temperature": null,
+  "maxTokens": 700,
+  "maxSteps": 10,
+  "timeoutMs": 60000,
+  "params": {
+    "warnAfterDispatch": 2,
+    "maxDispatches": 4
+  }
+}

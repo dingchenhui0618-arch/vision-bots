@@ -9,6 +9,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { botConfig } from './bots/config.mjs'
 
 /**
  * 本机配置文件：config/llm.local.json（.gitignore 排除，密钥只落在这里和我们自己的环境变量）。
@@ -40,6 +41,32 @@ export const LLM = {
    */
   thinking: String(env.DSH_MEDIA_LLM_THINKING || (local.thinking === true ? 'on' : 'off')) === 'on',
   source: env.DSH_MEDIA_LLM_BASE ? 'env' : (local.base ? 'config/llm.local.json' : 'default'),
+}
+
+/**
+ * 这个 bot 这一轮用什么模型、什么温度、多少步。
+ *
+ * 每个 bot 一份配置（config/bots/<id>.json）：model 可以写别名 fast / smart（映射到
+ * llm.local.json 的两档），也可以写完整模型名。四个 bot 各走各的，改一个不影响另一个。
+ * 连 base/key 都不用动——那是「这家网关怎么连」，不是「这个 bot 怎么想」。
+ */
+export function callProfile(botId) {
+  const cfg = botConfig(botId)
+  if (!cfg) return { model: LLM.model, temperature: null, maxTokens: 700, maxSteps: 8, timeoutMs: LLM.timeoutMs, source: 'fallback' }
+  const alias = cfg.model
+  return {
+    model: LLM.models[alias] || alias || LLM.model,
+    temperature: cfg.temperature,
+    maxTokens: cfg.maxTokens,
+    maxSteps: cfg.maxSteps,
+    timeoutMs: cfg.timeoutMs,
+    source: cfg.source,
+  }
+}
+
+/** 界面上显示用：这个 bot 实际连的是哪个模型。 */
+export function modelFor(botId) {
+  return callProfile(botId).model
 }
 
 /** 凭证：环境变量 > 本机配置文件 > codex 登录态。不入库、不打印。 */
