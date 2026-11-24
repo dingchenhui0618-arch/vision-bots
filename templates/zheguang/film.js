@@ -417,22 +417,35 @@ export async function createFilm({ media }) {
     c.strokeStyle = R(P.paper, 0.13); c.lineWidth = 1.5; c.stroke()
   }
 
+  /** 标签墙的左右两条窄带。哪边真放得下只有 >=140px 才算一条带：
+   *  小窗页的人物窗口右对齐，右边根本没有空，按奇偶硬分左右会把标签画到画面外（自测13 实测出画）。 */
+  function tagZones(shot) {
+    const r = personRect(shot)
+    const rawL = r.x - M - 18
+    const rawR = w - M - (r.x + r.w + 18)
+    return {
+      useL: rawL >= 140, useR: rawR >= 140,
+      left: { x: M, w: Math.max(140, rawL) },
+      right: { x: r.x + r.w + 18, w: Math.max(140, rawR) },
+    }
+  }
   function tagWall(c, b, t) {
     const items = b.items || []
     const shot = shotAt(t)
+    const z = tagZones(shot)
+    const onRight = j => z.useR && (!z.useL || j % 2 === 1)
     const r = personRect(shot)
-    const leftZone = { x: M, w: Math.max(120, r.x - M - 18) }
-    const rightZone = { x: r.x + r.w + 18, w: Math.max(120, w - M - (r.x + r.w + 18)) }
     const top = r.y + 40, bottom = r.y + r.h - 60
     const size = TY.blockSmall + 2
     items.forEach((it, i) => {
       const at = b.f0 + i * 0.13
       const k = E.outBack(clamp(seg(t, at, at + 0.26)))
       if (k <= 0.01) return
-      const right = i % 2 === 1
-      const zone = right ? rightZone : leftZone
-      const chipsInZone = items.filter((_, j) => (j % 2 === 1) === right).length || 1
-      const slot = Math.floor(i / 2)
+      const right = onRight(i)
+      const zone = right ? z.right : z.left
+      const chipsInZone = items.filter((_, j) => onRight(j) === right).length || 1
+      // 槽位按「同侧第几个」算：一侧放不下时所有标签都在另一侧，还按 i/2 排会互相压住
+      const slot = items.filter((_, j) => j < i && onRight(j) === right).length
       const y = top + (slot + 0.5) * ((bottom - top) / chipsInZone)
       const cw = Math.min(zone.w, measure(c, it, size, F.sans, 700) + 30)
       const chh = 46
@@ -515,10 +528,12 @@ export async function createFilm({ media }) {
     if (k <= 0.01) return
     const text = b.text || ''
     const size = TY.block + 6
-    const bh = 78
+    const bh = 56
+    // 两条斜杠压在胸口，不压脸：0.455/0.545h 正好横穿眼睛和鼻子（自测13 抽帧里眼睛被红条盖住 2.3 秒）。
+    // 抬到下巴以下、大字以上这一段（0.575 / 0.635h）才读得懂「划掉」又能看见人。
     for (let i = 0; i < 2; i++) {
       const ang = (i ? 2.6 : -2.2) * Math.PI / 180
-      const y = h * (i ? 0.545 : 0.455)
+      const y = h * (i ? 0.635 : 0.575)
       c.save()
       c.globalAlpha *= Math.min(1, k) * (i ? 0.92 : 1)
       c.translate(w / 2, y); c.rotate(ang)
@@ -570,6 +585,39 @@ export async function createFilm({ media }) {
     txt(c, 'AUTHOR', x + 100, y + 92, { size: TY.blockSmall - 2, family: F.disp, weight: 700, color: R(P.ash, 0.9), spacing: 3 })
     c.restore()
     reg(x, y, cw, chh, 'block:avatar')
+  }
+
+  // ───────── 句子级小标签：说过就留在屏上 ─────────
+  // 折光同一屏能叠三五张小标签：一句话说一个词条，词条冒出来就不走，下一句再叠一张。
+  // 只画 scene.chips 里的词（术语表 / 拉丁专名 / 已挑成大字高亮的词），时间是它被说出来的那一刻。
+  const CHIPL = L.chips || { lanes: [0.255, 0.345, 0.435], left: M, right: 150, h: 46, padX: 20 }
+  function chipLayer(c, t, shot) {
+    if (shot.kind === 'card' || shot.kind === 'outro') return
+    const list = (S.chips || []).filter(x => t >= x.f0 && t < x.f1)
+    if (!list.length) return
+    const size = TY.chip || 24
+    for (const chip of list) {
+      const k = Math.min(E.outCubic(clamp(seg(t, chip.f0, chip.f0 + 0.26))), 1 - clamp(seg(t, chip.f1 - 0.30, chip.f1)))
+      if (k <= 0.02) continue
+      const cw = Math.round(measure(c, chip.text, size, F.sans, 700) + CHIPL.padX * 2)
+      const hh = CHIPL.h
+      const y = h * ((CHIPL.lanes || [])[chip.lane] || 0.3)
+      // 小窗/竖框页：标签贴着人物窗口的边排，不飘到画面最外侧（参考片的标签就是紧贴窗口的一列）
+      // 满幅页：人物是整幅，标签压在画面左右两条边上，中间的脸留空
+      const x = (shot.kind === 'frame' || shot.kind === 'corner')
+        ? (chip.side ? personRect(shot).x + personRect(shot).w + 18 : personRect(shot).x - 18 - cw)
+        : (chip.side ? w - CHIPL.right - cw : CHIPL.left)
+      c.save()
+      c.globalAlpha *= k
+      // 从边上滑进来一点点：静止出现像贴图，滑进来才像「跟着这句话冒出来」
+      c.translate((chip.side ? 1 : -1) * (1 - k) * 18, 0)
+      rrect(c, x, y - hh / 2, cw, hh, 10)
+      c.fillStyle = R(P.void, 0.72); c.fill()
+      c.strokeStyle = R(P.paper, 0.16); c.lineWidth = 1.5; c.stroke()
+      txt(c, chip.text, x + CHIPL.padX, y + size * 0.35, { size, family: F.sans, weight: 700, color: R(chip.hot ? P.lime : P.paper, 0.95) })
+      c.restore()
+      reg(x, y - hh / 2, cw, hh, 'block:chip')
+    }
   }
 
   // ───────── 全屏字卡 / 结尾画中画 ─────────
@@ -639,6 +687,7 @@ export async function createFilm({ media }) {
           else if (b.kind === 'banner' && !onOutro) banner(c, b, t)
           else if (b.kind === 'avatar') avatarCard(c, b, t)
         }
+        chipLayer(c, t, shot)
         if (!onOutro) {
           const act = (S.bigs || []).find(b => t >= b.f0 && t < b.f1)
           if (act) drawBig(c, act, t, shot)

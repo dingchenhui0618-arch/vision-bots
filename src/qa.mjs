@@ -184,7 +184,7 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
     //      · 小窗 / 竖框 / 结尾版式里人物只占一个小窗，大字压在窗口下面的胸口是对的。
     //    以前不看版式一律按上 56% 判，小窗版式的 3 行大字被判失败——那是假失败。
     const zoneTop = Math.round(outSize[1] * BAR.zone.bodyTop)
-    const headTags = new Set(['hud:rec', 'hud:sec', 'hud:page', 'hud:brand', 'hud:progress', 'chapter'])
+    const headTags = new Set(['hud:rec', 'hud:sec', 'hud:page', 'hud:brand', 'hud:progress', 'chapter', 'block:chip', 'block:banner'])
     const inHead = new Map()
     for (const b of boxes) {
       if (headTags.has(b.tag)) continue
@@ -202,6 +202,29 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
         ].filter(Boolean).join('；')
         : `满幅版式的大字/图形块都在 ${zoneTop}px 以下；HUD 与章节卡在上方（按设计不在此列）`, 
       { zoneTop, bad: [...inHead].map(([tag, y]) => ({ tag, y })), hudLow: hudLow.map(b => b.tag) })
+
+    // 2b. 小标签不是正文，它是「挂在画面左右两条边上的词条」：允许进上部，但不许横穿中间。
+    //     没有这条，标签要么被头区规则全判违规，要么放开了就能糊到脸中间——两头都不对。
+    const chipBoxes = boxes.filter(b => b.tag === 'block:chip')
+    if (chipBoxes.length) {
+      const faceL = Math.round(outSize[0] * 0.26), faceR = Math.round(outSize[0] * 0.74)
+      const L0 = (scene && scene.layouts && scene.layouts[scene.ratio]) || {}
+      const prOf = (kind) => {
+        const ww = outSize[0], hh = outSize[1]
+        if (kind === 'frame') { const dw = Math.round(ww * ((L0.frame && L0.frame.w) || 0.52)); return { x: Math.round((ww - dw) / 2), y: Math.round(hh * ((L0.frame && L0.frame.y) || 0.2)), w: dw, h: Math.round(dw * hh / ww) } }
+        if (kind === 'corner') { const dw = Math.round(ww * ((L0.corner && L0.corner.w) || 0.52)); return { x: ww - dw - Math.round(L0.margin || 56), y: Math.round(hh * ((L0.corner && L0.corner.top) || 0.2)), w: dw, h: Math.round(dw * hh / ww) } }
+        return null
+      }
+      const intrude = chipBoxes.filter(b => {
+        const pr = prOf(b.shot)
+        if (pr) return intersect({ x: pr.x - 8, y: pr.y - 8, w: pr.w + 16, h: pr.h + 16 }, b)
+        return b.x < faceR && b.x + b.w > faceL
+      })
+      add('label_edge', intrude.length === 0,
+        intrude.length ? `${intrude.length} 个采样帧上小标签横穿中间的脸（允许范围：左边到 ${faceL}px、右边从 ${faceR}px 起）`
+          : `小标签都没压人物：小窗/竖框页贴窗口边排，满幅页在画面两侧（中间 ${faceL}–${faceR}px 留空）`,
+        { faceL, faceR, bad: intrude.slice(0, 4) })
+    }
 
     // 3. 人物蒙版接上之后，这条会换成真判定（alpha 轮廓）；现在如实标成未接入，不冒充通过。
     if (band && band.ok && source && source.width) {
@@ -228,7 +251,11 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
       const key = [b.tag, Math.round(b.x), Math.round(b.y), Math.round(b.w), Math.round(b.h)].join(',')
       if (seen.has(key)) continue
       seen.add(key)
-      if (b.x < BAR.margin || b.y < BAR.margin || b.x + b.w > outSize[0] - BAR.margin || b.y + b.h > outSize[1] - BAR.margin) bad.push(b)
+      // 出血器件（红条）按设计就是满幅的，只量上下边距，不量左右
+      const oob = b.bleed
+        ? (b.y < BAR.margin || b.y + b.h > outSize[1] - BAR.margin)
+        : (b.x < BAR.margin || b.y < BAR.margin || b.x + b.w > outSize[0] - BAR.margin || b.y + b.h > outSize[1] - BAR.margin)
+      if (oob) bad.push(b)
     }
     add('safe_area', bad.length === 0,
       bad.length ? `${bad.length} 个元素出画/贴边：${bad.slice(0, 3).map(b => b.tag).join('、')}` : `所有元素都在画面内，离边 ${BAR.margin}px 以上`,

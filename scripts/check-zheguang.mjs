@@ -10,6 +10,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { buildScene } from '../templates/zheguang/scene.mjs'
+import { segment } from '../src/segment.mjs'
 import { qaBoxes } from '../templates/zheguang/render.mjs'
 
 const ROOT = process.cwd()
@@ -100,6 +101,70 @@ ok('图形块都在支持的版式里', !badBlock, badBlock || '')
 const blockTexts = scene.blocks.flatMap(b => b.items || (b.text ? [b.text] : []))
 const allText = scene.sections.map(s => s.text).join('')
 ok('图形块文字都来自原话', blockTexts.every(t => inside(t, allText)), blockTexts.filter(t => !inside(t, allText)).join('、'))
+
+// 4b) 句子级小标签：词要接地、只挂单字词、只走两侧、别和别的器件抢地方
+const chips = scene.chips || []
+const LCH = (tpl.layouts['9:16'] || {}).chips || { lanes: [0.255, 0.345, 0.435], left: 56, right: 150, h: 46, padX: 20 }
+const chipSize = (tpl.type && tpl.type.chip) || 24
+const chipW = text => Math.round(emOf(text) * chipSize + LCH.padX * 2)
+const chipBox = c => ({ x: c.side ? LZ.size[0] - LCH.right - chipW(c.text) : LCH.left, y: LZ.size[1] * LCH.lanes[c.lane] - LCH.h / 2, w: chipW(c.text), h: LCH.h, f0: c.f0, f1: c.f1 })
+const chipOut = []
+for (const c of chips) {
+  const page = scene.pages.find(p => p.index === c.page)
+  const src = scene.sections.find(s2 => s2.index === c.page)
+  if (!src || !inside(c.text, src.text)) chipOut.push('词不接地「' + c.text + '」')
+  if (segment(c.text).length !== 1) chipOut.push('不是单个词「' + c.text + '」')
+  if (!page || c.f0 < page.start - 0.01 || c.f1 > page.end + 0.01) chipOut.push('跨页「' + c.text + '」')
+  if (c.f1 - c.f0 < 1.2 || c.f1 - c.f0 > 4.9) chipOut.push('时长 ' + (c.f1 - c.f0).toFixed(2) + 's「' + c.text + '」')
+  const shot = scene.shots.find(s2 => c.f0 >= s2.f0 && c.f0 < s2.f1)
+  if (!shot || !['full', 'frame', 'corner'].includes(shot.kind)) chipOut.push('排进了 ' + (shot ? shot.kind : '片外'))
+}
+ok('小标签的规矩（接地 / 单个词 / 不跨页 / 时长 / 版式）', chipOut.length === 0, chipOut.slice(0, 4).join('、'))
+// 同时在场最多 4 张（多了就是贴纸墙，不是标签）
+let peak = 0
+for (let t = 0; t <= scene.duration; t += 0.25) {
+  const n = chips.filter(c => t >= c.f0 && t < c.f1).length
+  if (n > peak) peak = n
+}
+ok('同一时刻的小标签不超过 4 张', peak <= 4, '最多 ' + peak + ' 张')
+// 标签不压人物：小窗/竖框页贴窗口边排，满幅页在画面两侧（中间 26%–74% 留空）
+const prOf = kind => {
+  if (kind === 'frame') { const dw = Math.round(LZ.size[0] * ((LZ.frame && LZ.frame.w) || 0.52)); return { x: Math.round((LZ.size[0] - dw) / 2), y: Math.round(LZ.size[1] * ((LZ.frame && LZ.frame.y) || 0.2)), w: dw, h: Math.round(dw * LZ.size[1] / LZ.size[0]) } }
+  if (kind === 'corner') { const dw = Math.round(LZ.size[0] * ((LZ.corner && LZ.corner.w) || 0.52)); return { x: LZ.size[0] - dw - (LZ.margin || 56), y: Math.round(LZ.size[1] * ((LZ.corner && LZ.corner.top) || 0.2)), w: dw, h: Math.round(dw * LZ.size[1] / LZ.size[0]) } }
+  return null
+}
+const mid = []
+for (const c of chips) {
+  const b = chipBox(c)
+  const shot = scene.shots.find(s2 => c.f0 >= s2.f0 && c.f0 < s2.f1)
+  const pr = prOf(shot && shot.kind)
+  const hit = pr
+    ? !(b.x + b.w <= pr.x - 4 || pr.x + pr.w + 4 <= b.x || b.y + b.h <= pr.y - 4 || pr.y + pr.h + 4 <= b.y)
+    : (b.x < LZ.size[0] * 0.74 && b.x + b.w > LZ.size[0] * 0.26)
+  if (hit) mid.push('「' + c.text + '」')
+}
+ok('小标签不压人物（窗口页贴边、满幅页只走两侧）', mid.length === 0, mid.join('、'))
+// 标签不压大字：离大字墨水顶还有余量
+const bigTops = scene.bigs.map(b => {
+  const lines = Math.max(1, (b.lines || []).length)
+  const size = Math.max((tpl.type && tpl.type.bigMin) || 62, Math.min((tpl.type && tpl.type.big) || 96, Math.floor(((LZ.size[0] - LZ.big.left - LZ.big.right) * 0.98) / Math.max(1, ...b.lines.map(emOf)))))
+  return (b.shotBottom || LZ.size[1] * 0.775) - lines * size * (LZ.big.lineGap || 1.06)
+})
+const chipBottom = Math.max(...chips.map(c => chipBox(c).y + chipBox(c).h), 0)
+ok('小标签不压大字（最低一张在大字墨水顶之上）', chips.length === 0 || chipBottom < Math.min(...bigTops) - 40, Math.round(chipBottom) + ' vs ' + Math.round(Math.min(...bigTops)))
+// 标签墙 / 红条在场时不叠标签：那块地方自己就是密度
+const clash = chips.filter(c => scene.blocks.some(b => (b.kind === 'tagwall' || b.kind === 'banner') && c.f0 < b.f1 && b.f0 < c.f1))
+ok('标签和标签墙/红条不同时在场', clash.length === 0, clash.map(c => c.text).join('、'))
+// 内容到位就要挂：一页里真说了两个以上术语/专名，至少得挂上一张
+const miss = []
+for (const p of scene.pages) {
+  const src = scene.sections.find(s2 => s2.index === p.index)
+  if (!src) continue
+  const terms = [...new Set(segment(src.text).filter(w => /^[A-Za-z][A-Za-z0-9+#.]*$/.test(w) && w.length >= 2))]
+  const has = chips.some(c => c.page === p.index)
+  if (terms.length >= 2 && !has && p.end - p.start >= 5) miss.push('P' + p.index + '（' + terms.join('/') + '）')
+}
+ok('说了两个以上专名的页都挂上了标签', miss.length === 0, miss.join('、'))
 
 // 5) 章节名：不空就别是半句话
 const BAD_END = /[的了是在和就都也才把给对从但而很太更不没有着过吧呢吗啊嘛去来出要会能说看用做你我他她它们这那越]$/

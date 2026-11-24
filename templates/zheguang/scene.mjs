@@ -359,6 +359,123 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
   const author = brief.author || brief.account || ''
   if (author) blocks.push({ kind: 'avatar', f0: Math.max(duration - 5.4, 0), f1: Math.max(duration - 2.8, 0.5), name: author, role: '', at: 'left' })
 
+  // ── 小标签（chips）：把已经认定为重点的词，按「说过就留在屏上」的节奏挂到画面两侧 ──
+  // 折光的密度不靠字号，靠粒度：一句话一个词条，冒出来就不走，几秒后屏上叠着三五张。
+  // 我们的图形块是段落级的（一页 ~5 秒最多一个），密度永远追不上。
+  // 但「密度」不能靠编：这一版只挂三类词——术语表里的词、拉丁专名（GPT / Claude / Codex）、
+  // 以及这条片子里已经被挑成大字高亮的词（bigs[].hot / page.emph）。每个词的时间就是它被说出来的时刻。
+  // 不新增内容、不改字、不碰时间码；色卡、结尾、标签墙、红条的时段不叠。
+  const CHIP_STOP = new Set([
+    '这个', '那个', '这些', '那些', '这里', '那里', '什么', '怎么', '为什么', '我们', '你们', '他们', '她们', '它们',
+    '就是', '但是', '因为', '所以', '其实', '然后', '而且', '现在', '时候', '时间', '今天', '昨天', '明天', '一下',
+    '一点', '一个', '已经', '可以', '没有', '不是', '不会', '不要', '还是', '也是', '都是', '只是', '这样', '那样',
+    '这种', '那种', '这么', '那么', '如果', '虽然', '不过', '只有', '才能', '应该', '觉得', '认为', '需要', '可能',
+    '一定', '真的', '非常', '比较', '有点', '很多', '一些', '东西', '事情', '以后', '之前', '之后', '的话', '一样',
+    '一起', '一直', '必须', '相当', '自己', '大家', '咱们', '别的', '起来', '出来', '进去', '知道', '看到', '结合',
+    '你的', '我的', '他的', '说的', '做的', '很难', '越来', '就可', '就以', '这种话', '而言', '来说', '别再', '别去', '不用', '只要', '就能',
+  ])
+  const PUNCT = /[\s，。！？、；：,.!?;:""''…—~·\-]/
+  const LATIN_SEG = /^[A-Za-z][A-Za-z0-9+#.]*$/
+  /** 这一页值得挂的标签词：术语表命中 / 拉丁专名 / 已被挑成大字高亮的词。
+   *  只有这三类，别的一律不挂——标签一多就会变成「为了热闹硬加」。 */
+  function chipPool(p, bigList, text) {
+    const pool = new Map()
+    const add = (text, kind) => {
+      const w = String(text || '')
+      // 拉丁专名（Claude / Codex / DeepSeek）本来就比四个汉字长；中文词只认 2–4 字
+      if (LATIN_SEG.test(w) ? (w.length < 2 || w.length > 9) : (w.length < 2 || w.length > 4)) return
+      // 只挂「一个词」：segment 拆成两段的短语（结合内容 / 一周的工）挂上去就是半句话
+      if (segment(w).length !== 1) return
+      if (CHIP_STOP.has(w) || /^[0-9]/.test(w)) return
+      if (pool.has(w)) return
+      pool.set(w, { text: w, kind })
+    }
+    for (const term of TERMS) if (text.includes(term)) add(term, 'term')
+    for (const b of bigList) {
+      const toks = segment(bare(b.text || ''))
+      for (const tok of toks) if (LATIN_SEG.test(tok) && tok.length >= 2) add(tok, 'latin')
+      if (b.hot) add(bare(b.hot), 'hot')
+    }
+    if (p.emph) add(bare(p.emph), 'hot')
+    for (const b of bigList) {
+      const hw = bare(b.hot || '')
+      if (!hw) continue
+      const piece = segment(hw).filter(w => w.length >= 2 && w.length <= 4).sort((x, y) => y.length - x.length)[0]
+      if (piece) add(piece, 'hot')
+    }
+    for (const c of (p.cards || [])) {
+      for (const tok of segment(bare(c.text || ''))) if (LATIN_SEG.test(tok) && tok.length >= 2) add(tok, 'latin')
+    }
+    return [...pool.values()]
+  }
+  /** 这个词是在这一页的哪一刻被说出来的：按字符表对齐，返回第一个字的时间。 */
+  function spokenAt(list, word) {
+    for (const b of list) {
+      const chars = (b.chars || []).filter(x => x && x.ch && !PUNCT.test(x.ch))
+      const bag = chars.map(x => x.ch).join('')
+      const idx = bag.indexOf(word)
+      if (idx >= 0 && chars[idx]) return chars[idx].f0
+    }
+    return null
+  }
+
+  const chips = []
+  const chipSlots = new Map()
+  const slotOrderA = [[0, 0], [1, 0], [0, 1], [1, 1], [0, 2], [1, 2]]
+  const slotOrderB = [[1, 0], [0, 0], [1, 1], [0, 1], [1, 2], [0, 2]]
+  const chipLife = (L.chips && L.chips.life) || 4.6
+  for (const p of pagesRaw) {
+    const list = beats.filter(b => b.f0 >= p.start - 0.25 && b.f0 < p.end)
+    const pageText = list.map(b => b.text).join('')
+    const bigList = bigs.filter(b => b.page === p.index)
+    const title = bare(p.title || '')
+    const cands = []
+    for (const c of chipPool(p, bigList, pageText)) {
+      if (title && (title.includes(c.text) || c.text.includes(title))) continue
+      const at = spokenAt(list, c.text)
+      if (at == null) continue
+      if (at < p.start + 1.75 || at > p.end - 1.2) continue
+      cands.push({ ...c, f0: at })
+    }
+    const rank = c => (c.kind === 'term' ? 3 : c.kind === 'latin' ? 2 : 1)
+    cands.sort((a, b) => (rank(b) - rank(a)) || (a.f0 - b.f0))
+    const picked = []
+    for (const c of cands) {
+      if (picked.length >= 4) break
+      if (picked.some(x => Math.abs(x.f0 - c.f0) < 1.0)) continue
+      if (picked.some(x => x.text.includes(c.text) || c.text.includes(x.text))) continue
+      picked.push(c)
+    }
+    picked.sort((a, b) => a.f0 - b.f0)
+    for (const c of picked) {
+      const f0 = round(c.f0)
+      const s0 = shots.find(s => f0 >= s.f0 && f0 < s.f1)
+      if (!s0 || s0.kind === 'card' || s0.kind === 'outro') continue
+      if (f0 + 0.5 > s0.f1) continue                              // 马上切版式，别贴边起
+      // 「说过就留着」：留 4.6 秒，后面的词再叠上来，任何一帧都有两三张在场
+      const f1 = round(Math.min(f0 + chipLife, p.end - 0.15, s0.f1 - 0.12, duration - 0.2))
+      if (f1 - f0 < 1.2) continue
+      if (blocks.some(b => (b.kind === 'tagwall' || b.kind === 'banner') && f0 < b.f1 && b.f0 < f1)) continue
+      const sides = s0.kind === 'corner' ? [0] : [0, 1]           // 小窗页右边是人物窗口，标签只走左边
+      const order = chips.length % 2 ? slotOrderB : slotOrderA
+      let key = null
+      for (const [side, lane] of order) {
+        if (!sides.includes(side)) continue
+        const k2 = side + ':' + lane
+        const busy = chipSlots.get(k2) || []
+        if (busy.some(w => f0 < w[1] + 0.12 && w[0] < f1 + 0.12)) continue
+        key = k2
+        break
+      }
+      if (!key) continue
+      const busy = chipSlots.get(key) || []
+      busy.push([f0, f1])
+      chipSlots.set(key, busy)
+      const [side, lane] = key.split(':').map(Number)
+      chips.push({ text: c.text, f0, f1, side, lane, page: p.index, hot: c.kind === 'term' || c.kind === 'latin' ? 1 : 0 })
+    }
+  }
+
   const subs = beats.map((b, i) => {
     const big = bigs.find(x => x.beat === i)
     return { text: b.text, f0: b.f0, f1: b.f1, runs: markRuns(b.text, big ? big.hot : '') }
@@ -390,6 +507,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     bigs,
     subs,
     blocks,
+    chips,
     beats,
     marks: pagesRaw.map(p => ({ t: round(p.start), index: p.index, total: p.total })),
     sections: pagesRaw.map(p => ({ index: p.index, start: round(p.start), end: round(p.end), text: p.text, lines: [] })),
@@ -411,6 +529,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     planSummary: {
       shots: shots.map(s => ({ at: round(s.f0), kind: s.kind, label: SHOT_LABEL[s.kind] || s.kind, why: s.why })),
       blocks: blocks.map(b => ({ at: round(b.f0), kind: b.kind })),
+      chips: chips.map(b => ({ at: b.f0, text: b.text })),
     },
   }
 }

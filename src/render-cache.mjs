@@ -23,7 +23,13 @@ export function hashOf(...parts) {
 }
 
 // 这些字段一变，每一帧都可能不一样，不做增量
-const GLOBAL = ['template', 'ratio', 'size', 'fps', 'frames', 'duration', 'palette', 'labels', 'stats', 'person', 'marks', 'timeline']
+const GLOBAL = ['template', 'ratio', 'size', 'fps', 'frames', 'duration', 'palette', 'labels', 'stats', 'person', 'marks', 'timeline',
+  // 版式/段落/声音提示一变，每一帧都可能不一样：shot 一换，人物位置、大字底边全变
+  'shots', 'pages', 'sections', 'cues']
+// 「有时间窗口、需要按帧算受影响区间」的元素。
+// 自测13 踩到：这里原来只有 bigs / beats，于是只改了 chips（或 blocks）时，planPatch 判「画面完全一样」，
+// 直接把上一版成片交回去——场景变了、成片没变，还是静默的。凡是能画出来的东西都得进来。
+const FRAMED = ['bigs', 'beats', 'subs', 'chips', 'blocks']
 
 /**
  * @param prev 上一版 { scene, hash, peaks } 或 null
@@ -42,7 +48,7 @@ export function planPatch({ prev, next, fps }) {
   }
 
   const spans = []
-  for (const key of ['bigs', 'beats']) {
+  for (const key of FRAMED) {
     const x = a[key] || []
     const y = b[key] || []
     if (x.length !== y.length) return { mode: 'full', reason: key + ' 的条数变了' }

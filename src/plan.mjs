@@ -27,6 +27,8 @@ export const DEFAULT_PLAN = {
   seam: { searchMs: 250, quietMs: 25, thresholdDb: -34, nudge: 0.012 },
   // 相邻重复：同一段话紧接着说了两遍，删后一遍
   dedupe: { enabled: true, minWords: 3, minChars: 4, maxGapSec: 0.8 },
+  // 口吃/重启：同一个词紧跟着又说一遍（「看到你 | 看到你的产品」）
+  restart: { enabled: true, maxBridge: 2, maxGapSec: 1.0 },
   // 口头语
   filler: { enabled: true, minGapSec: 0.12, words: [], markers: [] },
   // 删除的总字数占比上限：删过头就不是剪辑，是重写
@@ -85,6 +87,42 @@ function findRepeats(ws, { minWords = 3, minChars = 4, maxGapSec = 0.8 } = {}, t
       if (b[0].start - a[k - 1].end > maxGapSec) continue
       out.push({ i0: i + k, i1: i + 2 * k - 1, reason: 'repeat', text: tb, from: b[0].start })
       for (let x = i + k; x < i + 2 * k; x++) taken.add(ws[x].i)
+    }
+  }
+  return out
+}
+
+/**
+ * 口吃 / 重启：同一个词刚说出口，紧跟着又从头说了一遍。
+ *   「别人看到你 | 看到你的产品」——第一遍是没说完的残段，删掉它，留下说完整的那一遍。
+ * 只认这一种形状：两次之间只隔 1–2 个短虚词或代词（你 / 我 / 这个 / 就是），间隔 < 1 秒。
+ * 不认「一遍一遍地」这种叠用：下一个词是 地/得/的 就放过，那是修辞不是口吃。
+ * 自测13：质检在 51.14s 报「只有别人看到你看到你的产品」，重复句规则（minChars 4）够不着它，
+ * 因为重复的只有「看到」一个词——原来这一类只能靠模型提，模型又过不了等字数。
+ */
+function findRestarts(ws, { maxBridge = 2, maxGapSec = 1.0 } = {}, taken) {
+  const BRIDGE = new Set(['你', '我', '他', '她', '它', '这', '那', '这个', '那个', '就', '然后', '哦', '嗯', '啊'])
+  const out = []
+  for (let i = 0; i < ws.length - 1; i++) {
+    const a = ws[i]
+    if (taken.has(a.i)) continue
+    const ta = bare(a.w)
+    // 只认两个字以上的实词：「好好想想」「看看」是叠词，不是口吃
+    if (ta.length < 2) continue
+    for (let j = i + 1; j <= Math.min(i + 1 + maxBridge, ws.length - 1); j++) {
+      const b = ws[j]
+      if (taken.has(b.i)) continue
+      if (bare(b.w) !== ta) continue
+      if (b.start - a.end > maxGapSec) break
+      const bridge = ws.slice(i + 1, j)
+      if (bridge.some(w => !BRIDGE.has(bare(w.w)))) break
+      const after = ws[j + 1]
+      if (after && /^[地得的]$/.test(bare(after.w))) break
+      // 至少留下两个词，别把一句削成残句
+      if (ws.length - (j - i) < 2) break
+      out.push({ i0: i, i1: j - 1, reason: 'repeat', text: ws.slice(i, j).map(w => bare(w.w)).join(''), from: a.start })
+      for (let x = i; x < j; x++) taken.add(ws[x].i)
+      break
     }
   }
   return out
@@ -214,6 +252,7 @@ export function buildPlan(words, mediaDuration, options = {}) {
     for (let x = a; x <= b; x++) taken.add(ws[x].i)
   }
   if (o.dedupe.enabled) for (const d of findRepeats(ws, o.dedupe, taken)) { dels.push(d); taken.add(d.i0) }
+  if (o.restart.enabled) for (const d of findRestarts(ws, o.restart, taken)) { dels.push(d); taken.add(d.i0) }
   if (o.filler.enabled) for (const d of findFillers(ws, o.filler, taken)) dels.push(d)
   const deletions = protect(ws, dels).sort((a, b) => a.i0 - b.i0)
 

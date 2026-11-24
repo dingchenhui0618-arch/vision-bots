@@ -85,30 +85,55 @@ export function layoutBoxes({ scene, template }) {
     for (const b of scene.blocks || []) {
       const sk = shotAt(b.f0).kind
       if (b.kind === 'check') items.push({ tag: 'block:check', x: 56, y: Math.round(sk === 'corner' ? h * 0.50 : sk === 'frame' ? h * 0.86 : h * 0.775) - 84, w: Math.min(w - 112, 620), h: 84, t0: b.f0, t1: b.f1, shot: sk })
-      else if (b.kind === 'banner') items.push({ tag: 'block:banner', x: 0, y: Math.round(h * 0.42), w, h: Math.round(h * 0.16), t0: b.f0, t1: b.f1, shot: sk })
+      else if (b.kind === 'banner') {
+        // 红条是两条斜杠压出来的「划掉」：位置按 film.js 的 banner() 记两个真盒子（以前记成一个 0.42h 的整条，
+        // 量出来的高度和画出来的不是一回事）。它按设计是满幅出血，所以带 bleed 标记，安全区只放宽横向。
+        for (const yy of [0.575, 0.635]) items.push({ tag: 'block:banner', x: 0, y: Math.round(h * yy - 28), w, h: 56, t0: b.f0, t1: b.f1, shot: sk, bleed: true })
+      }
       else if (b.kind === 'gauge') items.push({ tag: 'block:gauge', x: w - 56 - 430, y: Math.round(h * 0.575), w: 430, h: 210, t0: b.f0, t1: b.f1, shot: sk })
       else if (b.kind === 'tagwall') {
         // 标签墙以前按「人物整块区域」记一个 1080×62% 的大盒子，于是永远和章节卡相交、
         // 也永远贴边——那是盒子编错了，不是画面压了。这里按 film.js 的真实摆放逐个算：
         // 左右两个窄带、交替左右、按同侧的个数平分高度。
         const r = personRect(sk)
-        const leftZone = { x: M0, w: Math.max(120, r.x - M0 - 18) }
-        const rightZone = { x: r.x + r.w + 18, w: Math.max(120, w - M0 - (r.x + r.w + 18)) }
+        // 和 film.js 的 tagZones 同一套：放不下 (<140px) 的那一侧不排，全部挪到另一侧
+        const rawL = r.x - M0 - 18
+        const rawR = w - M0 - (r.x + r.w + 18)
+        const useL = rawL >= 140, useR = rawR >= 140
+        const leftZone = { x: M0, w: Math.max(140, rawL) }
+        const rightZone = { x: r.x + r.w + 18, w: Math.max(140, rawR) }
+        const onRight = j => useR && (!useL || j % 2 === 1)
         const top = r.y + 40, bottom = r.y + r.h - 60
         const list = b.items || []
         list.forEach((it, i) => {
-          const right = i % 2 === 1
+          const right = onRight(i)
           const zone = right ? rightZone : leftZone
-          const count = list.filter((_, j) => (j % 2 === 1) === right).length || 1
-          const slot = Math.floor(i / 2)
+          const count = list.filter((_, j) => onRight(j) === right).length || 1
+          const slot = list.filter((_, j) => j < i && onRight(j) === right).length
           const y = top + (slot + 0.5) * ((bottom - top) / count)
           // 字宽按 24px 估（实际 22px），盒子宁可偏大：只会让检查更严
-          const cw = Math.min(zone.w, Math.round(textEm(it) * 24 + 30))
+          // 宽度必须和 film.js 一样先按窄带截断：不截的话长词（生产力工具）量出来的盒子比画出来的宽，
+          // 安全区就会报「出画」——那是盒子编的，不是画面出的。
+          const cw = Math.min(Math.round(zone.w), Math.round(textEm(it) * 24 + 30))
           const x = right ? zone.x : zone.x + Math.max(0, (zone.w - cw) * 0.5)
           items.push({ tag: 'block:tag', x: Math.round(x), y: Math.round(y - 23), w: Math.round(cw), h: 46, t0: b.f0, t1: b.f1, shot: sk })
         })
       }
       else if (b.kind === 'avatar') items.push({ tag: 'block:avatar', x: 56, y: Math.round(h * 0.32), w: 560, h: 132, t0: b.f0, t1: b.f1, shot: sk })
+    }
+    // 句子级小标签：和 film.js 的 chipLayer 同一套几何（左右两条边、三条泳道）
+    const CHIPL = L.chips || { lanes: [0.255, 0.345, 0.435], left: M0, right: 150, h: 46, padX: 20 }
+    for (const ch of scene.chips || []) {
+      const size = TY.chip || 24
+      const cw = Math.round(textEm(ch.text) * size + (CHIPL.padX || 20) * 2)
+      const hh = CHIPL.h || 46
+      const y = Math.round(h * (((CHIPL.lanes || [])[ch.lane]) || 0.3))
+      const sk2 = shotAt(ch.f0).kind
+      const pr = personRect(sk2)
+      const x = (sk2 === 'frame' || sk2 === 'corner')
+        ? (ch.side ? pr.x + pr.w + 18 : pr.x - 18 - cw)
+        : (ch.side ? w - (CHIPL.right || 150) - cw : (CHIPL.left || M0))
+      items.push({ tag: 'block:chip', x, y: y - hh / 2, w: cw, h: hh, t0: ch.f0, t1: ch.f1, shot: shotAt(ch.f0).kind })
     }
     // HUD 三件 + 章节卡：以前没进盒子表，等于质检看不见页码/胶囊/进度线/章节卡，
     // 「章节卡压大字」「小字眉压亮背景读不清」这类问题全都漏检。
