@@ -21,7 +21,9 @@ export const HEADLINE = {
   // 真素材上模型给过「满大街在做」「都能做出你」「一天做出」——都是把一句话在词中间掐断，
   // 读起来像字幕卡了。重写一次基本都能落回实词（2026-11-24 实测）。
   badTail: '的了是在和就都也才把给对从但而很太更不没有着过吧呢吗啊嘛做说看用要会能去来出你我他她它们',
-  badHead: /^(但是|然后|所以|因为|而且|就是|其实|如果|只有|或者|还是|这个|那个|就是说)/,
+  // 开头也不许是「的/了/着/过/地/得」这类结构助词：自测18 给过「的内容生产力」，
+  // 每个字都在句子里、也在词边界上，可上屏就是一个从句尾巴，读起来像被截断。
+  badHead: /^(但是|然后|所以|因为|而且|就是|其实|如果|只有|或者|还是|这个|那个|就是说|[的了着过地得])/,
   // 太短的句子不值得单独占大字：说话只要 1 秒，大字一闪反而像抖，
   // 这一句交给底部字幕 pill（它本来就有）。宁缺毋滥，也不拿上一句的字来凑。
   minSec: 1.15,
@@ -106,7 +108,10 @@ const CONNECTIVE = /^(但是|然后|所以|因为|而且|就是|其实|如果|�
 export function pickHeadline(sentence) {
   const text = strip(sentence)
   if (!text) return ''
-  if (text.length <= HEADLINE.maxChars) return HEADLINE.badHead.test(text) ? text.slice(0, HEADLINE.maxChars) : text
+  if (text.length <= HEADLINE.maxChars) {
+    const t = trimBadHead(text)
+    return t.length >= HEADLINE.minChars ? t : text
+  }
   const words = segment(text).length ? segment(text) : [...text]
   let best = null
   for (let i = 0; i < words.length; i++) {
@@ -115,15 +120,31 @@ export function pickHeadline(sentence) {
       acc += words[j]
       if (acc.length > HEADLINE.maxChars) break
       if (acc.length < HEADLINE.minChars) continue
+      // 以连接词或结构助词开头的窗口根本不考虑（自测20 兜底给出过「的机会是在OPC」：
+      // 模型那条被 checkHeadline 拦下了，兜底路径却只有旧扣分项，扣完还能当第一）。
+      if (HEADLINE.badHead.test(acc) || CONNECTIVE.test(acc)) continue
       let score = 0
       for (let k = i; k <= j; k++) score += words[k].length >= 2 ? words[k].length : 0
-      if (CONNECTIVE.test(acc)) score -= 2.5
       if (HEADLINE.badTail.includes(acc[acc.length - 1])) score -= 1.5
       if (acc.length < 3) score -= 1
       if (!best || score > best.score) best = { text: acc, score }
     }
   }
-  return best ? best.text : text.slice(0, HEADLINE.maxChars)
+  if (best) return best.text
+  const t = trimBadHead(text.slice(0, HEADLINE.maxChars))
+  return t.length >= HEADLINE.minChars ? t : text.slice(0, HEADLINE.maxChars)
+}
+
+/** 去掉开头的连接词/结构助词（「的机会是在OPC」→「机会是在OPC」）。 */
+function trimBadHead(t) {
+  let s = t
+  for (let k = 0; k < 3; k++) {
+    if (!HEADLINE.badHead.test(s)) break
+    const next = s.replace(HEADLINE.badHead, '')
+    if (next.length < HEADLINE.minChars) break
+    s = next
+  }
+  return s
 }
 
 function promptFor(input) {
@@ -133,7 +154,9 @@ function promptFor(input) {
     '- 每条 3–6 个汉字（最多 8 个）：是这一句的压缩，不是整句照抄，也不是总结别的句子。',
     '- 只能用这一句原文里出现过的字；不许引入这句里没有的数字、人名、平台名、结论。',
     '- 结尾落在实词上，不许是「的、了、是、在、就、都、也、才、把」这类字——那是半句话。',
-    '- 不许以「但是、然后、所以、因为、就是」开头；不要问句、不要感叹号。',
+    '- 不许以「但是、然后、所以、因为、就是」开头；也不许以「的、了、着、过、地、得」开头。',
+    '  开头是「的」就等于从句子中间起头（原文「落地的是内容生产力」写成「的内容生产力」是错的）。',
+    '- 不要问句、不要感叹号。',
     '- 每条只对指定的那一句负责：不要拿前后句的内容来概括，也不要跨句改写。',
     '- 必须是这一句里连续的一段：可以砍头、可以砍尾，不能从中间抽字。',
     '  原文「真正赚钱的有几个呢」写成「真正赚钱几个」（抽掉一个「的」）就要退回原句重来。',
@@ -197,7 +220,7 @@ export async function titleSentences({ sentences, log = () => {}, repair = true 
     const secs = rejected.map(t => list.find(s => s.index === t.index)).filter(Boolean)
     const fixPrompt = [
       '下面这几句的大字没过校验，原因在「不合格」里。只重写这几句，规则同前：',
-      '3–6 个汉字、只能用这一句原文里的字、结尾落在实词上、不许以「但是/所以/然后/就是」开头。',
+      '3–6 个汉字、只能用这一句原文里的字、结尾落在实词上、不许以「但是/所以/然后/就是」或「的/了/着/过/地/得」开头。',
       JSON.stringify(rejected.map((t, i) => ({ index: t.index, 原文: strip(secs[i].text), 不合格: t.why, 上一版: t.asked })), null, 1),
       '只输出 JSON：{"titles":[{"index":1,"text":"3到6个字"}]}',
     ].join('\n')

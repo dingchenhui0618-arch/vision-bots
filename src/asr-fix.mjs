@@ -19,6 +19,12 @@
  * 数字（只修阿拉伯数字写错）。近音最危险——「千」和「天」本来就不同音，凭什么说它错？
  * 所以近音要多一条独立证据：改动范围前后 3 个词里必须有低置信词（ASR 自己就在犯嘀咕），
  * 而且全片最多 2 处。没有这条证据，近音一律打回。
+ *
+ * 还有一类「文本两头都不成立」的错：同声母、同声调、韵母只差一个元音（捡 jiǎn / 卷 juǎn）。
+ * 拼音不全等→不算同音；韵母不同→不算近音；可快语流里这两个音节本来就难分。
+ * 自测18 交付的片子里「别再卷技术了」被写成「别再捡技术了」，模型报了、规则按「不同音」打回，
+ * 错字就这么出了厂。文本判不了的事只能交给音频：这类提案一律转听音复核，
+ * 要强耳朵两个窗口都听到「卷」才算数（实测 medium 两次都听到「卷」）。全片最多 PHON_CAP 处进重听。
  */
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -60,6 +66,8 @@ const MAX_FIXES = words => Math.max(4, Math.ceil(words.length * 0.08))
 const NEAR_WINDOW = 3
 const NEAR_CAP = 2
 const NEAR_P = 0.65
+// 「同声母同声调、韵母只差一个元音」（捡 jiǎn / 卷 juǎn）：文本层判不了，交听音复核，别占近音预算。
+const PHON_CAP = 3
 // 整段纠错（第二遍，按句子读）：ASR 的真错常常是一整段
 // （「指纹住在做内容」实际说的是「真正在做内容」），按词一个个看永远看不出来。
 // 约束不放松：字数不变、词数不变、时间码不动；全片最多 SPAN_CAP 处，逐条写进交付报告。
@@ -274,6 +282,55 @@ export async function phoneticOf(items) {
     : null))
 
   function j0(v) { return Array.isArray(v) ? v : [...String(v ?? '')] }
+}
+
+/**
+ * 「同声母、同声调、韵母只差一个元音」——文本层的证据到这里就到头了。
+ *
+ * 捡 jiǎn 与 卷 juǎn：拼音不全等（不是同音），韵母 ian/uan 不同（不是近音，
+ * 近音要求韵母一致、声母不同）。可这两个音节在快语流里本来就难分，
+ * 区别只在韵头 i/u —— 唯一能判的是音频，不是拼音表。
+ *
+ * 所以这里只回答「值不值得去听」：值得就返回韵母差异，由听音复核用强耳朵定生死。
+ * 判据刻意窄：声母一致、声调一致、韵母等长且只差一个字母。差两个字母的（盆 pén / 瓶 píng）
+ * 声学上差得远，不值得花一次重听预算。
+ */
+export function phonOnly(a, b) {
+  if (!a || !b) return null
+  if (a.py === b.py) return null
+  const ia = a.ini.join('')
+  const ib = b.ini.join('')
+  if (!ia || ia !== ib) return null
+  const fa = String(a.fin[0] ?? '')
+  const fb = String(b.fin[0] ?? '')
+  if (fa.length < 2 || fa.length !== fb.length) return null
+  const toneA = fa[fa.length - 1]
+  const toneB = fb[fb.length - 1]
+  if (toneA !== toneB) return null
+  const ra = fa.slice(0, -1)
+  const rb = fb.slice(0, -1)
+  let d = 0
+  for (let k = 0; k < ra.length; k++) if (ra[k] !== rb[k]) d++
+  return d === 1 ? { ini: ia, rimeA: ra, rimeB: rb, tone: toneA } : null
+}
+
+/**
+ * 两段等长文字是不是「只差一个字」。返回 { at, from, to }，否则 null。
+ * 听音复核拿它当闸门：只差一个元音的那类改法（捡/卷）只允许音频在这一处换一个字，
+ * 多一个字都不算「这一个音节听清了」——那就不是证据，是另一次转写。
+ */
+export function oneCharSwap(a, b) {
+  const A = [...strip(a)]
+  const B = [...strip(b)]
+  if (!A.length || A.length !== B.length) return null
+  let at = -1
+  for (let k = 0; k < A.length; k++) {
+    if (A[k] === B[k]) continue
+    if (at >= 0) return null
+    at = k
+  }
+  if (at < 0) return null
+  return { at, from: A[at], to: B[at] }
 }
 
 // ── 词文本的切分与重排：标点留在原位，只动字 ──
@@ -569,6 +626,8 @@ ${wordList}
 1. 同音字（如「画走」应为「划走」），kind=homophone；
 2. 近音字：韵母和声调相同、声母不同（如「一千的时间」应为「一天的时间」，千 qiān → 天 tiān）。
    这类只有在旁边确实有低置信词（?(…) 标记）时才报，kind=near；没有低置信词就别报。
+   还有一类更细的：声母和声调都相同、韵母只差一个元音（如「别再捡技术了」应为「别再卷技术了」，
+   捡 jiǎn → 卷 juǎn）。读不通就报 kind=near——这条不靠拼音自证，最终由重听音频决定，报错也不会出厂。
 3. 专有名词（如「斗音」应为「抖音」），kind=term；
 4. 数字写错（必须是阿拉伯数字写错），kind=number。
 
@@ -659,6 +718,9 @@ async function callModel(wordList, { nudge = '' } = {}) {
 export async function validate(proposals, words, { terms, pinyin }) {
   const accepted = []
   const rejected = []
+  // 文本层判不了、只能由音频定生死的提案（同声母同声调、韵母只差一个元音），
+  // 交听音复核；没被音频确认的，一律不改（理由照样写进报告）。
+  const phon = []
   const cap = MAX_FIXES(words)
   const seen = new Set()
   const list = Array.isArray(proposals) ? proposals : []
@@ -743,7 +805,16 @@ export async function validate(proposals, words, { terms, pinyin }) {
       const a = vals[k]
       const b = vals[k + 1]
       if (!a || !b) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '拼音查不到，无法验证同音' }); continue }
-      if (a.py !== b.py) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '不同音：' + a.py + ' vs ' + b.py }); continue }
+      if (a.py !== b.py) {
+        const ph = phonOnly(a, b)
+        if (!ph) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '不同音：' + a.py + ' vs ' + b.py }); continue }
+        // 会把这个词改碎的照样不送听：音频再准也救不了一个本来就不成立的词形。
+        const wbPh = wordBreak(x)
+        if (wbPh) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: wbPh }); continue }
+        rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '不同音（' + a.py + ' vs ' + b.py + '），但同声母同声调、韵母只差一个元音，已交听音复核：音频说是「' + strip(x.to) + '」才改' })
+        if (phon.length < PHON_CAP) phon.push({ i: x.i, n: x.n, at: +x.w.start.toFixed(2), from: strip(x.span.cores.join('')), to: strip(x.to), why: String(x.p.why || '').slice(0, 40), pinyin: a.py + ' vs ' + b.py, rime: ph.ini + ph.rimeA + ' vs ' + ph.ini + ph.rimeB })
+        continue
+      }
       const wb = wordBreak(x)
       if (wb) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: wb }); continue }
       accepted.push({ ...base, verified: '拼音 ' + a.py + ' 一致' })
@@ -757,6 +828,15 @@ export async function validate(proposals, words, { terms, pinyin }) {
       if (a.py === b.py) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '本来就是同音，应该报同音类' }); continue }
       const finA = a.fin.join('|')
       const finB = b.fin.join('|')
+      // 同声母同声调、韵母只差一个元音：近音证据与低置信见证都不适用，唯一的路是听音频。
+      const phn = phonOnly(a, b)
+      if (phn) {
+        const wbPn = wordBreak(x)
+        if (wbPn) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: wbPn }); continue }
+        rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '不同音（' + a.py + ' vs ' + b.py + '），但同声母同声调、韵母只差一个元音，已交听音复核：音频说是「' + strip(x.to) + '」才改' })
+        if (phon.length < PHON_CAP) phon.push({ i: x.i, n: x.n, at: +x.w.start.toFixed(2), from: strip(x.span.cores.join('')), to: strip(x.to), why: String(x.p.why || '').slice(0, 40), pinyin: a.py + ' vs ' + b.py, rime: phn.ini + phn.rimeA + ' vs ' + phn.ini + phn.rimeB })
+        continue
+      }
       if (finA !== finB) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '韵母或声调不同：' + finA + ' vs ' + finB }); continue }
       if (a.ini.join('|') === b.ini.join('|')) { rejected.push({ i: x.i, from: x.w.w, to: x.to, why: '声母也一致但不同音，无法自证' }); continue }
       const wit = nearWitness(words, x.i, x.n)
@@ -773,7 +853,7 @@ export async function validate(proposals, words, { terms, pinyin }) {
     }
     for (let k = 0; k < x.n; k++) seen.add(x.i + k)
   }
-  return { accepted, rejected, pinyinMode: pyOk ? 'on' : 'off' }
+  return { accepted, rejected, pinyinMode: pyOk ? 'on' : 'off', phon }
 }
 
 /**
@@ -813,10 +893,13 @@ export function lowConfidenceClusters(view, cfg = RELISTEN) {
  * 听音复核，并把能落地的改动落到 words 上。
  * 返回新的 current、记账 section、改动涉及的源时间区间（断言用）、净词数变化。
  */
-async function relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords = '', hints = [], log }) {
-  const base = { model: RELISTEN.model, ran: true, candidates: 0, spans: [], applied: 0 }
+async function relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords = '', hints = [], phon = [], log }) {
+  const base = { model: RELISTEN.model, ran: true, candidates: 0, spans: [], applied: 0, phonProposals: phon.length, phonApplied: 0 }
   const startLen = current.length
-  const off = (why, detail) => ({ current, section: { ...base, ran: false, why, detail: detail || null }, ranges: [], confirmed: [], delta: 0 })
+  const off = (why, detail) => {
+    if (phon.length) log('听音复核没跑（' + why + '）：' + phon.length + ' 处只能靠听音频的改法（' + phon.map(p => p.from + '→' + p.to).join('、') + '）没被确认，一律不改')
+    return { current, section: { ...base, ran: false, why, detail: detail || null }, ranges: [], confirmed: [], delta: 0 }
+  }
   if (!relistenEnabled()) return off('disabled', 'VISION_BOTS_RELISTEN=0')
   if (!relistenModel(RELISTEN.model)) {
     log('听音复核没跑：本机没有 faster-whisper ' + RELISTEN.model + '（要一个比 small 更强的耳朵；small 就是犯错的那个）')
@@ -867,6 +950,21 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
     seen.add(q)
     hintCands.push({ text: q, hint: h, lowN: 0, minP: 1, slot: null })
   }
+  // 紧跟质检线索之后的第三档：文本层判不了、只能听音频的改法（捡 jiǎn / 卷 juǎn）。
+  // 这类候选自带「应该听到哪个字」，重听后只允许那一个字被换过去，别处一个字都不许变；
+  // 听到的是别的，就说明确实不是那个字，原样交回并把理由写进报告。
+  const phonNotes = []
+  const phonCands = []
+  for (const p of phon) {
+    const hit = current.findIndex(w => Math.abs(w.start - p.at) <= 0.05)
+    if (hit < 0) { phonNotes.push({ from: p.from, to: p.to, skipped: '词已不在原位' }); continue }
+    const v = sentenceView(current, segments).find(s => s.ws.some(x => x.i === hit))
+    if (!v) { phonNotes.push({ from: p.from, to: p.to, skipped: '找不到这句' }); continue }
+    if (!v.text.includes(p.from)) { phonNotes.push({ from: p.from, to: p.to, skipped: '这句已被改过：' + v.text.slice(0, 16) }); continue }
+    if (seen.has(v.text)) { phonNotes.push({ from: p.from, to: p.to, skipped: '这句已在待听名单里' }); continue }
+    seen.add(v.text)
+    phonCands.push({ text: v.text, phon: p, lowN: 0, minP: 1, slot: null })
+  }
   for (const v of sentenceView(current, segments)) {
     if (seen.has(v.text)) continue
     seen.add(v.text)
@@ -888,12 +986,14 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
   // 质检线索**不占**采集预算。以前线索和采集共用 maxSpans：上一轮 17 句待查只听了 5 句，
   // 其中 3 句是线索，真正的错句（25.4s「指纹住在」）排在后面，一次都没轮到听过。
   // 线索是上一轮质检实测出来的疑点，必须听；预算只在「ASR 自己卡过」的句子里挑。
-  const pickedCands = [...hintCands, ...auditCands.slice(0, RELISTEN.maxSpans)]
+  // 只能靠音频定的那几处不占采集预算（和线索同理：它们是已知疑点，不是猜的）
+  const pickedCands = [...hintCands, ...phonCands, ...auditCands.slice(0, RELISTEN.maxSpans)]
   const section = {
-    ...base, candidates: hintCands.length + auditCands.length, hints: hintCands.length,
+    ...base, candidates: hintCands.length + auditCands.length + phonCands.length, hints: hintCands.length,
     notListened: Math.max(0, auditCands.length - RELISTEN.maxSpans),
     notListenedTexts: auditCands.slice(RELISTEN.maxSpans, RELISTEN.maxSpans + 3).map(c => c.text.slice(0, 14)),
-    picked: pickedCands.map(c => ({ text: c.text.slice(0, 16), hint: Boolean(c.hint), slot: c.slot ? c.slot.ratio : null, low: c.lowN })),
+    phon: { proposals: phon.length, candidates: phonCands.length, notes: phonNotes },
+    picked: pickedCands.map(c => ({ text: c.text.slice(0, 16), hint: Boolean(c.hint), phon: c.phon ? c.phon.from + '→' + c.phon.to : null, slot: c.slot ? c.slot.ratio : null, low: c.lowN })),
   }
   if (!pickedCands.length) {
     return off('nothing-suspicious', '既没有质检线索，也没有扎堆的低置信词（4 个词里 ≥2 个 p<' + RELISTEN.lowP + '）或吞了静音的词槽，没有值得重听的地方')
@@ -927,6 +1027,20 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       continue
     }
     const diff = charDiff(v.text, r.text)
+    // 只能靠音频定的那一类（捡 jiǎn / 卷 juǎn）：音频必须把这一处听成提案里的那个字，
+    // 而且整句其余字与字幕逐字相同。差一个字以上就不再是「这一个音节听清了」，那是另一次转写——
+    // 用它改字等于让重听顺手重写整句，规矩不允许。
+    if (cand.phon) {
+      if (diff.same) {
+        reject(span, r, v, '音频与字幕一致，都听到「' + cand.phon.from + '」，提案里的「' + cand.phon.to + '」不成立，不改')
+        continue
+      }
+      const sw = oneCharSwap(v.text, r.text)
+      if (!sw || sw.from !== cand.phon.from || sw.to !== cand.phon.to) {
+        reject(span, r, v, '音频听到「' + String(r.text || '').slice(0, 16) + '」，不是提案里的「' + cand.phon.from + '→' + cand.phon.to + '」，这条不改')
+        continue
+      }
+    }
     if (diff.same) {
       section.spans.push({ span, agree: true, confirmed: true, text: r.text })
       // 强耳朵逐字读过、和字幕一样：这句话里的词不算「没把握」了
@@ -1003,6 +1117,7 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       continue
     }
     current = next
+    if (cand.phon) section.phonApplied = (section.phonApplied || 0) + 1
     // 删字会把它前面那个词的 end 延长到被删词的 end，那个词的时间码确实变了，
     // 所以要把它一起划进「允许变动」的区间，否则断言会把它当成越权改动。
     const widen = rep.op === 'delete' ? current[Math.max(0, rg.a - 1)].start : t0
@@ -1013,6 +1128,7 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       tier: r.tier, model: r.model,
       added: rep.op === 'insert' ? rep.newWord.w : null,
       gap: rep.gap || null,
+      phon: cand.phon ? { from: cand.phon.from, to: cand.phon.to, pinyin: cand.phon.pinyin, rime: cand.phon.rime } : undefined,
       decodes: r.decodes,
     })
     log('听音复核：' + span.join('–') + 's 字幕「' + v.text + '」→ 音频「' + r.text + '」' +
@@ -1022,7 +1138,8 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
           ? '（把「' + rep.parts.map(x => x.from).join('') + '」改成「' + rep.parts.map(x => x.to).join('') + '」，时间码不动）'
           : rep.op === 'respeak'
             ? '（「' + rep.eaten.map(e => e.core).join('') + '」整段重说成「' + rep.ins + '」，合成一个词、时间码不动）'
-            : '（删 ' + rep.eaten.length + ' 个词）') + '；两次听一致（强耳朵 ' + r.model + '，两个窗口）')
+            : '（删 ' + rep.eaten.length + ' 个词）') + '；两次听一致（强耳朵 ' + r.model + '，两个窗口）' +
+      (cand.phon ? '；这处文本层判不了（' + cand.phon.pinyin + '），只有音频能分' : ''))
   }
   section.delta = current.length - startLen
   section.confirmedSpans = confirmed.length
@@ -1127,6 +1244,7 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
         const key = o => o.s + '|' + o.from + '|' + o.to
         const mapKey = m => (m || []).map(([i, t]) => i + ':' + t).sort().join('|')
         const seen = new Set()
+        const phonDual = []
         for (const p of r1b.proposals || []) {
           const v = view[Number(p && p.s) - 1]
           if (!v || !p.from || !p.to) continue
@@ -1144,6 +1262,30 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
           }
           const k = mapKey(m)
           if (k) seen.add(k)
+          // 第二模型自己报的改法：正好是「只差一个元音」那一类（捡 jiǎn / 卷 juǎn）时，
+          // 也交给听音复核。它常常和第一模型的提案对不上（一个说抓、一个说卷），
+          // 按现在的配对逻辑整个被丢掉——可这一类的判据本来就是音频，不是两个模型对不对得上。
+          const core1 = splitAffixes(current[i].w).core
+          const core2 = String(p.to ?? '').trim()
+          if (n === 1 && [...core1].length === 1 && [...core2].length === 1 && core1 !== core2) {
+            phonDual.push({ i, at: +current[i].start.toFixed(2), from: core1, to: core2, why: String(p.why || '').slice(0, 40) })
+          }
+        }
+        if (phonDual.length) {
+          const vals = await phoneticOf(phonDual.flatMap(x => [x.from, x.to]))
+          let added = 0
+          for (let k = 0; k < phonDual.length; k++) {
+            const a = vals && vals[k * 2]
+            const b = vals && vals[k * 2 + 1]
+            const ph = phonOnly(a, b)
+            if (!ph) continue
+            const cur = report.phonProposals || []
+            if (cur.length >= PHON_CAP) break
+            if (cur.some(x => Math.abs(x.at - phonDual[k].at) < 0.05)) continue
+            report.phonProposals = [...cur, { ...phonDual[k], pinyin: a.py + ' vs ' + b.py, rime: ph.ini + ph.rimeA + ' vs ' + ph.ini + ph.rimeB, by: '第二模型' }]
+            added++
+          }
+          if (added) log('第二意见：另有 ' + added + ' 处只差一个元音（' + phonDual.map(x => x.from + '→' + x.to).join('、') + '），也交听音复核')
         }
         const duals = new Set(passNeed.filter(x => seen.has(mapKey(x.map))).map(key))
         report.dual = {
@@ -1194,6 +1336,11 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
       report.model = { ok: true, model: r.model, ms: r.ms, tokens: r.tokens, proposals: (r.proposals || []).length, pinyinMode: v.pinyinMode }
       report.applied.push(...v.accepted)
       report.rejected.push(...v.rejected)
+      // 只差一个元音的改法（捡→卷）文本层判不了，记下来交给第五遍听音复核
+      if (v.phon && v.phon.length) {
+        report.phonProposals = v.phon
+        log('错字纠错：' + v.phon.length + ' 处只能靠听音频（' + v.phon.map(p => p.from + '→' + p.to).join('、') + '），已交给听音复核')
+      }
       // 跨词提案落地：一个提案可能占 2 个以上词位，按 parts 逐位写回
       const byIndex = new Map()
       for (const a of v.accepted) {
@@ -1237,7 +1384,7 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
   }
 
   // 第五遍：听音复核。只重听 ASR 自己卡过的那几句，预算 RELISTEN.maxSpans 处。
-  const aud = await relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords: hotwordPrompt(terms), hints, log })
+  const aud = await relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords: hotwordPrompt(terms), hints, phon: report.phonProposals || [], log })
   current = aud.current
   report.relisten = aud.section
 
@@ -1291,9 +1438,12 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     near: report.applied.filter(a => a.kind === 'near').length,
     span: report.applied.filter(a => a.kind === 'span').length,
     relisten: aud.section.applied || 0,
+    // 只差一个元音的那一类：文本层判不了，只有音频能定
+    phon: (report.phonProposals || []).length,
+    phonApplied: aud.section.phonApplied || 0,
     ms: Date.now() - t0,
   }
   const aiAccepted = report.applied.length - g.hits.length
-  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 第二意见 ${report.dual && report.dual.ok ? report.dual.need + ' 待证/' + report.dual.agreed + ' 一致' : '未用'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}、双模型 ${report.stats.dual}） · 听音复核 ${report.relisten && report.relisten.ran ? (report.relisten.candidates + ' 句待听/' + report.relisten.applied + ' 处落地') : '未跑'} · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
+  log(`错字治理：术语表 ${g.hits.length} 处 · 整句 ${report.sentence && report.sentence.ok ? report.sentence.proposals + ' 提案' : '未接'} · 逐词 ${report.model && report.model.ok ? report.model.proposals + ' 提案' : '未接'} · 第二意见 ${report.dual && report.dual.ok ? report.dual.need + ' 待证/' + report.dual.agreed + ' 一致' : '未用'} · 采纳 ${aiAccepted}（整段 ${report.stats.span}、双模型 ${report.stats.dual}） · 听音复核 ${report.relisten && report.relisten.ran ? (report.relisten.candidates + ' 句待听/' + report.relisten.applied + ' 处落地') : '未跑'}${report.stats.phon ? '（含只差一个元音 ' + report.stats.phonApplied + '/' + report.stats.phon + '）' : ''} · 打回 ${report.rejected.length} · 待确认 ${report.pending.length}`)
   return { words: current, report }
 }

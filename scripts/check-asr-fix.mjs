@@ -2,7 +2,7 @@
  * 错字治理的自检：术语表、模型提案的校验器、句子回流、硬断言。
  * 模型提案用固定样本喂进来，不联网；拼音校验在本机有 uv 时额外验一遍。
  */
-import { applyTerms, applyToSegments, mergeAsciiRuns, breaksWord, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, loadTerms, LEN_NUDGE } from '../src/asr-fix.mjs'
+import { applyTerms, applyToSegments, mergeAsciiRuns, breaksWord, validate, validateSpans, sentenceView, correct, hotwordPrompt, pinyinOf, phoneticOf, phonOnly, oneCharSwap, loadTerms, LEN_NUDGE } from '../src/asr-fix.mjs'
 
 let pass = 0
 const fails = []
@@ -277,11 +277,41 @@ if (py) {
   ok('校验 · 低置信的「时→是」虽然同音，但会把「时代」改碎 → 打回', vV.accepted.length === 0 && /切碎/.test(String(vV.rejected[0] && vV.rejected[0].why)), JSON.stringify(vV.rejected[0]))
 }
 
+// ── 19. 只差一个元音的那一类（捡 jiǎn / 卷 juǎn）：文本判不了，交听音复核 ──
+// 自测18 交付片里「别再卷技术了」写成「别再捡技术了」：模型报了、规则按「不同音」打回，错字出厂。
+// 现在这类不进采纳、也不简单打回，而是记成「待听」——只有音频说「卷」才改。
+if (py) {
+  const [pj, ju, qian, tian, pen, ping] = await phoneticOf(['捡', '卷', '千', '天', '盆', '瓶'])
+  const c1 = phonOnly(pj, ju)
+  ok('只差一个元音 · 捡/卷（同声母同声调、韵母 ian/uan）算待听', Boolean(c1) && c1.rimeA === 'ian' && c1.rimeB === 'uan' && c1.tone === '3', JSON.stringify(c1))
+  ok('只差一个元音 · 千/天 声母不同，归近音不归这里', phonOnly(qian, tian) === null)
+  ok('只差一个元音 · 盆/瓶 韵母差两个字母，不值得花一次重听', phonOnly(pen, ping) === null)
+  ok('只差一个元音 · 同音（拼音全等）不算这一类', phonOnly(pj, pj) === null)
+
+  const jw = [W('别', 0), W('再', 0.32), W('去', 0.64), W('捡', 0.96, 0.8), W('技', 1.28), W('术', 1.6), W('了', 1.92)]
+  const vp = await validate([{ i: 3, to: '卷', kind: 'homophone', why: '应为卷' }], jw, { terms: [] })
+  ok('只差一个元音 · 不进采纳（文本证据不够）', vp.accepted.length === 0)
+  ok('只差一个元音 · 记成待听并写清理由', vp.phon.length === 1 && vp.phon[0].from === '捡' && vp.phon[0].to === '卷', JSON.stringify(vp.phon))
+  ok('只差一个元音 · 报告里的理由是「已交听音复核」', /已交听音复核/.test(String(vp.rejected[0] && vp.rejected[0].why)), JSON.stringify(vp.rejected[0]))
+  const vp2 = await validate([{ i: 3, to: '卷', kind: 'near', why: '应为卷' }], jw, { terms: [] })
+  ok('只差一个元音 · 报成 near 也照样转听音，不会漏', vp2.phon.length === 1 && vp2.accepted.length === 0, JSON.stringify(vp2.phon))
+  const bw = [W('一', 0), W('盆', 0.32, 0.8), W('花', 0.64)]
+  const vb = await validate([{ i: 1, to: '瓶', kind: 'homophone', why: '应为瓶' }], bw, { terms: [] })
+  ok('只差一个元音 · 差得远的提案不占重听预算', vb.phon.length === 0 && /不同音/.test(String(vb.rejected[0] && vb.rejected[0].why)), JSON.stringify(vb.rejected[0]))
+}
+
+// 闸门：音频只能在这一处换一个字，多一个字都不算「这一个音节听清了」
+const gate = oneCharSwap('别再去捡技术了', '别再去卷技术了')
+ok('听音闸门 · 只差一个字 → 认', Boolean(gate) && gate.from === '捡' && gate.to === '卷' && gate.at === 3, JSON.stringify(gate))
+ok('听音闸门 · 差两个字 → 不认（那是另一次转写）', oneCharSwap('别再去捡技术了', '别再该卷技术了') === null)
+ok('听音闸门 · 字数不同 → 不认', oneCharSwap('别再去捡技术了', '别再卷技术') === null)
+ok('听音闸门 · 完全一致 → 不认（提案不成立）', oneCharSwap('别再去捡技术了', '别再去捡技术了') === null)
+
 const total = pass + fails.length
 if (fails.length) {
   console.log('FAIL · ' + fails.length + '/' + total + ' 条没过')
   for (const f of fails) console.log('  · ' + f)
   process.exitCode = 1
 } else {
-  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2 / 跨词 6 / 近音 5 / 整句 8 / 证据词条 2 / 拉丁 5 / 双模型 4' + (py ? ' / 拼音 4' : '') + '）')
+  console.log('PASS · ' + total + ' 条全过（术语表 5 / 低置信 1 / 校验器 9 / 数字 3 / 上限 1 / 主入口 6 / 句式 2 / 热词 2 / 跨词 6 / 近音 5 / 整句 8 / 证据词条 2 / 拉丁 5 / 双模型 4 / 听音闸门 4' + (py ? ' / 拼音 4 / 只差一个元音 7' : '') + '）')
 }

@@ -3,7 +3,7 @@
  * 这里验的是「模型说的话能不能被采信」，模型本身的质量靠真素材跑片看。
  */
 import { checkTitle, validateBatch, TITLE } from '../src/section-titles.mjs'
-import { groundIssues, verifyHomophones, judgeSemantic, confirmsReading, KINDS } from '../src/qa-semantic.mjs'
+import { groundIssues, verifyHomophones, judgeSemantic, confirmsReading, KINDS, SEMANTIC, semanticBudget } from '../src/qa-semantic.mjs'
 import { sectionsOf, applyTitles } from '../src/sections.mjs'
 import { mergeSections } from '../src/chapters.mjs'
 
@@ -114,6 +114,12 @@ ok(confirmsReading({ checkedCaps: 3, firstQuote: '观众三秒', lastQuote: '内
 ok(!confirmsReading({ checkedCaps: 2, firstQuote: '观众三秒', lastQuote: '内容红利' }, rc).ok, '读全：条数不对 → 不采信')
 ok(!confirmsReading({ checkedCaps: 3, lastQuote: '内容红利' }, rc).ok, '读全：没有首卡证据 → 不采信')
 ok(!confirmsReading({ checkedCaps: 3, firstQuote: '完全另一句', lastQuote: '内容红利' }, rc).ok, '读全：首卡开头对不上 → 不采信')
+
+// ── 7b. 语义审读的输出预算按卡数给（自测19：24 张卡 2600 token 又被截断，整层没查成）──
+ok(semanticBudget(Array.from({ length: 24 }, () => ({}))) >= 24 * 100, '语义预算：24 张卡时够写满 8 条问题')
+ok(semanticBudget([]) === SEMANTIC.maxTokens, '语义预算：没有卡时退回下限，不会给 0')
+ok(semanticBudget(Array.from({ length: 500 }, () => ({}))) === SEMANTIC.tokensCap, '语义预算：有上限，卡再多也不会把预算开到天边')
+ok(SEMANTIC.retryFactor > 1, '语义预算：截断后要能抬一档重试')
 
 // ── 8. 门槛常量不许被随手改小 ──
 ok(TITLE.minChars === 4 && TITLE.maxChars === 12 && TITLE.hardMax === 16, '门槛：标题长度常量在位')

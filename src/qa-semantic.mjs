@@ -19,7 +19,24 @@ const strip = s => String(s || '').replace(PUNCT, '')
 export const KINDS = { homophone: '同音错字', semantic: '语句不通', repeat: '重复句', offtopic: '跑题' }
 // 输出预算按 26 张卡实测调过：1400 会在 JSON 中间被截断（reading-unverified），
 // 截断的语义审读等于没查，只能判不通过。宁可多花几百 token，也别让它半句话收工。
-export const SEMANTIC = { maxIssues: 8, maxTokens: 2600, timeoutMs: 90000 }
+// 自测19 又撞了一次：24 张卡时 2600 还是不够，模型把 JSON 输出到 issues 数组中间就被截断，
+// extractJSON 只捞回一个数组 → 读全性验证判「没给 checkedCaps」→ 语义层整层没查成（QC 18/19）。
+// 现在按卡数给预算，并且解析失败时自动把预算抬高一档重试一次——截断的语义审读等于没查。
+export const SEMANTIC = {
+  maxIssues: 8,
+  maxTokens: 2600,      // 下限，兼容老口径
+  tokensPerCard: 120,   // 每张卡要给多少输出预算（一条问题带 quote/to/why 约 60–80 token）
+  tokensBase: 1200,
+  tokensCap: 6000,
+  retryFactor: 1.5,
+  timeoutMs: 90000,
+}
+
+/** 语义审读的输出预算：卡越多，问题列表越长，按卡数给。纯函数，可单测。 */
+export function semanticBudget(cards = []) {
+  const n = Array.isArray(cards) ? cards.length : 0
+  return Math.min(SEMANTIC.tokensCap, Math.max(SEMANTIC.maxTokens, SEMANTIC.tokensBase + n * SEMANTIC.tokensPerCard))
+}
 
 /**
  * 读全性验证：条数 + 首尾卡的开头都要对得上。纯函数，可单测。
@@ -299,10 +316,23 @@ export async function reviewText({ words = [], captions = null, sections = [], b
     '只输出 JSON：{"checkedCaps":<条数>,"firstQuote":"前4字","lastQuote":"前4字","verdict":"ok"|"issues","issues":[{"kind":"homophone","at":12.3,"quote":"原文片段","to":"正确写法","why":"一句话"}]}',
   ].join('\n')
 
-  const r = await chatJSON({ prompt, model, maxTokens: SEMANTIC.maxTokens, timeoutMs: SEMANTIC.timeoutMs, temperature: 0 })
+  // 输出被截断时 extractJSON 会捞回半截（最典型的是只捞回 issues 数组），
+  // 这种半成品不能当「读完了」也不能当「读全了」——抬一档预算重试一次，仍不行才如实报没查成。
+  const budget0 = semanticBudget(cards)
+  let r = await chatJSON({ prompt, model, maxTokens: budget0, timeoutMs: SEMANTIC.timeoutMs, temperature: 0 })
+  let budget = budget0
+  const salvaged = v => v === null || v === undefined || Array.isArray(v)
+  if (salvaged(r.ok ? r.value : null)) {
+    const budget1 = Math.min(SEMANTIC.tokensCap, Math.round(budget0 * SEMANTIC.retryFactor))
+    log('语义审读：这次输出被截断（预算 ' + budget0 + ' token），抬到 ' + budget1 + ' 重试一次')
+    const r2 = await chatJSON({ prompt, model, maxTokens: budget1, timeoutMs: SEMANTIC.timeoutMs, temperature: 0 })
+    budget = budget1
+    if (!salvaged(r2.ok ? r2.value : null)) r = r2
+    else if (!r.ok) r = r2
+  }
   if (!r.ok) {
     log('语义审读：模型没接上（' + r.skipped + '）')
-    return { ok: false, skipped: r.skipped, detail: r.detail || null, model: null }
+    return { ok: false, skipped: r.skipped, detail: r.detail || null, model: null, budget }
   }
 
   // 只认条数不够：模型不读也能数出条数。还要它逐字报第一张和最后一张卡的开头，
@@ -326,7 +356,7 @@ export async function reviewText({ words = [], captions = null, sections = [], b
     verdict: blocks.length ? 'issues' : 'ok',
     issues: verified,
     dropped,
-    model: r.model, ms: r.ms, tokens: r.tokens,
+    model: r.model, ms: r.ms, tokens: r.tokens, budget,
     stats: { reported: raw.length, grounded: kept.length, blocks: blocks.length, dropped: dropped.length },
   }
 }
