@@ -21,10 +21,13 @@ import { join } from 'node:path'
 export const CACHE_VERSION = 'p1'
 
 /** 输入指纹：同一个问题才可能命中；任何一个字段变了都是新问题。 */
-export function proposalKey({ prompt = '', system = '', messages = null, model = '', temperature = null, maxTokens = null, kind = 'json' } = {}) {
+export function proposalKey({ prompt = '', system = '', messages = null, model = '', temperature = null, maxTokens = null, kind = 'json', salt = '' } = {}) {
   const body = JSON.stringify({
     v: CACHE_VERSION,
     kind,
+    // salt 只进指纹、不进提问：同一个问题要独立采几次样（自一致性投票）时用它分开缓存，
+    // 模型看到的字一个都不差。不带 salt 的调用和以前完全同键。
+    salt: String(salt || ''),
     model: String(model || ''),
     temperature: temperature === null || temperature === undefined ? 'default' : temperature,
     maxTokens: maxTokens === null || maxTokens === undefined ? null : maxTokens,

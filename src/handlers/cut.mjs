@@ -220,6 +220,10 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     const applied = []   // 累积的整句删：第二轮只能往第一轮上加，不能把第一轮删过的句子又放回去
     const all = []
     let last = null
+    // 证据要留「真的删出了句子的那一轮」的模型信息：最后一轮常常是「再问一遍，模型说没什么可删了」，
+    // picks 是各轮累加的，如果 model 块取最后一轮，报告里就只剩 picked:0 / 票数空，
+    // 「哪几句在摇、几票对几票」这份证据当场丢掉（自测24 第一次重跑就是这样）。
+    let evidence = null
     for (let k = 0; k < rounds; k++) {
       if (fit(cur.outDuration)) {
         if (k === 0) log('选句删：成片 ' + cur.outDuration.toFixed(2) + 's 已经在目标 ' + targetSec + 's 以内，不删内容')
@@ -227,7 +231,14 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
       }
       if (k === 0) group.emit({ type: 'progress', bot: 'cutter', text: '剪辑在挑整句删：成片 ' + cur.outDuration.toFixed(1) + 's，目标 ' + targetSec + 's', transient: true })
       const pr = await planPrune({ segments, words, plan: cur, target: targetSec, terms, params: pruneParams, log })
-      if (pr) last = pr
+      if (pr) {
+        last = pr
+        // 优先留「真删出了句子」的那一轮；只有模型什么都没说时才退回「只提到被规则挡住的」那一轮。
+        if (pr.model) {
+          if (pr.model.picked > 0 || (pr.model.votes || []).length) evidence = pr
+          else if (!evidence) evidence = pr
+        }
+      }
       if (!pr || !pr.picks || !pr.picks.length) break
       const ranges = pr.picks.map(x => ({ i0: Number(x.i0), i1: Number(x.i1), reason: 'content', text: x.text }))
       const bad = ranges.find(r => !Number.isInteger(r.i0) || !Number.isInteger(r.i1))
@@ -239,7 +250,7 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
       if (fit(cur.outDuration)) break
     }
     prune = last
-      ? { ...last, before, after: Number(cur.outDuration.toFixed(2)), picks: all, rounds: applied.length ? (last.rounds || 1) : 0 }
+      ? { ...last, model: (evidence && evidence.model) || last.model, before, after: Number(cur.outDuration.toFixed(2)), picks: all, rounds: applied.length ? (last.rounds || 1) : 0 }
       : null
     if (prune) {
       prune.delta = Number((cur.outDuration - targetSec).toFixed(2))

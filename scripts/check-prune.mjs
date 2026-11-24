@@ -6,7 +6,8 @@
  * 到不了要说出「差几秒、为什么」，不许悄悄交一条 66.5 秒的片子还说达标。
  */
 import { buildPlan } from '../src/plan.mjs'
-import { planPrune, buildSentences, hardRefuse, chooseSubset, similarity, isDup, outroStart, reasonFits, fragmentFlags, DEFAULT_PRUNE } from '../src/prune.mjs'
+import { planPrune, buildSentences, hardRefuse, chooseSubset, similarity, isDup, outroStart, reasonFits, fragmentFlags, DEFAULT_PRUNE, verdictsOf } from '../src/prune.mjs'
+import { proposalKey } from '../src/proposal-cache.mjs'
 
 let pass = 0
 const fails = []
@@ -205,6 +206,101 @@ const pair2 = chooseSubset({ candidates: [s7[1], s7[2]], sentences: s7, current:
 ok('碎片和前半句一起删 → 允许', pair2 && pair2.picked.length === 2, JSON.stringify(pair2 && pair2.picked))
 const pair3 = chooseSubset({ candidates: [s7[1]], sentences: s7, current: 62, target: 60, fragments: frags, params: { maxChars: 0.6, maxSentences: 0.5 } })
 ok('只删前半句、把碎片吊在空中 → 不许', pair3 === null, JSON.stringify(pair3 && pair3.picked))
+
+// ── 自测24：逐句表态 + 多数票（判读本身在摇，一次判读不能当结论）──
+// 真跑实测：同一份输入、同一个模型、温度 0，自由挑句五次两两重合 0.69（最低 0.33）；
+// 逐句判读三次重合 0.85（最低 0.78）。所以默认问法改成逐句，并要求多数票才许删。
+const cV = corpus([
+  '今天说个事',
+  '我最近研究了一圈',
+  '真正的机会是在OPC',
+  '就是说用AI来做工具',
+  '大家用Claude写东西',
+  '我是杨团长',
+  '我们可以聊一聊',
+])
+const planV = buildPlan(cV.words, cV.duration, {})
+const sV0 = buildSentences({ segments: cV.segments, words: cV.words })
+const durOf = (txt) => sV0.find(s => s.bare.includes(txt)).dur
+// 目标设成「正好差这一句的时长」，否则删多了会被 chooseSubset 判成删过头（那是另一条规则）
+const voteP = async (batches, extra = {}) => planPrune({ segments: cV.segments, words: cV.words, plan: planV, target: planV.outDuration - durOf('研究'), params: { samples: 3, minVotes: 2 }, propose: async () => batches, ...extra })
+const verdict = (rows) => ({ ok: true, value: { 每句: rows }, model: 'fake', ms: 1, tokens: 1 })
+const sV = buildSentences({ segments: cV.segments, words: cV.words })
+const idxOf = (txt) => sV.find(s => s.bare.includes(txt)).idx
+
+// 三票里一票说可删 → 不够票，不许删
+const oneVote = await voteP([
+  verdict([{ index: idxOf('研究'), cut: true, why: '口头过渡' }, { index: idxOf('大家用Claude'), cut: false, why: '工具' }]),
+  verdict([{ index: idxOf('研究'), cut: false, why: '观点' }, { index: idxOf('大家用Claude'), cut: false, why: '工具' }]),
+  verdict([{ index: idxOf('研究'), cut: false, why: '观点' }, { index: idxOf('大家用Claude'), cut: false, why: '工具' }]),
+])
+ok('三票里只有一票说「能删」 → 这句不删（票数不够不是证据）', !oneVote.picks.some(p => p.idx === idxOf('研究')), JSON.stringify(oneVote.picks.map(p => [p.text, p.source])))
+ok('票数不够的句子记进报告（哪几句在摇，可查）', oneVote.model.unstable.some(u => u.idx === idxOf('研究') && u.yes === 1 && u.no === 2), JSON.stringify(oneVote.model.unstable))
+ok('三票都判「不能删」 → 一个都不删', oneVote.picks.length === 0, JSON.stringify(oneVote.picks.map(p => p.text)))
+ok('报告写清问法、采了几次、几票算数', oneVote.model.mode === 'score' && oneVote.model.samples === 3 && oneVote.model.minVotes === 2, JSON.stringify({ mode: oneVote.model.mode, samples: oneVote.model.samples, minVotes: oneVote.model.minVotes }))
+
+const twoVote = await voteP([
+  verdict([{ index: idxOf('研究'), cut: true, why: '口头过渡' }]),
+  verdict([{ index: idxOf('研究'), cut: true, why: '口头过渡' }]),
+  verdict([{ index: idxOf('研究'), cut: false, why: '观点' }]),
+])
+ok('三票里两票说「能删」 → 删（多数票，不是全票）', twoVote.picks.some(p => p.idx === idxOf('研究') && p.source === 'model'), JSON.stringify(twoVote.picks.map(p => [p.text, p.source])))
+ok('采纳的也带理由和票数（报告里对得上）', twoVote.model.votes.some(v => v.idx === idxOf('研究') && v.yes === 2 && v.no === 1), JSON.stringify(twoVote.model.votes))
+
+// 「每句」和老的 cut 两种形状都解析；坏形状当没答，不猜
+const vOf = verdictsOf
+ok('逐句表态的形状能解析', vOf({ 每句: [{ index: 2, cut: true, why: '铺垫' }] }).length === 1 && vOf({ 每句: [{ index: 2, cut: true }] })[0].cut === true)
+ok('老的 cut 形状仍能解析（对照用）', vOf({ cut: [{ index: 3, why: '过渡' }] })[0].index === 3)
+ok('两种都不是 → 空，不猜', vOf({ 每句: 'x', cut: null }).length === 0 && vOf(null).length === 0)
+
+// 缓存指纹：salt 只进指纹，不进提问
+const keyA = proposalKey({ prompt: 'p', salt: '' })
+const keyB = proposalKey({ prompt: 'p', salt: 'sample:1' })
+ok('salt 让同一份提问各自缓存（多票各自命中，重跑不变）', keyA !== keyB && proposalKey({ prompt: 'p' }) === keyA)
+
+// ── 自测24 抓到的真漏洞：话没说完的句子不许删 ──
+const cD = corpus([
+  '今天大家都在卷AI技术',
+  '但是我今天就要给大家',
+  '泼一瓶冷水',
+  '真正的机会是在内容',
+  '我们可以聊一聊',
+])
+const sD = buildSentences({ segments: cD.segments, words: cD.words })
+const whyD = hardRefuse(sD[1], sD, { params: DEFAULT_PRUNE })
+ok('开头的「转折 + 承诺」句是钩子 → 不许删（只护第一句不够）', /钩子/.test(whyD || ''), String(whyD))
+// 同一种「话没说完」的形态放到片子中段（不受钩子规则保护），由悬空规则拦住
+const cO = corpus([
+  '今天大家都在卷AI技术',
+  '真正的机会是在内容',
+  '这个月的量涨了三倍',
+  '然后我今天就要给大家',
+  '泼一瓶冷水',
+  '我们可以聊一聊',
+])
+const sO = buildSentences({ segments: cO.segments, words: cO.words })
+const whyO = hardRefuse(sO[3], sO, { params: DEFAULT_PRUNE })
+ok('以「给大家」收尾、后半句在下一句 → 不许删（话没说完）', /话没说完/.test(whyO || ''), String(whyO))
+const cD2 = corpus(['今天说个事', '我最近研究了一圈', '真正的机会是在内容', '我们可以聊一聊'])
+const sD2 = buildSentences({ segments: cD2.segments, words: cD2.words })
+ok('普通口语句子（不以要宾语的词收尾）→ 不误拦', !/话没说完/.test(hardRefuse(sD2[1], sD2, { params: DEFAULT_PRUNE }) || ''), String(hardRefuse(sD2[1], sD2, { params: DEFAULT_PRUNE })))
+
+// 降档通道不许动主张句：模型给的理由对不上（说主张句是「铺垫」），按老逻辑会降一档删掉
+const cC = corpus(['今天说个事', '我最近研究了一圈', '内容生产力才是王道', '这个窗口还在', '我们可以聊一聊'])
+const planC = buildPlan(cC.words, cC.duration, {})
+const sC = buildSentences({ segments: cC.segments, words: cC.words })
+const iClaim = sC.find(s => s.bare.includes('才是王道')).idx
+const claimRun = await planPrune({
+  segments: cC.segments, words: cC.words, plan: planC, target: planC.outDuration - sC[iClaim].dur,
+  params: { samples: 3, minVotes: 2 },
+  propose: async () => [
+    { ok: true, value: { 每句: [{ index: iClaim, cut: true, why: '铺垫' }] }, model: 'fake', ms: 1 },
+    { ok: true, value: { 每句: [{ index: iClaim, cut: true, why: '铺垫' }] }, model: 'fake', ms: 1 },
+    { ok: true, value: { 每句: [{ index: iClaim, cut: true, why: '铺垫' }] }, model: 'fake', ms: 1 },
+  ],
+})
+ok('主张句 + 理由对不上 → 连降档都不给（删掉的常是论点）', claimRun.picks.length === 0, JSON.stringify(claimRun.picks.map(p => [p.text, p.source])))
+ok('被挡的那条留在 rejectedByReason 里，理由可查', claimRun.rejectedByReason.some(r => r.idx === iClaim && /主张句/.test(r.why)), JSON.stringify(claimRun.rejectedByReason))
 
 const total = pass + fails.length
 console.log(fails.length ? 'FAIL ' + fails.length + '/' + total : 'PASS ' + total + ' 条')

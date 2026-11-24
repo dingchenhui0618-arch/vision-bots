@@ -239,7 +239,7 @@ export function proposalCacheDir() {
 const cacheKeyFor = (opts, kind) => proposalKey({
   prompt: opts.prompt || '', system: opts.system || '', messages: opts.messages || null,
   model: opts.model || LLM.model, temperature: opts.temperature === undefined ? null : opts.temperature,
-  maxTokens: opts.maxTokens === undefined ? null : opts.maxTokens, kind,
+  maxTokens: opts.maxTokens === undefined ? null : opts.maxTokens, kind, salt: opts.salt || '',
 })
 
 /**

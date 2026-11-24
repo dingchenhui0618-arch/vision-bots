@@ -31,6 +31,9 @@ export const DEFAULT_PRUNE = {
   minSentenceSec: 0.7, // 太短的句子删了只是零头，还会把刀口切碎
   protectTail: 2,      // 最后两句是落点（自我介绍 / 收尾 CTA），不动
   maxCandidates: 12,
+  mode: 'score',      // score = 逐句表态（默认）；pick = 自由挑几句（保留做对照）
+  samples: 3,         // 同一个问题独立判读几次，取多数票：温度钉 0 在这个网关上也不保证一致
+  minVotes: null,     // 默认 samples 的过半票
 }
 
 /** 主张句：这一句是论点不是铺垫，删了观点就没了。 */
@@ -68,6 +71,8 @@ export function outroStart(sentences) {
 }
 /** 连接词起头：后一句以它开头，说明它接的是前一句。 */
 const CONNECTIVE = /^(但是|可是|不过|所以|因此|于是|然后|而且|因为|结果|另外|还有)/
+/** 承诺句：开口就答应观众「要给你点什么」——这种句子是钩子的落点，删了前 5 秒就没有抓手。 */
+const HOOK_PROMISE = /(我今天|今天我就|我要|想跟|跟你说|给你|给大家|告诉你|说个事|说白了|泼一瓶|泼盆)/
 /** 两句都用同一个连接词开头，中间那份被删了就会连着说两个「但是」。 */
 const CLAUSE_START = /^(但是|可是|不过|所以|因此|于是|而且|因为)/
 
@@ -155,6 +160,10 @@ const digitsIn = s => String(s || '').match(/\d+/g) || []
 export function hardRefuse(s, sentences, ctx = {}) {
   const p = ctx.params || DEFAULT_PRUNE
   if (s.idx === 0) return '第一句是钩子'
+  // 钩子常常是两句：第一句铺垫（「AI时代最赚钱的不是技术」），第二句转折加承诺
+  // （「但是我今天就要给大家泼一瓶冷水」）。只护第一句的话，被删的正好是钩子的落点——
+  // 自测24 真素材实测：三次重剪里有一次就把这句删了，开头变成「今天大家都在卷AI技术…大家在看这些…」。
+  if (s.start < 12 && CLAUSE_START.test(s.bare) && HOOK_PROMISE.test(s.bare)) return '这是开头的钩子（转折 + 承诺），删了前 5 秒就没抓手'
   if (Number.isInteger(ctx.outroFrom) && s.idx >= ctx.outroFrom) return '自我介绍之后都是落点（品牌 / CTA）'
   if (s.idx >= sentences.length - (p.protectTail ?? 2)) return '最后两句是落点（自我介绍 / 收尾）'
   if (s.dur < (p.minSentenceSec ?? 0.7)) return '只有 ' + s.dur.toFixed(1) + 's，删了也是零头'
@@ -165,6 +174,13 @@ export function hardRefuse(s, sentences, ctx = {}) {
   if (ctx.deletedRepeat && ctx.deletedRepeat.has(s.bare)) return '这句的重复副本已经删过了，再删整句就没了'
   const sub = s.bare.match(SUBORDINATE)
   if (sub) return '这句以「' + sub[1] + '」起头，删了后半句挂空'
+  // 话没说完就收尾：这句以「给/把/让/对…」这种要宾语的词结尾，动词和宾语都在下一句里。
+  // 自测24 抓到的真实漏洞：「但是我今天就要给大家」被放行删掉，成片剩下「泼一瓶冷水」——
+  // 钩子的意思全没了。碎片规则（≤7 字 + 特定动词起头）拦不住它，因为它有 9 个字、以「但是」起头。
+  const nx = sentences[s.idx + 1]
+  // 形态是「动词 + 对象」就收尾（「给大家」「给你」「告诉他们」）：对象在，动作在下一句。
+  const openTail = s.bare.match(/(给|让|请|叫|告诉|跟|对|向)(你|我|他|她|它|您|你们|我们|他们|大家|各位|自己)$/)
+  if (openTail && nx && bare(nx.text).length <= 8) return '这句以「' + openTail[0] + '」收尾，话没说完，后半句在下一句'
   const cons = s.bare.match(CONSEQUENCE)
   if (cons) return '这句以「' + cons[0] + '」接上句，删了上句挂空'
   // 碎片句不承担逻辑连接，跳过「下一句以连接词开头」这条（否则碎片的前半句会被连坐）
@@ -296,7 +312,7 @@ export function reasonFits(s, why, sentences, dups = []) {
   return { ok: true, unverified: true }
 }
 
-const PROMPT = ({ target, current, need, list, note = '' }) => [
+export const PROMPT = ({ target, current, need, list, note = '' }) => [
   '你在做一条竖屏口播视频的剪辑。旁白已经录完，现在的成片是 ' + current.toFixed(1) + ' 秒，',
   '客户要 ' + target + ' 秒左右，还要再删掉 ' + need.toFixed(1) + ' 秒左右才行。',
   '',
@@ -315,6 +331,57 @@ const PROMPT = ({ target, current, need, list, note = '' }) => [
   '',
   '只输出 JSON：{"cut":[{"index":3,"why":"过渡句"}],"keep":"删完之后这条片子还剩下什么"}',
 ].join('\n')
+
+/**
+ * 逐句表态的问法（默认）：不问「挑哪几句」，问「这十句各自能不能删」。
+ *
+ * 为什么换（自测24 实测，同一个模型、同一份输入、温度 0）：
+ *   · 自由挑几句连问五次，五次之间两两重合平均 0.69，最低 0.33——同一份材料能挑出四种删法；
+ *   · 逐句判读连问三次，两两重合 0.85，最低 0.78，而且每次都把每一句判到。
+ * 自由挑是个全局选择，模型每次落在不同的局部最优；逐句表态是十个小判断，抖动能互相抵消。
+ * 上下文照样给全片（它得知道这句在整条片子里的位置），只让它对**规则允许删的那几句**表态。
+ */
+export const SCORE_PROMPT = ({ target, current, need, list, allow, note = '' }) => {
+  const sameSet = Array.isArray(allow) && allow.length === list.length
+  return [
+  '你在做一条竖屏口播视频的剪辑。旁白已经录完，现在的成片是 ' + current.toFixed(1) + ' 秒，',
+  '客户要 ' + target + ' 秒左右，还要再删掉 ' + need.toFixed(1) + ' 秒左右才行。',
+  '',
+  (sameSet
+    ? '下面按顺序是成片里还留着的每一句。请**逐句**给结论，一句都不要漏：'
+    : '先看全片（只作上下文，不要对这里的每一句表态）：'),
+  ...(sameSet ? [] : [JSON.stringify(list, null, 1), '']),
+  ...(sameSet ? [] : ['要你判的是下面这几句（规则已经筛过，剩下的都允许删）。请**逐句**给结论，一句都不要漏：']),
+  JSON.stringify(allow, null, 1),
+  '',
+  '判断标准：删掉之后意思不丢、上下文接得上、观众不会听不懂。',
+  'cut=true 的典型：铺垫、口头过渡（「我最近研究了一圈」「就是说」）、重复了别处已经说过的意思、离题的补充。',
+  'cut=false 的典型：抛出观点的（「才是王道」）、给出数字的、点出工具的、收尾和自我介绍、话没说完的半句。',
+  '不要为了凑时长硬删——删得不够我会自己再想办法，删错了观众听得出来。',
+  'why 八个字以内，只能写：铺垫、口头过渡、重复、离题、观点、数字、工具、落点、话没说完。',
+  '',
+  (note ? [note, ''] .join('\n') : ''),
+  '只输出 JSON：{"每句":[{"index":2,"cut":false,"why":"观点"},{"index":5,"cut":true,"why":"口头过渡"}]}',
+  ].join('\n')
+}
+
+/** 两种问法都解析成同一种行：{index, cut, why}。坏输出当没答，不猜。 */
+export function verdictsOf(value, mode = 'score') {
+  if (!value || typeof value !== 'object') return []
+  if (Array.isArray(value['每句'])) {
+    return value['每句'].filter(x => x && typeof x === 'object')
+      .map(x => ({ index: Number(x.index), cut: x.cut === true, why: String(x.why || '').slice(0, 20) }))
+      .filter(x => Number.isInteger(x.index))
+  }
+  if (Array.isArray(value.cut)) {
+    const rows = value.cut.filter(x => x && typeof x === 'object')
+      .map(x => ({ index: Number(x.index), cut: true, why: String(x.why || '').slice(0, 20) }))
+      .filter(x => Number.isInteger(x.index))
+    return rows
+  }
+  return []
+}
+
 
 /**
  * 主入口。plan 是已经算好的第一版剪辑（删完气口/口头语/口吃）。
@@ -364,67 +431,126 @@ export async function planPrune({ segments = [], words = [], plan, target, terms
   const need = current - target
   const listOf = list => list.map(s => ({ index: s.idx, 起始: round2(s.start), 时长: round2(s.dur), 原话: s.bare }))
   const rank = list => list.slice().sort((a, b) => (valueOf(a) / Math.max(0.4, a.dur)) - (valueOf(b) / Math.max(0.4, b.dur)))
-  // propose 是自检用的注入口：离线断言不许联网，也不该为了测个选择器去调模型
-  const ask = (note, list) => (typeof propose === 'function'
+  // 模型怎么问、问几遍、几票才算数——全部来自剪辑自己的配置（config/bots/cutter.json 的 prune 段）。
+  // 温度钉 0 只保证「同样的请求发出去」，不保证「拿回来的答案一样」：自测24 实测同一个网关上
+  // 同一份输入连问五次，五次之间两两重合 0.69、最低 0.33。所以这里不再依赖「一次判读就是答案」，
+  // 改成逐句表态 + 多次判读取多数票（票数不够的句子记进报告，不删）。
+  const mode = p.mode === 'pick' ? 'pick' : 'score'
+  const wantSamples = Math.max(1, Math.min(5, Number(p.samples) || 1))
+  // propose 是自检用的注入口：离线断言不许联网，也不该为了测个选择器去调模型（只给一次答案）
+  const perRound = typeof propose === 'function' ? 1 : wantSamples
+  // 离线注入口一次给一份答案时按 1 票算（老断言不受影响）；要测投票就显式给 samples / minVotes，
+  // 并让 propose 一次返回一组答案（数组＝几次判读），这样离线也能复现「同一输入三次判得不一样」。
+  const minVotes = Math.max(1, Math.min(wantSamples, Number(p.minVotes) || (typeof propose === 'function' ? 1 : Math.ceil(wantSamples / 2))))
+  const askOnce = (note, list, allow, k) => (typeof propose === 'function'
     ? propose(list, note)
-    // 走剪辑 bot 的配置（模型、温度），不再硬写 fast / 不传温度：同一素材两次跑必须挑出同一批句子
-    : chatJSONCached({ prompt: PROMPT({ target, current, need, list, note }), ...taskCall('cutter', { maxTokens: 760 }) }))
+    // 走剪辑 bot 的配置（模型、温度）。salt 只进缓存指纹、不进提问：同一份问题采几次样，
+    // 每次各存一份缓存，所以同一个群重跑时这几票全是原样命中，结果不会自己变。
+    : (mode === 'pick'
+      ? chatJSONCached({ prompt: PROMPT({ target, current, need, list, note }), ...taskCall('cutter', { maxTokens: 760 }), salt: k ? 'sample:' + k : '' })
+      : chatJSONCached({ prompt: SCORE_PROMPT({ target, current, need, list, allow, note }), ...taskCall('cutter', { maxTokens: 1200 }), salt: k ? 'sample:' + k : '' })))
 
   const modelYes = new Map()   // 模型点名可以删的句子（多轮累加）
   const modelWeak = new Map()  // 模型提了、但理由对不上句子的（降一档用）
   const modelBad = []          // 上面那些，带理由留在报告里
   const blocked = []           // 模型想删、被规则挡住的（原话片段）
-  const modelInfo = { rounds: 0, picked: 0, blocked, skipped: null }
+  const modelInfo = { rounds: 0, mode, samples: wantSamples, asks: 0, minVotes, picked: 0, votes: [], unstable: [], blocked, skipped: null }
   let widened = false
   let best = null
 
-  // 最多问两轮：第一轮全片挑；挑不够就告诉它「上一轮这些被规则挡住了」，只在规则允许的句子里再挑一次。
+  // 最多问两轮：第一轮问「规则允许的每一句能不能删」；不够就告诉它「上一轮被规则挡住了哪几句」再问一次。
   // 「删哪句读得通」是判断力问题，交给模型；「哪些句不许删」是规则问题，留在规则里。
   const rounds = Math.max(1, Math.min(2, Number(p.modelRounds) || 2))
   for (let round = 0; round < rounds; round++) {
     const allowedNow = cands.filter(s => !modelYes.has(s.idx))
     if (round > 0 && !allowedNow.length) break
-    const list = round === 0 ? listOf(sentences) : listOf(allowedNow)
+    const list = listOf(sentences)
+    // 第一轮问全片：模型想删但被规则挡住的也要留成证据（「提了什么、哪条规则打回」）；
+    // 计票只在规则允许的那几句里算，第二轮就只问剩下的允许句。
+    const allow = round === 0 ? sentences : allowedNow
     const left = need - (best ? best.drop : 0)
     const note = round === 0 ? '' : (
-      '上一轮你挑的 ' + modelYes.size + ' 句里有 ' + blocked.length + ' 句被规则挡住了：' + blocked.slice(0, 6).join('；') + '。' +
+      '上一轮你判为可删的 ' + modelYes.size + ' 句里有 ' + blocked.length + ' 句被规则挡住了：' + blocked.slice(0, 6).join('；') + '。' +
       '下面只列规则允许删的句子，还要再删 ' + Math.max(0.1, left).toFixed(1) + ' 秒。')
-    const r = await ask(note, list)
-    modelInfo.rounds = round + 1
-    if (!r || !r.ok) {
-      modelInfo.skipped = (r && r.skipped) || 'unknown'
+    const votes = new Map()   // idx -> { yes, no, whys: [] }
+    let okSamples = 0
+    let rawCount = 0
+    for (let k = 0; k < perRound; k++) {
+      const got = await askOnce(note, list, listOf(allow), k)
+      // 一次判读 = 一份答案；注入口也允许一次给一组（数组），离线就能复现多票
+      const batch = Array.isArray(got) ? got : [got]
+      for (const r of batch) {
+        modelInfo.rounds = round + 1
+        if (!r || !r.ok) {
+          modelInfo.skipped = (r && r.skipped) || 'unknown'
+          continue
+        }
+        okSamples++
+        modelInfo.asks = (modelInfo.asks || 0) + 1
+        if (!modelInfo.model) { modelInfo.model = r.model; modelInfo.tokens = r.tokens }
+        modelInfo.ms = (modelInfo.ms || 0) + (r.ms || 0)
+        const rows = verdictsOf(r.value, mode)
+        rawCount += rows.length
+        for (const row of rows) {
+          const i = row.index
+          if (i < 0 || i >= sentences.length) continue
+          if (!allow.some(s => s.idx === i)) continue   // 只认被问到的那几句，别把上下文当成表态
+          const v = votes.get(i) || { yes: 0, no: 0, whys: [] }
+          if (row.cut) { v.yes++; if (row.why) v.whys.push(row.why) } else v.no++
+          votes.set(i, v)
+        }
+      }
+    }
+    if (!okSamples) {
       if (round === 0) log('选句：模型没接上（' + modelInfo.skipped + '），按确定性价值排序删')
       break
     }
-    modelInfo.model = r.model
-    modelInfo.ms = r.ms
-    modelInfo.tokens = r.tokens
-    const raw = Array.isArray(r.value && r.value.cut) ? r.value.cut : []
     let added = 0
-    for (const x of raw) {
-      const i = Number(x && x.index)
-      if (!Number.isInteger(i) || i < 0 || i >= sentences.length) continue
-      const why = String((x && x.why) || '').slice(0, 20)
-      const fit = reasonFits(sentences[i], why, sentences, dups)
-      if (!fit.ok) {
-        // 理由对不上不等于这句不能删：把它降一档（只在「对得上的那几句不够」时才用），照实记下来
-        modelBad.push({ idx: i, text: sentences[i].bare.slice(0, 18), why: fit.why, said: why })
-        if (!modelWeak.has(i)) added++
-        modelWeak.set(i, why)
+    for (const [i, v] of votes) {
+      if (modelYes.has(i) || modelWeak.has(i)) continue
+      const why = v.whys[0] || ''
+      const row = { idx: i, text: sentences[i].bare.slice(0, 14), yes: v.yes, no: v.no }
+      const ref = refused.find(x => x.idx === i)
+      if (ref) {
+        // 模型想删、规则不许：这是「模型提了什么、哪条规则打回」的证据，同时驱动第二轮
+        if (v.yes >= minVotes) {
+          ref.byModel = ref.byModel || why
+          if (!blocked.includes(ref.text)) blocked.push(ref.text)
+        }
         continue
       }
-      if (!modelYes.has(i)) added++
-      modelYes.set(i, why)
-    }
-    // 模型想删但被规则挡住的：照实记下来（这是「模型提了什么、哪条规则打回」的证据）
-    for (const [i, why] of modelYes) {
-      const bad = refused.find(y => y.idx === i)
-      if (bad) { bad.byModel = bad.byModel || why; if (!blocked.includes(bad.text)) blocked.push(bad.text) }
+      if (v.yes >= minVotes) {
+        const fit = reasonFits(sentences[i], why, sentences, dups)
+        if (!fit.ok) {
+          // 主张句（「才是」「真正的」「不是」…）连降档都不给：模型给的理由对不上，
+          // 说明它没读懂这句在片子里的位置，这时候按「降一档也能删」处理，删掉的常是论点。
+          const claim = CLAIM.find(c => sentences[i].bare.includes(c))
+          if (claim) {
+            modelBad.push({ idx: i, text: sentences[i].bare.slice(0, 18), why: '主张句（含「' + claim + '」）不走降档，理由又对不上', said: why })
+            continue
+          }
+          // 理由对不上不等于这句不能删：把它降一档（只在「对得上的那几句不够」时才用），照实记下来
+          modelBad.push({ idx: i, text: sentences[i].bare.slice(0, 18), why: fit.why, said: why })
+          modelWeak.set(i, why)
+          continue
+        }
+        modelYes.set(i, why || '模型判为可删')
+        added++
+        modelInfo.votes.push({ ...row, why })
+      } else if (v.yes > 0) {
+        // 有票但不够票：这就是「同一输入两次判得不一样」落在哪几句上的直接证据
+        modelInfo.unstable.push({ ...row, why })
+      }
     }
     modelInfo.picked = modelYes.size
-    if (round === 0 && !modelYes.size) {
-      log('选句：模型没给出能用的句号（' + raw.length + ' 条提案里 0 条可用），按确定性价值排序再评一遍')
+    if (round === 0 && !modelYes.size && !blocked.length) {
+      log('选句：模型没给出能用的句号（' + rawCount + ' 条表态里 0 条够票），按确定性价值排序再评一遍')
       break
+    }
+    if (round === 0 && !modelYes.size) {
+      // 想删的都被规则挡住了：带着驳回理由再问一轮，只问剩下的允许句
+      log('选句：模型想删的 ' + blocked.length + ' 句被规则挡住了，带着理由再问一轮')
+      continue
     }
     if (round > 0 && !added) break
     const strong = cands.filter(s => modelYes.has(s.idx) || dups.includes(s.idx))

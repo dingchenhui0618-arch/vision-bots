@@ -24,7 +24,10 @@
       "minSentenceSec": 0.7,
       "protectTail": 2,
       "maxCandidates": 12,
-      "maxRounds": 2
+      "maxRounds": 2,
+      "mode": "score",
+      "samples": 3,
+      "minVotes": 2
     },
     "gap": {
       "period": 0.3,
