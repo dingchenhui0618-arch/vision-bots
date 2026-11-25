@@ -9,10 +9,10 @@
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { buildScene } from '../templates/zheguang/scene.mjs'
+import { buildScene, chapterHoldUntil } from '../templates/zheguang/scene.mjs'
 import { segment } from '../src/segment.mjs'
 import { qaBoxes } from '../templates/zheguang/render.mjs'
-import { layoutBoxes } from '../src/layout-boxes.mjs'
+import { layoutBoxes, pageAtFor } from '../src/layout-boxes.mjs'
 
 const ROOT = process.cwd()
 const argv = process.argv.slice(2)
@@ -250,14 +250,14 @@ ok('时间线统计齐', scene.stats && scene.stats.out > 0 && scene.frames > 0)
   ok('贴墨迹顶的卡会被判成压字（尺子有分辨力）', badHit === true)
 }
 
-// 8) 刻度卡与大字：谁也别压谁；章节卡占场那 1.5 秒，大字不进盒子
+// 8) 刻度卡与大字：谁也别压谁；给章节卡让位的大字，盒子从让位结束起算
 //
 // 自测22 质检报「10 帧 big × block:gauge，第 492 帧」，量下去一半真一半假：
 //   · 真的：第 545 帧「越来越低 ↓」被大字板沿切掉——短句子按内容顶到 168px，板顶升到 1286px，
 //     正好插进刻度卡底部 1314px；
 //   · 假的：492–519 帧大字被章节卡压着根本没画，盒子却照样算它，还报了重叠。
 // 两条口径，渲染器和盒子都认：① 有刻度卡在场就把字号缩到板顶落在卡底 22px 以下；
-// ② 大字的可见起点 = max(f0, 页首 + 1.5s)。
+// ② 大字的可见起点 = 数据里的 holdUntil（自测29 起不再按「页首 + 1.5s」重算）。
 {
   const H8 = 1920
   const base8 = {
@@ -272,8 +272,48 @@ ok('时间线统计齐', scene.stats && scene.stats.out > 0 && scene.frames > 0)
   ok('刻度卡在场时，大字的板顶落在卡底 22px 以下', Boolean(bigW) && bigW.y >= gaugeBottom + 22, bigW ? '板顶 ' + bigW.y + '，卡底 ' + gaugeBottom : '没有大字')
   ok('没有刻度卡时字号回到内容上限（不被白缩一档）', Boolean(bigN) && Boolean(bigW) && bigN.y < bigW.y, bigN && bigW ? bigN.y + ' vs ' + bigW.y : '-')
   ok('缩的是字号，不是把板切一刀', Boolean(bigW) && Boolean(bigN) && bigW.h < bigN.h, bigW && bigN ? bigW.h + ' vs ' + bigN.h : '-')
-  const bigE = bigOf({ ...base8, bigs: [{ f0: 0.2, f1: 4, lines: ['最赚钱的不是技术'], text: '最赚钱的不是技术', hot: '' }], blocks: [] })
-  ok('章节卡占场那 1.5 秒，大字不进盒子', Boolean(bigE) && bigE.t0 >= 1.5 - 1e-6, bigE ? String(bigE.t0) : '-')
+  // 让位规则落在数据里（b.holdUntil）：页首 1.5 秒内、且和章节名说的是同一句 → 让位。
+  const bigHold = bigOf({ ...base8, bigs: [{ f0: 0.2, f1: 4, lines: ['技术门槛'], text: '技术门槛', hot: '', holdUntil: 1.5 }], blocks: [] })
+  ok('让位的大字，盒子从让位结束起算', Boolean(bigHold) && bigHold.t0 >= 1.5 - 1e-6, bigHold ? String(bigHold.t0) : '-')
+  // 反向验证：页首 1.5 秒内**不和章节名重复**的大字必须从 f0 就进盒子。
+  // 老实现（页首 + 1.5 一刀切）在这里会给出 1.5，正是自测28 白丢的那 1.5 秒。
+  const bigNoHold = bigOf({ ...base8, bigs: [{ f0: 0.2, f1: 4, lines: ['泼一瓶冷水'], text: '泼一瓶冷水', hot: '' }], blocks: [] })
+  ok('不和章节名重复的页首大字从 f0 就出场（不再按时间一刀切）', Boolean(bigNoHold) && Math.abs(bigNoHold.t0 - 0.2) < 0.02, bigNoHold ? String(bigNoHold.t0) : '-')
+}
+
+// 8b) 章节卡与大字：按内容判，不按时间切（自测29）
+//
+// 自测28 的成片里这条规矩闯了两类祸：页首新出的大字白丢 1.5 秒（5.54 / 17.93 / 34.98
+// / 50.65 四处，画面上只剩一行小字幕），跨页的大字中途消失 1.5 秒再闪回来（28.59s /
+// 41.41s 那两条）。所以规则从「时间」改成「内容」：只有说的是同一句才让位。
+{
+  const pg = { index: 2, start: 5.54, end: 17.63, title: '真正的机会是在OPC' }
+  const pg7 = { index: 7, start: 50.65, end: 59.93, title: '卷内容生产力才是王道' }
+  ok('页首、和章节名同一句：让位到 1.5 秒', chapterHoldUntil('机会是在OPC', 5.6, pg) === 7.04, String(chapterHoldUntil('机会是在OPC', 5.6, pg)))
+  ok('页首、被章节名包含：也算同一句', chapterHoldUntil('卷内容生产力', 50.65, pg7) === 52.15, String(chapterHoldUntil('卷内容生产力', 50.65, pg7)))
+  ok('页首、和章节名不搭：不让位（老实现会白丢 1.5 秒）', chapterHoldUntil('今天大家都在卷', 5.54, pg) === 0, String(chapterHoldUntil('今天大家都在卷', 5.54, pg)))
+  ok('跨页的大字不让位（不让它在中途消失再闪回来）', chapterHoldUntil('AI来去做内容', 28.59, { index: 4, start: 29.41, end: 34.98, title: '知道的人会做的人太少' }) === 0)
+  ok('页首 1.5 秒之外的大字不按这条判', chapterHoldUntil('机会是在OPC', 8.0, pg) === 0, String(chapterHoldUntil('机会是在OPC', 8.0, pg)))
+  ok('没有页名就不让位（不许凭空白压 1.5 秒）', chapterHoldUntil('机会是在OPC', 5.6, { start: 5.54, end: 17.63, title: '' }) === 0)
+  // 真 scene 上再验一遍：跨页的大字一条都不许带 holdUntil；带了的必须落在本页头 1.5 秒内
+  const straddle = scene.bigs.filter(b => {
+    const pg2 = scene.pages.find(p2 => p2.start > b.f0 + 0.05 && p2.start < b.f1)
+    return pg2 && b.holdUntil
+  })
+  ok('真 scene：跨页的大字一条都不带让位', straddle.length === 0, straddle.map(b => b.text).join('、'))
+  const badHold = scene.bigs.filter(b => b.holdUntil && (b.holdUntil < b.f0 || b.holdUntil > b.f0 + 1.5 + 0.02))
+  ok('真 scene：让位只会落在开头 1.5 秒内（不会把整条大字吃掉）', badHold.length === 0, badHold.map(b => b.text + '@' + b.holdUntil).join('、'))
+  const held = scene.bigs.filter(b => b.holdUntil).length
+  ok('真 scene：确实有被让位的大字（这条规矩没被绕过）', held >= 1, held + ' 条 / ' + scene.bigs.length + ' 条')
+  // 页间空档不许把页码打回第一页。自测28 的 17.63–17.93s 那 0.3 秒里 HUD 跳回了「P. 01 / 07」。
+  const synthPages = [{ index: 1, start: 0, end: 5 }, { index: 2, start: 5.3, end: 10 }, { index: 3, start: 10.4, end: 15 }]
+  const gapAt = t => (pageAtFor(synthPages, t) || {}).index
+  ok('页间空档取最近的前一页（页码不倒回 P. 01）', gapAt(5.1) === 1 && gapAt(10.2) === 2, gapAt(5.1) + ',' + gapAt(10.2))
+  ok('页内仍取当前页', gapAt(5.35) === 2, String(gapAt(5.35)))
+  ok('空档在片头之前也只取第一页', gapAt(-1) === 1, String(gapAt(-1)))
+  // 真 scene 里如果正好有空档，也得落在前一页上
+  const realGap = (() => { for (let i = 1; i < scene.pages.length; i++) { const a = scene.pages[i - 1].end, b = scene.pages[i].start; if (b - a > 0.05) return { t: (a + b) / 2, expect: scene.pages[i - 1].index } } return null })()
+  ok('真 scene：页间空档也落在前一页', !realGap || (pageAtFor(scene.pages, realGap.t) || {}).index === realGap.expect, realGap ? '空档 ' + realGap.t.toFixed(2) + 's' : '本片页是连着的')
 }
 
 // 9) 字卡页的大字：居中排版，盒子必须跟着居中（自测28）

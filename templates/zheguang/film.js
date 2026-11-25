@@ -40,7 +40,16 @@ export async function createFilm({ media }) {
   media.register('person', { url: '/media/frames/person', count: S.person.count })
 
   const shotAt = (t) => (S.shots || []).find(s => t >= s.f0 && t < s.f1) || (S.shots || [])[0] || { kind: 'full' }
-  const pageAt = (t) => (S.pages || []).find(p => t >= p.start && t < p.end) || (S.pages || [])[0] || null
+  // 页与页之间有空档（删掉静音之后，两段之间那 0.3 秒不属于任何一页）。原来兜底到 pages[0]，
+  // 于是 17.63–17.93s 那 0.3 秒里 HUD 会跳回「P. 01 / 07」——页码倒退。取「最近的前一页」：
+  // 这一刻画面还在上一页的语境里。
+  const pageAt = (t) => {
+    const ps = S.pages || []
+    const hit = ps.find(p => t >= p.start && t < p.end)
+    if (hit) return hit
+    for (let i = ps.length - 1; i >= 0; i--) if (ps[i].start <= t) return ps[i]
+    return ps[0] || null
+  }
   const blockAt = (t) => (S.blocks || []).filter(b => t >= b.f0 && t < b.f1)
 
   function srcIdx(f) {
@@ -331,8 +340,12 @@ export async function createFilm({ media }) {
     // 和大字「赚钱不是技术」上下叠着，说的是同一句话）。但压 2 秒压过头了——章节卡自己
     // 只活 1.7 秒，剩下那半秒小窗页的下半屏是全黑的（自测11 抽帧 7.0s）。现在章节卡收到
     // 1.5 秒，大字从 1.5 秒起，两者不同屏也不再留空。
-    const pg0 = pageAt(t)
-    if (pg0 && pg0.title && t < pg0.start + 1.5) return
+    //
+    // 自测29：这条原来写成「t < 本页起点 + 1.5 就 return」——时间条件，不是内容条件。
+    // 它把页首新出的大字白丢 1.5 秒（全片 4 处），还让两条跨页的大字在中途消失 1.5 秒
+    // 再闪回来（28.59s / 41.41s 那两条）。现在让不让位由 scene.mjs 的 chapterHoldUntil
+    // 按「是不是同一句话」判好、写在 b.holdUntil 上，渲染器只执行。
+    if (b.holdUntil && t < b.holdUntil) return
     const g = bigGeom(b, shot)
     const lines = g.lines
     const size = g.size

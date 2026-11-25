@@ -24,6 +24,39 @@ const round = (n, k = 3) => Number(n.toFixed(k))
 const chW = ch => (/[\x00-\xff]/.test(ch) ? 0.56 : 1)
 export const textEm = s => [...String(s)].reduce((n, ch) => n + chW(ch), 0)
 
+/**
+ * 这条大字要不要给章节卡让位、让到什么时候。
+ *
+ * 以前的规矩是「页开始后 1.5 秒一律不画大字」（film.js 的 drawBig 里一行时间判断）。
+ * 那是**时间条件**，不是内容条件，自测28 的成片里它闯了两类祸：
+ *   · 页首新出的大字白丢 1.5 秒——5.54 / 17.93 / 34.98 / 50.65 四处，
+ *     6.2s、18.6s、35.1s 那几帧画面上只剩一行小字幕，像没渲完；
+ *   · 跨页的大字在中途消失 1.5 秒再闪回来——28.59s 那条（页 4 从 29.41s 起）
+ *     和 41.41s 那条（页 6 从 42.33s 起），同一条大字在画面上闪了一下。
+ * 章节卡和大字真正的冲突只有一种：两段字说的是同一句（自测07 抽到「01 最赚钱的不是技术」
+ * 压着大字「赚钱不是技术」）。所以按内容判：本页开头 1.5 秒内新出的大字，只有和章节名
+ * 说的是同一句才让位；跨页的大字一律不让——那时候章节卡说的是新的一页，和大字不是一回事。
+ */
+function commonRun(a, b) {
+  let best = 0
+  for (let i = 0; i < a.length; i++) {
+    for (let j = 0; j < b.length; j++) {
+      let k = 0
+      while (a[i + k] && a[i + k] === b[j + k]) k++
+      if (k > best) best = k
+    }
+  }
+  return best
+}
+export function chapterHoldUntil(text, f0, page, cardSec = 1.5) {
+  if (!page || !String(page.title || '').trim()) return 0
+  if (f0 < page.start - 0.001 || f0 >= page.start + cardSec) return 0
+  const t = bare(text), pt = bare(page.title)
+  if (!t || !pt) return 0
+  const same = pt.includes(t) || t.includes(pt) || commonRun(t, pt) >= 4
+  return same ? round(page.start + cardSec) : 0
+}
+
 const TERMS = (() => {
   try {
     const p = fileURLToPath(new URL('../../config/terms.json', import.meta.url))
@@ -295,6 +328,11 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
     else if (auto.style === 'redBox' || auto.style === 'limeMark') style = auto.style
     else if (auto.style === 'yellow' && firstOfPage) style = 'yellow'
     const hot = style === 'redBox' ? (emph || auto.hot) : style === 'plain' ? '' : (emph || auto.hot)
+    // 让位规则写进数据（见上面 chapterHoldUntil）：渲染器和盒子表都读这个字段，
+    // 不再各自拿时间判断——两处实现一旦不同步，质检就会报一个画面上没有的大字（自测22 踩过）。
+    // 字卡页不参与：字卡上根本不画章节卡（film.js 的 draw() 在 card 页提前收工），让位没有对象。
+    const shotHere = shots.find(s2 => f0 >= s2.f0 && f0 < s2.f1)
+    const holdUntil = shotHere && shotHere.kind === 'card' ? 0 : chapterHoldUntil(text, f0, page)
     bigs.push({
       index: bigs.length + 1, beat: i, text,
       hot: hot || '', style,
@@ -305,6 +343,7 @@ export function buildScene({ words, segments, plan, brief = {}, tpl, cards = [],
       pageTitle: page ? page.title : '',
       pageEyebrow: page ? page.eyebrow : '',
       lineIn: 0.10,
+      ...(holdUntil ? { holdUntil } : {}),
     })
   })
 

@@ -11,6 +11,20 @@ const clamp = (x, a, b) => (x < a ? a : x > b ? b : x)
 /** 中文字宽按 1em、ASCII 按 0.56em 估（和断行同一套口径），用于取最宽可能值。 */
 const textEm = (str) => [...String(str)].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)
 
+/**
+ * 某一刻在哪一页。页与页之间有空档（删掉静音之后那 0.3 秒不属于任何一页），
+ * 兜底必须取「最近的前一页」——取 pages[0] 会让页码在空档里跳回 P. 01（自测28 17.8s 那帧）。
+ * film.js 里有一份同样的实现（渲染器是浏览器模块，import 不到这里），两边都由
+ * scripts/check-zheguang.mjs 的空档断言钉住。
+ */
+export function pageAtFor(pages, t) {
+  const ps = pages || []
+  const hit = ps.find(p => t >= p.start && t < p.end)
+  if (hit) return hit
+  for (let i = ps.length - 1; i >= 0; i--) if (ps[i].start <= t) return ps[i]
+  return ps[0] || null
+}
+
 export function layoutBoxes({ scene, template }) {
   const L = (template.layouts && (template.layouts[scene.ratio] || template.layouts[template.ratio])) || null
   if (!L) return { ok: false, reason: '模板没有这个画幅的布局：' + scene.ratio, items: [] }
@@ -32,13 +46,11 @@ export function layoutBoxes({ scene, template }) {
     const shots = scene.shots || [{ f0: 0, f1: scene.duration, kind: 'full' }]
     const shotAt = (t) => shots.find(s => t >= s.f0 && t < s.f1) || shots[0]
     const pagesOf = scene.pages || []
-    const pageAt = t => pagesOf.find(p => t >= p.start && t < p.end) || pagesOf[0] || null
-    // 页首 1.5 秒章节卡占场，大字不出场（和 film.js 的 drawBig 同一条）。
-    // 不认这条，盒子就会报一个画面上根本不存在的大字（自测22 第 492 帧的假报）。
-    const bigVisibleFrom = b => {
-      const pg = pageAt(b.f0)
-      return pg && pg.title ? Math.max(b.f0, pg.start + 1.5) : b.f0
-    }
+    const pageAt = t => pageAtFor(pagesOf, t)
+    // 大字什么时候出场：只看数据里的 holdUntil（scene.mjs 的 chapterHoldUntil 算的），
+    // 不再在这里按「页首 1.5 秒」重算一遍。两处实现一旦不同步，盒子就会报一个画面上
+    // 根本不存在的大字（自测22 第 492 帧），或者量到一个还没画出来的大字（自测28 的 1.04:1）。
+    const bigVisibleFrom = b => (b.holdUntil ? Math.max(b.f0, b.holdUntil) : b.f0)
     // 刻度卡压着右边一块（0.575h 起、高 210）。大字的板从下往上长，短句子会被字号上限顶到 168px，
     // 板顶正好插进卡底（自测22 第 545 帧：「越来越低 ↓」被板沿切掉）。和 film.js 的 bigGeom 同一口径：
     // 有卡在场就把字号缩到板顶落在卡底 22px 以下。
