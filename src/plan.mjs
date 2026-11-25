@@ -235,6 +235,23 @@ function refineCut(A, B, lo, hi, g, opts) {
   return back > out ? [out, back] : nominal
 }
 
+/**
+ * 「没解决的怀疑」只有落在**成片**里才算数：整句被剪掉的词，观众一个字也听不到。
+ * 自测26 实测：报告列了 10 个「没把握」的字，其中 4 个（些 / 但是 / 你 / 看到）整句都被 EDL 剪掉了——
+ * 数字看着像永远追不平，其实是拿全条转写在记账：剪辑删了 5 句，那 5 句的怀疑还留在清单上。
+ * 这里按保留区间过一遍，成片内的和已剪掉的分开记，两边都要报。
+ */
+export function pendingOnFilm(pending = [], keep = []) {
+  const inFilm = []
+  const cut = []
+  for (const p of pending || []) {
+    const at = Number(p && p.at)
+    const hit = (keep || []).some(([a, b]) => at + 1e-6 >= a && at < b)
+    ;(hit ? inFilm : cut).push(p)
+  }
+  return { inFilm, cut }
+}
+
 export function buildPlan(words, mediaDuration, options = {}) {
   const o = { ...DEFAULT_PLAN, ...options, gap: { ...DEFAULT_PLAN.gap, ...(options.gap || {}) }, seam: { ...DEFAULT_PLAN.seam, ...(options.seam || {}) } }
   const ws = normWords(words)

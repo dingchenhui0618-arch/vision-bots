@@ -323,6 +323,13 @@ ok('听过了、音频和字幕不一致 → 记成 audio-differs', oq.some(x =>
 ok('从没听过 → 记成 never-heard（这才该去听）', oq.some(x => x.w === '丁' && x.why === 'never-heard'), JSON.stringify(oq))
 ok('已改过 / 听音改过的词不再列为怀疑', openQuestions({ current: oqWords, appliedIdx: new Set([3]), audioIdx: new Set([2]), heardRanges: [[0, 0.6]], openRanges: [[0.6, 0.9]] }).length === 0)
 ok('两类混在一份名单里也能分开数', oq.filter(x => x.why === 'never-heard').length === 1 && oq.filter(x => x.why === 'audio-differs').length === 1, JSON.stringify(oq))
+// 自测26 补的两条：整句读数不一致时逐字确认过的、以及「小模型自己说没听准」的强信号
+const oqConf = openQuestions({ current: oqWords, heardRanges: [[0, 0.6]], openRanges: [[0.6, 0.9]], confirmedIdx: new Set([2, 3]) })
+ok('整句读数不一致、但这个字每个窗口都听到 → 不再算怀疑', oqConf.length === 0, JSON.stringify(oqConf))
+const oqStrong = openQuestions({ current: oqWords, heardRanges: [[0, 0.6]], openRanges: [[0.6, 0.9]] })
+ok('p≤0.40 的怀疑标成 strong（必须去听掉）', oqStrong.length === 2 && oqStrong.every(x => x.strong), JSON.stringify(oqStrong))
+const oqMid = openQuestions({ current: [{ w: '因为', start: 0, end: 0.3, p: 0.565 }] })
+ok('p=0.565 的常见词算「记下来但不去追」，不算该听没听', oqMid.length === 1 && oqMid[0].strong === false, JSON.stringify(oqMid))
 
 // ── 21. 音频否决：我们改过的字，音频读的是改之前那句 → 退回去（自测26）──
 // 实测 45.21–47.73s：「一千→一天」是两个文本模型一致同意的，medium 六个窗口却全读成「1000」（＝一千）。

@@ -895,6 +895,16 @@ export function applyToSegments(words, segments) {
 // 4 个词的窗口里出现 ≥2 个 p<0.65 的词，就是小模型在这儿卡过的实证（实测「知(0.42) 道 会(0.55)」
 // 正是它把两句话并成一句的地方）。全片最多重听 RELISTEN.maxSpans 处，逐条记账。
 
+/**
+ * 孤零零一个极低置信词（不需要邻居作证）。纯函数，可单测。
+ * 「扎堆」这条触发条件的盲区就在这里：它数的是**个数**，一个 p=0.10 的字单独出现时
+ * 在任何 4 词窗口里都只有它自己，永远凑不满 2 个，于是那句话从没被听过。
+ */
+export function isolatedLow(view, cfg = RELISTEN) {
+  const ws = (view && view.ws) || []
+  return ws.filter(w => typeof w.p === 'number' && w.p <= cfg.isoP).map(w => ({ i: w.i, w: w.core, p: +Number(w.p).toFixed(3) }))
+}
+
 /** 句子里低置信词扎堆的位置。纯函数，可单测。 */
 export function lowConfidenceClusters(view, cfg = RELISTEN) {
   const out = []
@@ -964,6 +974,26 @@ export function vetoPlan({ current = [], ids = [], audio = '' }) {
     proof.push({ i, from: core(i), to: core0(i) })
   }
   return { ok: true, ids: changed, proof, orig, backText: orig, why: '音频读的是改动之前的原话' }
+}
+
+/**
+ * 整句读数不一致时的逐字判定：只有「每个窗口都听得到」的词才算被音频确认过。
+ * 指纹用「这个词 + 它后面那个字」（最后一个词用「前一个字 + 它」）：单字太容易在短窗口里撞上，
+ * 实测 55.29–56.55s 的「你」在三个窗口里出现的位置都不一样，单字比对会说对，双字指纹才说明是听到的。
+ */
+export function confirmWords(ws = [], texts = []) {
+  const list = (texts || []).map(t => String(t || '')).filter(Boolean)
+  if (list.length < 2) return []
+  const cores = (ws || []).map(x => strip(x.core))
+  const out = []
+  for (let k = 0; k < cores.length; k++) {
+    const a = cores[k]
+    if (!a) continue
+    const pair = cores[k + 1] ? a + cores[k + 1] : (cores[k - 1] || '') + a
+    if ([...pair].length < 2) continue
+    if (list.every(t => t.includes(pair))) out.push({ i: ws[k].i, w: a, pair })
+  }
+  return out
 }
 
 async function relistenRepair({ words, current, segments, media, envelope, relistenDir, hotwords = '', hints = [], phon = [], log }) {
@@ -1051,11 +1081,15 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
       const an = slotAnomaly({ start: ww.start, end: ww.end, chars: [...splitAffixes(ww.w).core].length, gaps: silentGaps(envelope, ww.start, ww.end) })
       if (an.anomaly && (!slot || an.ratio > slot.ratio)) slot = { ratio: an.ratio, i: w.i, gap: an.gap }
     }
-    if (!lowConfidenceClusters(v).length && !slot) continue
-    auditCands.push({ text: v.text, lowN, minP, slot })
+    // 第三个触发条件：句子里有没有孤零零一个极低置信词（自测26 的「时」0.23、「OP」0.254、「现在」0.358 都在这里）
+    const iso = isolatedLow(v)
+    if (!lowConfidenceClusters(v).length && !slot && !iso.length) continue
+    auditCands.push({ text: v.text, lowN, minP, slot, iso: iso.length })
   }
-  // 采集顺序：先看词槽有没有吞字的迹象，再看低置信词多不多
-  auditCands.sort((a, b) => (b.slot ? b.slot.ratio : 0) - (a.slot ? a.slot.ratio : 0) || b.lowN - a.lowN || a.minP - b.minP)
+  // 采集顺序：先看词槽有没有吞字的迹象（结构证据），再按**最不可信那个字有多不可信**排。
+  // 原来是先比个数（b.lowN - a.lowN）：三个 p=0.5 会排在两个 p=0.1 前面，最可疑的句子反而最后才听，
+  // 预算一紧就被截掉——自测25 那一版被挤掉的第一句就在成片开头。
+  auditCands.sort((a, b) => (b.slot ? b.slot.ratio : 0) - (a.slot ? a.slot.ratio : 0) || a.minP - b.minP || b.lowN - a.lowN)
   // 质检线索**不占**采集预算。以前线索和采集共用 maxSpans：上一轮 17 句待查只听了 5 句，
   // 其中 3 句是线索，真正的错句（25.4s「指纹住在」）排在后面，一次都没轮到听过。
   // 线索是上一轮质检实测出来的疑点，必须听；预算只在「ASR 自己卡过」的句子里挑。
@@ -1068,10 +1102,10 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
     notListened: Math.max(0, auditCands.length - RELISTEN.maxSpans),
     notListenedTexts: auditCands.slice(RELISTEN.maxSpans, RELISTEN.maxSpans + 3).map(c => c.text.slice(0, 14)),
     phon: { proposals: phon.length, candidates: phonCands.length, notes: phonNotes },
-    picked: pickedCands.map(c => ({ text: c.text.slice(0, 16), hint: Boolean(c.hint), phon: c.phon ? c.phon.from + '→' + c.phon.to : null, slot: c.slot ? c.slot.ratio : null, low: c.lowN })),
+    picked: pickedCands.map(c => ({ text: c.text.slice(0, 16), hint: Boolean(c.hint), phon: c.phon ? c.phon.from + '→' + c.phon.to : null, slot: c.slot ? c.slot.ratio : null, low: c.lowN, iso: c.iso || 0 })),
   }
   if (!pickedCands.length) {
-    return off('nothing-suspicious', '既没有质检线索，也没有扎堆的低置信词（4 个词里 ≥2 个 p<' + RELISTEN.lowP + '）或吞了静音的词槽，没有值得重听的地方')
+    return off('nothing-suspicious', '既没有质检线索，也没有扎堆的低置信词（4 个词里 ≥2 个 p<' + RELISTEN.lowP + '）、没有单个 p≤' + RELISTEN.isoP + ' 的词、没有吞了静音的词槽，没有值得重听的地方')
   }
   if (section.truncated) {
     log('听音复核：可疑句 ' + auditCands.length + ' 句，预算 ' + RELISTEN.maxSpans + ' 句，还有 ' + section.notListened +
@@ -1080,6 +1114,8 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
 
   const ranges = []
   const confirmed = []
+  // 整句读数不一致、但某个字每个窗口都听得到的那些词下标（不放进 confirmed 区间：区间按整句算太粗）
+  const confirmedIdx = new Set()
   const reject = (span, r, v, why) => {
     section.spans.push({ span, agree: true, text: r.text, mine: v.text, rejected: why })
     log('听音复核：' + span.join('–') + 's 音频是「' + r.text + '」、字幕是「' + v.text + '」，但' + why + '，不改')
@@ -1094,7 +1130,13 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
     const t0 = current[rg.a].start
     const t1 = current[rg.b].end
     const span = [+t0.toFixed(2), +t1.toFixed(2)]
-    const r = await relistenSentence({ media, span: [t0, t1], cacheDir: relistenDir, hotwords, expect: v.text, log })
+    // 邻词的文字一并交进去：窗口的 pad 会把它们切进来（三个窗口都带着，所以「读数一致」也救不了），
+    // 不剥掉就会被当成「我们漏了一个字」去申请插字。
+    const ctx = {
+      prev: rg.a > 0 ? strip(splitAffixes(current[rg.a - 1].w).core) : '',
+      next: rg.b + 1 < current.length ? strip(splitAffixes(current[rg.b + 1].w).core) : '',
+    }
+    const r = await relistenSentence({ media, span: [t0, t1], cacheDir: relistenDir, hotwords, expect: v.text, ctx, log })
     if (!r.ok) {
       section.spans.push({ span, skipped: r.skipped, detail: r.detail || null })
       log('听音复核：' + span.join('–') + 's 没听成（' + r.skipped + '），这条不改')
@@ -1102,8 +1144,15 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
     }
     // 采信条件：逐字一致，或者多数窗口一致（votes 里有几比几）。只差句外切进来一两个字时走 loose。
     if (!r.agree && !r.loose && !r.majority) {
-      section.spans.push({ span, agree: false, decodes: r.decodes, votes: r.votes || [] })
-      log('听音复核：' + span.join('–') + 's 几个窗口听的读数不一致（' + (r.votes || []).map(v => '「' + v.text + '」×' + v.n).join(' vs ') + '），不算证据')
+      // 整句读数不一致，不等于每个字都没听到：这个词（带上它后面那个字当指纹）**每个窗口**都听得出来，
+      // 它就算被音频确认过。自测26 实测 55.29–56.55s 三个窗口读成「只有别人看到你看」/
+      // 「只有别人看到你的产品你」/「口只有别人看到你」——整句对不上，但「别人」「看到」三个窗口都有；
+      // 原来整句一否决，这两个字也跟着进了「没解决」，等于把已经听得到的证据一起扔掉。
+      const hitWords = confirmWords(v.ws, r.texts || [])
+      section.spans.push({ span, agree: false, decodes: r.decodes, votes: r.votes || [], confirmedWords: hitWords })
+      for (const c of hitWords) confirmedIdx.add(c.i)
+      log('听音复核：' + span.join('–') + 's 几个窗口的整句读数不一致（' + (r.votes || []).map(v => '「' + v.text + '」×' + v.n).join(' vs ') + '），' +
+        (hitWords.length ? '但每个窗口都听到「' + hitWords.map(c => c.w).join('、') + '」，这几个字算确认过' : '没有哪个字是每个窗口都听到的，整段都不算证据'))
       continue
     }
     const diff = charDiff(v.text, r.text)
@@ -1243,7 +1292,7 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
   }
   section.delta = current.length - startLen
   section.confirmedSpans = confirmed.length
-  return { current, section, ranges, confirmed, delta: section.delta }
+  return { current, section, ranges, confirmed, confirmedIdx, delta: section.delta }
 }
 
 /**
@@ -1259,7 +1308,7 @@ async function relistenRepair({ words, current, segments, media, envelope, relis
  * 这个数字只是装饰。其中一句就是成片开头：「今天大街都在卷AI技术」，
  * 强耳朵三个窗口全听成「今天大家…」，带错出厂，质检 19/19 也没拦住。
  */
-export function openQuestions({ current = [], appliedIdx = new Set(), audioIdx = new Set(), heardRanges = [], openRanges = [], lowP = LOW_P }) {
+export function openQuestions({ current = [], appliedIdx = new Set(), audioIdx = new Set(), heardRanges = [], openRanges = [], confirmedIdx = new Set(), lowP = LOW_P, isoP = RELISTEN.isoP }) {
   const inside = (w, ranges) => ranges.some(r => Array.isArray(r) && w.start >= r[0] && w.end <= r[1] + 1e-6)
   const out = []
   for (let i = 0; i < current.length; i++) {
@@ -1268,7 +1317,13 @@ export function openQuestions({ current = [], appliedIdx = new Set(), audioIdx =
     if (appliedIdx.has(i) || audioIdx.has(i)) continue
     // 强耳朵逐字读过、和字幕一样 → 这不是怀疑，是已核对过的事实
     if (inside(w, heardRanges)) continue
-    out.push({ i, at: +w.start.toFixed(2), w: w.w, p: +Number(w.p).toFixed(3), why: inside(w, openRanges) ? 'audio-differs' : 'never-heard' })
+    // 整句读数不一致，但这个字每个窗口都听得到 → 也是核对过的事实（只是核对粒度是字，不是句）
+    if (confirmedIdx.has(i)) continue
+    // strong=true 是「小模型自己说这个音没听准」（p≤0.40）：这种必须去听掉，留着就是没追到底。
+    // strong=false 是 p 在 0.40–0.65 之间的常见词：whisper 对这种词本来就这样，没有结构信号，
+    // 记下来但不去追——把两者混成一个「没把握 N 个字」，才是自测25 那个装饰数字的老毛病。
+    const strong = typeof w.p === 'number' && w.p <= isoP
+    out.push({ i, at: +w.start.toFixed(2), w: w.w, p: +Number(w.p).toFixed(3), strong, why: inside(w, openRanges) ? 'audio-differs' : 'never-heard' })
   }
   return out
 }
@@ -1522,7 +1577,7 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
   const openRanges = ((aud.section && aud.section.spans) || [])
     .filter(s => Array.isArray(s.span) && (s.agree === false || s.rejected))
     .map(s => s.span)
-  report.pending = openQuestions({ current, appliedIdx, audioIdx, heardRanges, openRanges })
+  report.pending = openQuestions({ current, appliedIdx, audioIdx, heardRanges, openRanges, confirmedIdx: aud.confirmedIdx || new Set() })
 
   // 硬约束改两条，都比原来更严：
   //   · 改动那句**外面**的词，起止一个字节都不许动（原来要求全片逐词相等；
@@ -1560,6 +1615,8 @@ export async function correct({ words, terms, log = () => {}, askModel = true, s
     // 没解决的两类分开计数：没听过（该去听）／听过但音频和字幕不一致（要人定）
     pendingNever: report.pending.filter(x => x.why === 'never-heard').length,
     pendingDisagree: report.pending.filter(x => x.why === 'audio-differs').length,
+    // 其中「小模型自己说这个音没听准」（p≤0.40）的有几个：这几个必须去听掉，留着就是没追到底
+    pendingStrong: report.pending.filter(x => x.strong).length,
     vetoed: (report.relisten && report.relisten.vetoed) || 0,
     suspicious: (report.relisten && report.relisten.suspicious) || 0,
     unheard: (report.relisten && report.relisten.notListened) || 0,

@@ -6,8 +6,8 @@
  * 模型说「应该是知道怎么做」不算证据（自测13 实测那条建议是错的，音频里只有「会」），
  * 换一个更强的模型在同一段音频上听到「的人」才算——因为它听的是素材本身。
  */
-import { alignCrop, charDiff, planRepair, silentGaps, modelAvailable, relistenSentence, enabled, slotAnomaly, voteTexts, hanNumbers, R, strip } from '../src/relisten.mjs'
-import { lowConfidenceClusters } from '../src/asr-fix.mjs'
+import { alignCrop, charDiff, planRepair, silentGaps, modelAvailable, relistenSentence, enabled, slotAnomaly, voteTexts, hanNumbers, stripContext, R, strip } from '../src/relisten.mjs'
+import { lowConfidenceClusters, isolatedLow, confirmWords } from '../src/asr-fix.mjs'
 import { phraseAround } from '../src/qa-semantic.mjs'
 
 let pass = 0
@@ -172,6 +172,43 @@ ok('1000 → 一千', hanNumbers('花1000的时间') === '花一千的时间', h
 ok('10 → 十、120 → 一百二十、105 → 一百零五', hanNumbers('10') === '十' && hanNumbers('120') === '一百二十' && hanNumbers('105') === '一百零五', hanNumbers('120') + '/' + hanNumbers('105'))
 ok('汉字写的数字原样不动（一天不会被改成别的）', hanNumbers('要花一天的时间') === '要花一天的时间', hanNumbers('要花一天的时间'))
 ok('超过 4 位的数字不猜（留原样，免得比出假相等）', hanNumbers('10000') === '10000', hanNumbers('10000'))
+
+// ── 窗口边界带进来的邻句尾音（自测26）：不许当成「我们漏了一个字」 ──
+// 实测 17.7s 的「圈」是上一句「研究了一圈」的尾字、57.61s 的「品」是「产品」的尾字，
+// 两处都被读成「字幕少一个字」去申请插字，插不进去，最后记成「音频与字幕不一致」。
+const sc1 = stripContext('圈真正的机会是在OPC结合内容', { prev: '圈', next: '真' })
+ok('剥掉窗口左边带进来的上一句尾字「圈」', sc1.text === '真正的机会是在OPC结合内容' && sc1.head === 1, JSON.stringify(sc1))
+const sc2 = stripContext('品你才有机会出圈', { prev: '品', next: '' })
+ok('剥掉左边的「品」（上一句「产品」的尾字）', sc2.text === '你才有机会出圈' && sc2.head === 1, JSON.stringify(sc2))
+const sc3 = stripContext('卷内容生产力', { prev: '剪', next: '才' })
+ok('邻字对不上就不剥（「卷」不是「剪」的尾字）', sc3.text === '卷内容生产力' && sc3.head === 0 && sc3.tail === 0, JSON.stringify(sc3))
+const sc4 = stripContext('但是', { prev: '但是', next: '但是' })
+ok('不许把这句剥空', sc4.text.length >= 1, JSON.stringify(sc4))
+const sc5 = stripContext('abcd', { prev: 'xxxab', next: '' })
+ok('最多剥两个字（邻词是「xxxab」也只剥「ab」），不做整段匹配', sc5.head === 2 && sc5.text === 'cd', JSON.stringify(sc5))
+const sc6 = stripContext('今天大家都在卷AI技术', { prev: '是', next: '下' })
+ok('两端都对不上时一个字都不动', sc6.text === '今天大家都在卷AI技术', JSON.stringify(sc6))
+
+// ── 整句读数不一致时的逐字判定（自测26）：整句对不上，不等于每个字都没听到 ──
+// 实测 55.29–56.55s 三个窗口读成「只有别人看到你看」/「只有别人看到你的产品你」/「口只有别人看到你」
+const ws55 = [
+  { i: 190, core: '只有' }, { i: 191, core: '别' }, { i: 192, core: '人' },
+  { i: 193, core: '看到' }, { i: 194, core: '你' },
+]
+const cw = confirmWords(ws55, ['只有别人看到你看', '只有别人看到你的产品你', '口只有别人看到你'])
+ok('三个窗口都听到的词才算确认（只有/别/人/看到/你）', cw.length === 5, JSON.stringify(cw.map(c => c.w)))
+const cw2 = confirmWords([{ i: 195, core: '产品' }, { i: 196, core: '才' }], ['只有别人看到你看', '只有别人看到你的产品你', '口只有别人看到你'])
+ok('只有一个窗口里有的词不算确认', cw2.length === 0, JSON.stringify(cw2.map(c => c.w)))
+const cw3 = confirmWords(ws55, ['只有别人看到你看'])
+ok('少于两个窗口时不做逐字判定（一条读数不是证据）', cw3.length === 0, JSON.stringify(cw3))
+
+// ── 「扎堆」看不见孤零零一个极低置信词（自测26）：p=0.10 的字单独出现也得进队列 ──
+const isoView = { ws: [{ i: 1, core: '这', p: 0.753 }, { i: 2, core: '些', p: 0.104 }, { i: 3, core: '满', p: 0.948 }, { i: 4, core: '大', p: 0.998 }] }
+ok('4 个词里只有 1 个低置信 → 「扎堆」看不见它', lowConfidenceClusters(isoView).length === 0, JSON.stringify(lowConfidenceClusters(isoView)))
+ok('同一个词 p=0.104 → 单字触发能看见它', isolatedLow(isoView).length === 1 && isolatedLow(isoView)[0].w === '些', JSON.stringify(isolatedLow(isoView)))
+const midView = { ws: [{ i: 1, core: '因为', p: 0.565 }, { i: 2, core: '现在', p: 0.985 }, { i: 3, core: '专注', p: 0.978 }] }
+ok('p=0.565 的常见词不算「小模型说没听准」，不触发重听', isolatedLow(midView).length === 0, JSON.stringify(isolatedLow(midView)))
+ok('单字触发线 p≤0.40 写在一处配置里', typeof R.isoP === 'number' && R.isoP > 0 && R.isoP < R.lowP, 'isoP=' + R.isoP)
 
 const total = pass + fails.length
 console.log(fails.length ? 'FAIL ' + fails.length + '/' + total : 'PASS ' + total + ' 条')

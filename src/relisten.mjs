@@ -82,11 +82,16 @@ export const R = {
   lowP: 0.65,
   lowWindow: 4,
   lowNeeded: 2,
-  // 采集预算：一集里「ASR 自己卡过」的句子有多少就听多少（16 句 ≈ 48 条窗口解码，约 3 分钟）。
+  // 「扎堆」数的是字数，看不见**孤零零一个**极低置信词。自测26 实测：成片第一句「AI时代」的「时」p=0.23、
+  // 结尾「OPC」的「OP」p=0.254、「现在」p=0.358，各自句子里只有它一个低置信词，
+  // 因此那句从没进过队列——报告里只好把它们记成「没听过」（7 个里的 3 个就是这么来的）。
+  // 一个 p≤0.40 的词本身就是小模型在说「这个音我没听准」，不需要邻居来作证。
+  isoP: 0.40,
+  // 采集预算：一集里「ASR 自己卡过」的句子有多少就听多少（20 句 ≈ 60 条窗口解码，冷启约 15–20 分钟）。
   // 原来是 5 句，代价是自测25 实测过的：这支片子排了 10 句可疑句，只听前 5 句，
   // 被挤掉的第 1 句就在成片开头——字幕「今天大街都在卷AI技术」，三个窗口全听成「今天大家…」，
   // 一个确凿的错字带着 6% 的「没把握」一起出厂。听不过来时必须明说截断了多少，不许静默。
-  maxSpans: Number(process.env.VISION_BOTS_RELISTEN_SPANS) || 16,
+  maxSpans: Number(process.env.VISION_BOTS_RELISTEN_SPANS) || 20,
   // 加字：新字落进静音缝隙，缝隙要够长（按每字 0.10s 估）
   gapMin: 0.28,
   charSec: 0.10,
@@ -271,12 +276,36 @@ export function cropWords(words, t0, t1) {
 }
 
 /**
+ * 窗口的 pad 区会把**邻句**的尾音/头音切进来，读成「我们漏了一个字」。
+ * 自测26 实测两处：17.7s 的「圈」是上一句「研究了一圈」的尾字，57.61s 的「品」是「产品」的尾字；
+ * 两处都被当成「字幕少了一个字」而申请插字，插不进去（词槽内没有静音缝隙），
+ * 最后写进报告成「音频与字幕不一致」——错在记账，不在音频，也不在字幕。
+ * 规矩：只剥**两端**，只剥与紧邻的那个词文字对得上的字，最多两字，剥完不能把这句话剥空。
+ * 剥的不是证据，是窗口自己带进来的上下文。
+ */
+export function stripContext(text, ctx = {}, maxChars = 2) {
+  let t = strip(text)
+  const prev = strip(ctx && ctx.prev ? ctx.prev : '')
+  let head = 0
+  // 只剥**左边**：实测的两处（圈 / 品）都是窗口起点切进了上一句的最后一个词。
+  // 右边不剥——句尾的字与下一个词的首字相同时（「…了」+「了…」），剥哪个都分不清，
+  // 剥错就会把我们自己的字当成「窗口带进来的」，宁可让右边多出一个字（那只会走到「不改」）。
+  if (prev) {
+    for (let k = Math.min(maxChars, prev.length, t.length - 1); k >= 1; k--) {
+      if (t.startsWith(prev.slice(-k))) { t = t.slice(k); head = k; break }
+    }
+  }
+  return { text: t, head, tail: 0 }
+}
+
+/**
  * 重听一句话：两个不同左上下文的窗口各听一次，逐字一致才算证据。
  * span 是这句话在**源时间**里的起止（词的起止，不是 whisper 段）。
  */
-export async function relistenSentence({ media, span, cacheDir, model = R.model, tier = 'auto', hotwords = '', expect = null, log = () => {} }) {
+export async function relistenSentence({ media, span, cacheDir, model = R.model, tier = 'auto', hotwords = '', expect = null, ctx = null, log = () => {} }) {
   if (!enabled()) return { ok: false, skipped: 'disabled' }
   const [t0, t1] = span
+  let ctxCut = 0
   const listen = async (m, compute) => {
     const decodes = []
     let lastErr = null
@@ -286,12 +315,20 @@ export async function relistenSentence({ media, span, cacheDir, model = R.model,
       // 有「要复核的那句话」时按文字对齐（抗两个模型词边界差 0.3–0.5s），否则按时长裁
       let ws = cropWords(r.words, t0, t1)
       let text = strip(ws.map(w => w.w).join(''))
+      let aligned = false
       if (expect) {
         const al = alignCrop(expect, r.words, R, [t0, t1])
         if (al) {
           ws = r.words.slice(al.a, al.b + 1)
           text = al.text
+          aligned = true
         }
+      }
+      // 对齐之后仍然可能带着 pad 区的邻字（三个窗口都带着，所以「一致」也救不了）：剥掉再比。
+      // 只在**对齐成功**时剥：没对齐就不知道这句的边界在哪，剥掉头一个字可能把这句话自己的字剥走。
+      if (ctx && aligned) {
+        const sc = stripContext(text, ctx)
+        if (sc.text !== text) { text = sc.text; ctxCut += (sc.head || 0) + (sc.tail || 0) }
       }
       decodes.push({ pad, text, words: ws, cached: !!r.cached })
     }
@@ -333,6 +370,9 @@ export async function relistenSentence({ media, span, cacheDir, model = R.model,
     ok: true, tier: used.tier, model: used.model, compute: used.compute, span,
     agree: used.agree, single: Boolean(used.single), loose: Boolean(used.loose),
     majority: Boolean(used.majorityOk), votes: used.votes || [],
+    // 每个窗口的原文（含「剥掉邻句尾音」之后的版本）：整句读数不一致时，逐字判定要用它
+    texts: used.decodes.map(d => d.text),
+    ctxCut,
     text: used.agree ? used.decodes[0].text : (used.loose ? used.base : (used.majorityOk ? used.topText : null)),
     decodes: used.decodes.map(d => ({ pad: d.pad, text: d.text, cached: d.cached })),
     words: used.decodes[0].words,

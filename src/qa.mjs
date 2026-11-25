@@ -166,12 +166,16 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
     // 数字看着像风险度量，其实没有对应动作，最后带着「今天大街→今天大家」这个错字交付。
     const never = pending.filter(p => p.why === 'never-heard').length
     const differs = pending.filter(p => p.why === 'audio-differs').length
-    const split = never + differs ? `（没听过 ${never} 个、音频与字幕不一致 ${differs} 个）` : ''
+    // 其中「小模型自己说这个音没听准」（p≤0.40）的有几个：那才是真该去听掉的。
+    const strong = pending.filter(p => p.strong).length
+    const cut = stats.pendingCut || 0
+    const split = never + differs ? `（没听过 ${never} 个、音频与字幕不一致 ${differs} 个${strong ? `，其中该听没听的 ${strong} 个` : ''}）` : ''
+    const cutText = cut ? `；另有 ${cut} 个低置信字所在的句子被剪掉了，观众听不到，不算进这个比例` : ''
     add('asr_confidence', safe && okRatio,
       `改字 ${applied.length} 处${kindText ? `（${kindText}）` : ''}，打回 ${rejected.length} 处，没解决 ${pending.length}${totalWords ? `/${totalWords} 词 = ${(ratio * 100).toFixed(1)}%（上限 ${(BAR.confidence * 100).toFixed(0)}%）` : ''}` +
       (pending.length ? `：${pending.slice(0, 5).map(p => `「${p.w}」@${p.at}s`).join('、')}${pending.length > 5 ? ' 等' : ''}` : '') +
-      `${split}；词数 ${assertion.wordCount ? '未变' : '变了'}，时间码 ${assertion.timingUntouched ? '未动' : '被动了'}`,
-      { applied, rejected, pending, assertion, ratio: Number(ratio.toFixed(4)), bar: BAR.confidence, never, differs })
+      `${split}${cutText}；词数 ${assertion.wordCount ? '未变' : '变了'}，时间码 ${assertion.timingUntouched ? '未动' : '被动了'}`,
+      { applied, rejected, pending, assertion, ratio: Number(ratio.toFixed(4)), bar: BAR.confidence, never, differs, strong, cut })
   }
 
   // 段落节奏：用户 2026-11-23 明确否掉"22 章切太碎"，这里把它变成硬门槛。

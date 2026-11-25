@@ -4,7 +4,7 @@
  * 全部是合成数据 + 合成包络，不碰素材、不转写、不渲染，几秒钟跑完。
  * 真素材上的对照在 docs/PROGRESS.md 里（38.24s 那句重复）。
  */
-import { buildPlan } from '../src/plan.mjs'
+import { buildPlan, pendingOnFilm } from '../src/plan.mjs'
 import { buildCaptions } from '../src/captions.mjs'
 
 let pass = 0, fail = 0
@@ -178,6 +178,22 @@ const fillerCfg = { enabled: true, minGapSec: 0.12, words: ['嗯', '啊'], marke
   const caps = buildCaptions(dirty, p).cards.map(c => c.text).join('')
   ok(caps.includes('我们今天聊剪辑'), '字幕里第一次说的那句是完整的', caps)
 }
+
+// ── 「没解决的怀疑」按成片记账（自测26）──
+// 实测：报告列了 10 个「没把握」的字，其中 4 个整句被剪掉了。剪掉的词观众听不到，
+// 拿它当「没追平的差距」是把账算在转写上，不是算在成片上。
+const pend = [
+  { w: '时', at: 0.46, why: 'never-heard' },
+  { w: '些', at: 10.42, why: 'never-heard' },
+  { w: '因为', at: 27.5, why: 'audio-differs' },
+  { w: '但是', at: 39.94, why: 'never-heard' },
+]
+const onFilm = pendingOnFilm(pend, [[0, 3.125], [25.28, 39.928], [42.332, 44.74]])
+ok(onFilm.inFilm.length === 2 && onFilm.cut.length === 2, '成片内 / 已剪掉分开记账', JSON.stringify({ a: onFilm.inFilm.map(x => x.w), b: onFilm.cut.map(x => x.w) }))
+ok(onFilm.cut.every(x => x.w === '些' || x.w === '但是'), '被整句剪掉的「些」「但是」进「已剪掉」那一边', JSON.stringify(onFilm.cut.map(x => x.w)))
+ok(pendingOnFilm(pend, [[0, 100]]).cut.length === 0, '全保留时一个都不算剪掉')
+ok(pendingOnFilm(pend, []).inFilm.length === 0, '没有保留区间（空片）时成片内一个都没有，不静默当成「都过了」')
+ok(pendingOnFilm([], [[0, 10]]).inFilm.length === 0 && pendingOnFilm([], [[0, 10]]).cut.length === 0, '没有怀疑时两边都是空')
 
 console.log('')
 if (fail) { console.log('FAIL  ' + pass + ' 条通过，' + fail + ' 条不通过'); process.exit(1) }

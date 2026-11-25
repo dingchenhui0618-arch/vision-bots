@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { probe } from '../probe.mjs'
 import { extractAudio } from '../ffmpeg.mjs'
 import { transcribe } from '../asr.mjs'
-import { buildPlan } from '../plan.mjs'
+import { buildPlan, pendingOnFilm } from '../plan.mjs'
 import { envelope16 } from '../energy.mjs'
 import { paramsOf } from '../bots/config.mjs'
 import { buildCaptions, toSRT } from '../captions.mjs'
@@ -270,6 +270,31 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
       plan = cur
     }
   }
+  // ── 「没解决的怀疑」按成片记账 ──
+  // 听音复核跑在剪辑之前，它算的是**全条转写**上的怀疑；剪辑会整句删掉内容，
+  // 被删掉的句子里那些低置信字，观众根本听不到，却一直挂在报告里当「没追平的差距」。
+  // 自测26 实测：10 个字里有 4 个（些 / 但是 / 你 / 看到）整句都被剪掉了。
+  // 分开记：成片里的（要追）+ 已剪掉的（不该再算），两个数都报，不许合成一个。
+  if (fixReport && Array.isArray(fixReport.pending)) {
+    const split = pendingOnFilm(fixReport.pending, plan.keep)
+    fixReport.pendingAll = fixReport.pending.length
+    fixReport.pendingCut = split.cut.length
+    fixReport.pendingCutTexts = split.cut.map(p => p.w + '@' + p.at + 's')
+    fixReport.pending = split.inFilm
+    if (fixReport.stats) {
+      fixReport.stats.pending = split.inFilm.length
+      fixReport.stats.pendingNever = split.inFilm.filter(x => x.why === 'never-heard').length
+      fixReport.stats.pendingDisagree = split.inFilm.filter(x => x.why === 'audio-differs').length
+      fixReport.stats.pendingStrong = split.inFilm.filter(x => x.strong).length
+      fixReport.stats.pendingCut = split.cut.length
+    }
+    if (split.cut.length) {
+      log('没解决的怀疑：成片里 ' + split.inFilm.length + ' 个字，另有 ' + split.cut.length + ' 个字所在的句子已被剪掉（' +
+        split.cut.slice(0, 4).map(p => '「' + p.w + '」@' + p.at + 's').join('、') + (split.cut.length > 4 ? ' 等' : '') +
+        '）——剪掉的观众听不到，不再算没追平，但照实记着')
+    }
+  }
+
   const delLabel = { repeat: '重复', filler: '口头语', mistake: '口误', content: '整句删' }
   if (plan.deletions.length) {
     const by = Object.entries(plan.byReason).map(([k, n]) => (delLabel[k] || k) + ' ' + n).join(' / ')
@@ -376,7 +401,8 @@ export async function runCut({ group, job, log, artifact, brief, state, narrate 
     (fixReport.rejected.length ? `\n模型提的 ${fixReport.rejected.length} 处改法没通过校验，退回了：` + fixReport.rejected.slice(0, 2).map(r => `「${r.from}」→「${r.to}」${r.why}`).join('、') + '。' : '') +
     (pending.length
       ? `\n还有 ${pending.length} 个词识别把握不高（没听过 ${pending.filter(w => w.why === 'never-heard').length} 个、音频与字幕不一致 ${pending.filter(w => w.why === 'audio-differs').length} 个）：${pending.slice(0, 4).map(w => `「${w.w}」@${w.at}s`).join('、')}${pending.length > 4 ? ' 等' : ''}，没把握就不动它，全部列在错字清单里。`
-      : '\n低置信词都处理干净了。'),
+      : '\n成片里没有一个字的识别是没把握的。') +
+    (fixReport.pendingCut ? `\n另有 ${fixReport.pendingCut} 个低置信字所在的句子整句被剪掉了，观众听不到，不算进上面的账。` : ''),
     { job: job.id })
 
   // 给 bot 说话用的事实（数字都在这儿，模型不许自己再算一遍）
