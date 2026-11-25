@@ -40,7 +40,76 @@
 
 环境变量优先级更高：`DSH_MEDIA_LLM_BASE` / `_KEY` / `_FAST` / `_SMART` / `_THINKING` / `_TIMEOUT_MS`。
 
-`fast` 用在每片必经的检查（错字、语义审读、段落标题），`smart` 用在读需求这种一次性的判断。
+`fast` 用在每片必经的检查（错字、语义审读、段落标题），`smart` 用在读需求和整句删这种要判断力的地方。
+
+## 一条产线接两家服务：模型名自带路由（2026-11-25）
+
+模型名可以写成 `<路由>:<模型>`，不带前缀的照旧走 `base`：
+
+```json
+"models": { "fast": "qwen3.8-flash", "smart": "qwen3.8-max" },
+"routes": {
+  "codesome": {
+    "base": "https://v3.codesome.cn/v1",
+    "key": "…",
+    "models": { "fast": "claude-sonnet-5-5", "smart": "claude-opus-5-5" },
+    "noTemperature": true,
+    "noThinkingFlag": true,
+    "minMaxTokens": 8000,
+    "minTimeoutMs": 90000
+  }
+}
+```
+
+换成 Opus 只需把 `smart` 改成 `codesome:claude-opus-5-5`（或起服务时给
+`DSH_MEDIA_LLM_SMART=codesome:claude-opus-5-5`）。**只有这一档过去**：`fast`、术语表、
+音频证据、时间码一个字节都没动，提案回来仍旧过同一套校验器。
+
+为什么不是直接改 `base`：两家网关的请求体不一样，硬换会以三种方式失败，其中一种**不报错**。
+
+| 路由开关 | 不加会怎样 |
+|---|---|
+| `noTemperature` | Opus 5.5 开着 thinking 时 `temperature` 只许是 1，传 0 直接 **400** |
+| `noThinkingFlag` | 它没有 vLLM 系的 `enable_thinking` 字段 |
+| `minMaxTokens` | 思考与回答共用 `max_tokens`：29 句的选句题一次要 2000–2500 提示 + 2200–3000 思考 token。给 4000 会偶发 `finish_reason=length`、正文空白——**HTTP 200，不报错**，产品只会当成「模型没接上」然后退回规则排序 |
+| `minTimeoutMs` | 单次 25–49s，默认 60s 的耐心不够 |
+| `extraBody` | 网关方言（`output_config.effort`）原样带过去；只许加字段，不许改 model / messages / max_tokens / temperature / tools |
+
+另外两条：
+
+- **空正文只在 `finish_reason=length` 且该路由声明了思考下限时重试一次、预算翻倍**（`shouldRetryEmpty`）。
+  别的空就是空，不重试。重试是基础设施行为：不改问题、不改答案的含义，也不替模型下结论。
+- 名册只显示模型名（`modelLabel`），网关前缀是接线细节，不露给客户。
+
+离线断言 `scripts/check-routes.mjs` 29 条（解析 8 / 请求体 11 / 重试 4 / 接线 6）：不联网、
+不读本机凭证（路由用注入的假表），换机器照样能跑。出问题要看见网关原话时，
+设 `VISION_BOTS_LLM_TRACE=<文件>`，每次调用的完整请求与响应都会落一行。
+
+## 实测：把 Opus 5.5 接到提案侧，值不值（2026-11-25）
+
+同一条真素材（自测29：29 句、首版成片 66.56s、目标 60s），同一套输入重放「整句删」：
+
+| | qwen3.8-max（现用） | Opus（预算 4000） | Opus（预算 8000） |
+|---|---|---|---|
+| 重放次数 | 3 | 6 | 3 |
+| 删到 60.05s | **3/3** | 3/6 | **3/3** |
+| 删的是同一组句子 | 3/3 票一致 | 够票的那几次一致 | **3/3 票一致** |
+| 一次重放总耗时 | **33–37s** | 110–152s | 167–293s |
+| 单次调用 | **5–6s** | 20–27s | 39–49s |
+
+读需求（`understand()`，同一句话 ×3）：两边字段 **3/3 完全一致**（抖音 / 9:16 / 90s / 折光 / 无稿），
+Opus 3.6–5.5s、qwen 1.9–2.1s。
+
+结论三句：
+
+1. **接得通**：正文、JSON、工具调用（`tool_calls` → `tool` 回投）都正常，多轮那步 2.96s + 3.67s；
+2. **「更稳」没被证实**：qwen3.8-max 在现有「3 次采样 + 2 票」的机制下已经 3/3 完全一致；
+   Opus 预算够时也一样稳——两次不达标都不是模型判得不同，是**预算没给够**把答案截断了；
+3. **代价是真的**：Opus 一次重放 167–293s，qwen 33–37s，慢 5–9 倍。
+
+所以默认仍是 `smart: qwen3.8-max`。要再验一次，用固定手法：
+`node scripts/model-ab.mjs <群 id> <标签> <第几次>`——同一条素材、同一套输入重放，
+比「删的句子是否相同」「票数是否一致」「单次多久」，不比感觉。
 
 ## 实测（2026-11-23，TokenRouter 网关，26 个模型可选）
 
