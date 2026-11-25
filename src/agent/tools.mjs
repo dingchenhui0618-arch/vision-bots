@@ -49,6 +49,67 @@ export async function inspectProject({ group, brief, state }) {
 }
 
 /** 每个 bot 能调的工具。job 是这次派活的执行单元（handler 要用它建工作目录）。 */
+
+/**
+ * 某个源时间点的全部证据：这一秒说的是哪个词、置信度多少、有没有被强耳朵听过、结论是什么、
+ * 没听是为什么、这个点还在不在成片里。纯函数，可单测。
+ *
+ * 为什么要有它（自测27 实测）：制片人问「27.5s 和 31.3s 你验一下」，质检手上只有一份整片报告，
+ * 没有「查某一个时刻」的手，于是它诚实地说「证不出来」，再按红线判了不通过——
+ * 而同一份报告里明明写着：27.5s「因为」p=0.565（常见词、没进可疑队列）、31.3s「G」p=0.424（三连英文听不准）。
+ * 结果报告 19/19、群里说「低置信词不通过」，用户看到的是自相矛盾。
+ * 红线（没有证据不许判通过）不用改，缺的是取证的手。
+ */
+export function spotFacts({ at, words = [], keep = [], fixReport = null, win = 0.6 } = {}) {
+  const t = Number(at)
+  const near = (words || [])
+    .filter(w => Number(w.end) >= t - win && Number(w.start) <= t + win)
+    .slice(0, 6)
+    .map(w => ({
+      w: w.w,
+      start: +Number(w.start).toFixed(2),
+      end: +Number(w.end).toFixed(2),
+      p: typeof w.p === 'number' ? +w.p.toFixed(3) : null,
+      src: w.src || null,
+    }))
+  const fr = fixReport || {}
+  const inFilm = (keep || []).some(([a, b]) => t + 1e-6 >= a && t < b)
+  const spans = ((fr.relisten && fr.relisten.spans) || [])
+    .filter(s => Array.isArray(s.span) && t >= s.span[0] - 0.05 && t <= s.span[1] + 0.05)
+    .map(s => ({
+      span: s.span,
+      agree: s.agree !== false,
+      heard: s.text || null,
+      applied: s.applied ? s.op || 'edit' : null,
+      veto: Boolean(s.veto),
+      rejected: s.rejected || null,
+      confirmed: Boolean(s.confirmed),
+      confirmedWords: (s.confirmedWords || []).map(x => x.w),
+    }))
+  const pending = (fr.pending || [])
+    .filter(p => Math.abs(Number(p.at) - t) <= win)
+    .map(p => ({ w: p.w, at: p.at, p: p.p, why: p.why, strong: Boolean(p.strong) }))
+  const verdict = spans.length
+    ? (spans.some(s => s.veto) ? 'vetoed' : spans.some(s => s.applied) ? 'changed' : spans.some(s => s.rejected) ? 'rejected' : 'audited')
+    : (pending.length ? 'not-audited' : 'not-suspicious')
+  return {
+    at: t,
+    words: near,
+    inFilm,
+    spans,
+    pending,
+    verdict,
+    // 这一版有没有被剪辑剪掉过（剪掉的句子里的字，观众听不到，账在 pendingCut 里单独记）
+    pendingCut: (fr.pendingCutTexts || []).map(s => String(s).replace(/@.*$/, '')),
+    hint: verdict === 'audited' ? '这一秒被强耳朵逐字听过，结论见 spans'
+      : verdict === 'changed' ? '这一秒被强耳朵听过、并且已经按音频改过'
+      : verdict === 'vetoed' ? '这一秒我们改过字，但音频读的是改之前那句，已退回原话'
+      : verdict === 'rejected' ? '这一秒听过，但音频和字幕对不上、改法过不了约束，如实留在清单里'
+      : verdict === 'not-audited' ? '这一秒没被听过：见 pending 里的 why（没进可疑队列 / 音频和字幕不一致）'
+      : '这一秒没有任何可疑记录，也没被重听过',
+  }
+}
+
 export function toolsFor(botId, { group, brief, state, runner, director }) {
   const cutJob = () => director.currentJob('cutter')
   const packJob = () => director.currentJob('packer')
@@ -176,6 +237,25 @@ export function toolsFor(botId, { group, brief, state, runner, director }) {
           }
           return r
         },
+      },
+      {
+        name: 'explain_spot',
+        label: '查某一秒',
+        description: '查源素材某个时间点（秒）的全部证据：这一秒说的是哪个词、置信度多少、有没有被强耳朵听过、' +
+          '听过是什么结论（确认 / 改过 / 否决 / 对不上）、没听是为什么、这个点还在不在成片里。' +
+          '被追问「某某秒到底对不对」时先用它取证，不要凭整片报告的摘要说「证不出来」。',
+        parameters: {
+          type: 'object',
+          properties: { at: { type: 'number', description: '源素材时间，秒（例如 27.5）' } },
+          required: ['at'],
+          additionalProperties: false,
+        },
+        run: args => spotFacts({
+          at: args.at,
+          words: (state.transcript && state.transcript.words) || [],
+          keep: (state.plan && state.plan.keep) || [],
+          fixReport: state.fixReport || null,
+        }),
       },
     ]
   }

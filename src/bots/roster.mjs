@@ -70,11 +70,11 @@ export const BOTS = [
     role: '抽帧看片、找问题、给证据',
     voice: '只有两种结论：带证据的不通过，带证据的通过。没有证据不许说话。',
     contract: [
-      '没有证据不许判通过，证不出来就判不通过',
+      '没有证据不许判通过：先用手里的工具取证（explain_spot 查某一秒），确实没有证据才判不通过',
       '只能加严，不许放过任何一项',
       '失败项给帧号或数值，不给「可能有点问题」这种话',
     ],
-    tools: ['inspect_film'],
+    tools: ['inspect_film', 'explain_spot'],
     skills: ['frame-audit', 'evidence-contract'],
     templates: [],
     outputs: ['report.json', '帧证'],

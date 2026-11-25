@@ -9,7 +9,7 @@ import { BotSession } from '../src/agent/session.mjs'
 import { FactBook } from '../src/agent/facts.mjs'
 import { runAgent, buildSystem } from '../src/agent/loop.mjs'
 import { Director } from '../src/agent/director.mjs'
-import { toolsFor } from '../src/agent/tools.mjs'
+import { toolsFor, spotFacts } from '../src/agent/tools.mjs'
 import { BOTS, byId } from '../src/bots/roster.mjs'
 import { callProfile } from '../src/llm.mjs'
 
@@ -134,6 +134,65 @@ console.log('\n[4] 四个 bot 是一套工具代码的四个会话，配置各�
   ok('剪辑没有派活权（层级是代码定的）', !ct.some(t => t.name === 'dispatch_to'))
   ok('四个 bot 的工具不重样', new Set(BOTS.flatMap(b => b.tools)).size === BOTS.flatMap(b => b.tools).length)
   ok('会话各存一份', BOTS.every(b => d.session(b.id).dir.includes(join('bots', b.id))))
+  // 质检得有一只能「查某一秒」的手（自测27：被追问 27.5s / 31.3s 时它只能说「证不出来」，然后按红线判不通过，
+  // 而同一份报告里那两个点明明有记录——报告 19/19、群里「低置信词不通过」，用户看到的是自相矛盾）
+  const qt = toolsFor('qc', { group: g, brief: d.brief, state: d.state, runner: d.runner, director: d })
+  ok('质检有 explain_spot（被追问某一秒时能取证）', qt.some(t => t.name === 'explain_spot'), qt.map(t => t.name).join(','))
+  ok('别的 bot 没有 explain_spot（工具不重样）', BOTS.filter(b => b.id !== 'qc').every(b => !b.tools.includes('explain_spot')))
+}
+
+// ── 4b. explain_spot：某一秒的证据（纯函数，用自测27 的真实数字当夹具）──
+console.log('\n[4b] 查某一秒')
+{
+  const words = [
+    { w: '为什么', start: 27.02, end: 27.22, p: 0.995 },
+    { w: '因为', start: 27.5, end: 27.74, p: 0.565 },
+    { w: '现在', start: 27.74, end: 28.1, p: 0.985 },
+    { w: 'G', start: 31.28, end: 31.56, p: 0.424 },
+    { w: '些', start: 10.42, end: 10.52, p: 0.104 },
+  ]
+  const fixReport = {
+    relisten: { spans: [
+      { span: [3.64, 5.92], agree: true, confirmed: true, text: '今天大家都在卷AI技术' },
+      { span: [36.9, 39.94], agree: true, confirmed: true, text: '但是AI来去做内容' },
+      { span: [45.21, 47.73], agree: true, veto: true, text: '我现在花1000的时间', orig: '我现在要花一千的时间', applied: true, op: 'revert' },
+      { span: [30.6, 34.88], agree: true, text: '大家用GDPCodexCodex这些工具', rejected: '删 10 个字，超过听音复核 4 个字的预算' },
+    ] },
+    pending: [
+      { at: 27.5, w: '因为', p: 0.565, why: 'never-heard', strong: false },
+      { at: 31.28, w: 'G', p: 0.424, why: 'audio-differs', strong: false },
+    ],
+    pendingCutTexts: ['些@10.42s', '但是@39.94s'],
+  }
+  const keep = [[0, 3.125], [25.28, 39.928], [45.07, 54.87]]
+  const s1 = spotFacts({ at: 27.5, words, keep, fixReport })
+  ok('查得到这一秒的词和置信度', s1.words.some(w => w.w === '因为' && w.p === 0.565), JSON.stringify(s1.words))
+  ok('点在有保留区间里 → inFilm', s1.inFilm === true)
+  ok('没被听过 → not-audited，并带出为什么', s1.verdict === 'not-audited' && s1.pending[0].why === 'never-heard' && s1.pending[0].strong === false, JSON.stringify(s1.pending))
+  const s2 = spotFacts({ at: 31.28, words, keep, fixReport })
+  ok('听过但对不上 → rejected，并把理由带出来', s2.verdict === 'rejected' && /删 10 个字/.test(s2.spans[0].rejected || ''), JSON.stringify(s2.spans))
+  const s3 = spotFacts({ at: 46.5, words, keep, fixReport })
+  ok('被音频否决过 → vetoed', s3.verdict === 'vetoed')
+  const s4 = spotFacts({ at: 10.42, words, keep, fixReport })
+  ok('已被剪掉的点 → inFilm false（观众听不到）', s4.inFilm === false)
+  const s5 = spotFacts({ at: 20, words, keep, fixReport })
+  ok('没有任何记录 → not-suspicious', s5.verdict === 'not-suspicious' && s5.spans.length === 0 && s5.pending.length === 0)
+  ok('剪掉的字单独列出来（去掉时间写法）', s4.pendingCut.includes('些') && s4.pendingCut.includes('但是'), JSON.stringify(s4.pendingCut))
+
+  // 这只手要真的能把证据交到模型手上，不是只在工具表里挂个名字
+  const g2 = group('取证')
+  const d2 = new Director(g2, { brief: {}, state: { transcript: { words }, plan: { keep }, fixReport } })
+  const qtools = toolsFor('qc', { group: g2, brief: d2.brief, state: d2.state, runner: d2.runner, director: d2 })
+  const seen = []
+  const chatFn = async ({ messages }) => {
+    const isTool = messages.some(m => m.role === 'tool')
+    if (!isTool) return { ok: true, content: '', toolCalls: [{ id: 'e1', function: { name: 'explain_spot', arguments: JSON.stringify({ at: 27.5 }) } }] }
+    seen.push(messages.filter(m => m.role === 'tool').map(m => String(m.content)).join(''))
+    return { ok: true, content: '27.5s 的「因为」置信 0.565，没进过可疑队列，不是抓漏。', toolCalls: [] }
+  }
+  const rr = await runAgent({ session: new BotSession(g2, 'qc'), bot: byId('qc'), task: '27.5s 对不对', tools: qtools, chatFn })
+  ok('质检能从工具里拿到那一秒的证据', seen.length === 1 && seen[0].includes('因为') && seen[0].includes('never-heard'), JSON.stringify(seen).slice(0, 200))
+  ok('拿到证据后的话过数字校验', rr.ok && rr.check && rr.check.ok, JSON.stringify(rr.check && rr.check.fail && rr.check.fail.slice(0, 3)))
 }
 
 // ── 5. 交付硬门：没质检不许交 ──
