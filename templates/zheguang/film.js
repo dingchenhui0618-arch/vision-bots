@@ -742,15 +742,16 @@ export async function createFilm({ media }) {
     // 底色不用纯黑：把这一帧的本人压暗、虚化当底纹。纯黑卡片一下把全片平均亮度砸掉 19 级
     // （106 → 86.8），而且 2–3 秒的黑屏在时间线上是「画面死了」；参考片的字卡背后始终还是这个人。
     if (img && img.width) {
+      // 自测28：字卡原来把人虚化到 brightness 0.40 再叠 0.40 黑幕，为的是让白字读得出——
+      // 代价是钩子那 3.9 秒里人是一团虚影（全片 9.5% 的帧低于自身中位锐度的 0.4 倍，
+      // 折光参考片只有 1.6%；亮度 p10 45.4 对参考片 62.1）。参考片的字卡上人始终是清楚的，
+      // 字靠自己的对比读得出来：暗带 + 阴影，不靠把整屏压黑。压光因此改到下面那条局部带。
       c.save()
-      // 0.40 是量出来的下限：调到 0.55 时字卡上的白字压在虚化后的人脸上只有 1.03:1（质检 32s 抓到）
-      c.filter = 'blur(24px) brightness(0.40) saturate(0.6)'
-      const s = Math.max(w / img.width, h / img.height) * 1.18
+      c.filter = 'contrast(1.06) saturate(0.98) brightness(0.97)'
+      const s = Math.max(w / img.width, h / img.height) * 1.03
       const dw = img.width * s, dh = img.height * s
       c.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh)
       c.restore()
-      c.fillStyle = R(P.void, 0.40)
-      c.fillRect(0, 0, w, h)
     } else {
       c.fillStyle = R(P.void, 1)
       c.fillRect(0, 0, w, h)
@@ -781,7 +782,19 @@ export async function createFilm({ media }) {
     const lines = (b && b.lines && b.lines.length) ? b.lines : [text]
     const size = Math.min(TY.big + 56, Math.floor((w - M * 2) / Math.max(1, ...lines.map(l => textEm(l)))))
     const lh = size * 1.02
-    const top = (h - lines.length * lh) / 2 - 40
+    // 字卡正文压在胸口（0.62h 是墨迹中心），不是画面正中：正中会正好切在嘴上。
+    // 参考片的字卡大字也在胸口那一带——人清楚之后，字压嘴就是硬伤（自测28 抽帧看到的）。
+    const top = Math.round(h * 0.62 - ((lines.length - 1) * lh + size * 0.5))
+    // 局部压光：只在文字块后面羽化一条暗带（人上半身不动），对比度由它和字阴影一起保证。
+    // 宽度铺满是因为卡片正文本来就接近满宽；两端各羽化 84px，免得成了一条硬边黑条。
+    const bandTop = top - 96, bandBot = top + lines.length * lh + 56, feath = 84
+    const gb = c.createLinearGradient(0, bandTop - feath, 0, bandBot + feath)
+    gb.addColorStop(0, R(P.void, 0))
+    gb.addColorStop(0.2, R(P.void, 0.74))
+    gb.addColorStop(0.8, R(P.void, 0.74))
+    gb.addColorStop(1, R(P.void, 0))
+    c.fillStyle = gb
+    c.fillRect(0, bandTop - feath, w, bandBot - bandTop + feath * 2)
     c.save()
     // 小字眉用页面标题（原话摘的），不是编出来的英文
     // 小字眉和正文是同一句话时不画（自测16 的 32s 那屏上写了「知道的人会做的人」两遍，
@@ -798,7 +811,8 @@ export async function createFilm({ media }) {
       const k = E.outExpo(clamp(seg(t, at, at + 0.40)))
       c.globalAlpha = k
       // 沿用大字的强调规则：一个词进荧光绿/红底，其余纸白；字卡不再整屏上色
-      drawRuns(c, ln, M + (1 - k) * size * 0.12, top + i * lh + size * 0.88, size, b ? b.style : 'plain', b ? b.hot : '', false)
+      // 阴影开着：底已经是清楚的人，字的边缘要靠自己压住（参考片的字卡也带阴影）
+      drawRuns(c, ln, M + (1 - k) * size * 0.12, top + i * lh + size * 0.88, size, b ? b.style : 'plain', b ? b.hot : '', true)
     })
     // 一条短绿线压住正文：卡片上除了大字什么都没有，空得像没画完（自测16 对比抽帧看到的）
     line(c, M, top + lines.length * lh + 22, M + 74, top + lines.length * lh + 22, R(P.lime, 0.92), 4)

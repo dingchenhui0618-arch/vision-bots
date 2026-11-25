@@ -71,6 +71,27 @@ export function layoutBoxes({ scene, template }) {
     // 大字：按版式给不同的底边（和 film.js 的 bigBottom 一致）
     for (const b of scene.bigs || []) {
       const shot = shotAt(b.f0)
+      // 全屏字卡：大字是**居中**的（film.js 的 cardShot），不是满幅页那条压在 0.775h 的排版。
+      // 以前这里不分版式，字卡页的大字盒子按满幅页算——位置完全不对，量出来的对比度
+      // 是「字卡上根本不存在的那块地方」的亮度（自测27 之前卡片的 1.03:1 假失败就是这么来的，
+      // 后来又变成「字卡页一个盒子都没量到」）。自测28 起两个分支分开算。
+      if (shot.kind === 'card') {
+        const cl = (b.lines && b.lines.length) ? b.lines : [b.text]
+        const capBig = ((scene.type && scene.type.big) || (template.type && template.type.big) || 96) + 56
+        const cSize = Math.min(capBig, Math.floor((w - (L.margin || 56) * 2) / Math.max(1, ...cl.map(textEm))))
+        const cLh = cSize * 1.02
+        // 和 film.js 的 cardShot 同一口径：墨迹中心在 0.62h（压胸口，不压嘴）
+        const cTop = Math.round(h * 0.62 - ((cl.length - 1) * cLh + cSize * 0.5))
+        items.push({
+          tag: 'big', x: L.margin || 56, y: Math.round(cTop - 60),
+          w: w - (L.margin || 56) * 2, h: Math.round(cl.length * cLh + 80),
+          // 时间窗要和「字真的画出来」对齐：第一行从 f0 起淡入 0.40s，后续行每行晚 0.12s。
+          // 不认这一条，盒子会去量淡入那一帧——那一刻字还没画，盒子里的背景就是人脸，
+          // 自测28 第一次重出就在这里量出 big 1.04:1 的假失败。
+          t0: b.f0 + 0.12 * (cl.length - 1) + 0.40, t1: b.f1, shot: 'card',
+        })
+        continue
+      }
       const lines = Math.max(1, (b.lines && b.lines.length) || 1)
       const size = bigSizeOf(b, shot)
       // 盒子量的是「墨迹」，不是行盒：film.js 把基线画在 top + i*lh + size*0.86 上，
@@ -119,11 +140,28 @@ export function layoutBoxes({ scene, template }) {
       }
     }
     // 字幕：和 film.js 同一个字宽公式
+    // 字卡页上不画字幕（film.js 的 draw() 在 card 页提前 return），盒子也要跟着消失。
+    // 不信这条，字卡页上会冒出一个「画面里根本没有的字幕盒子」：以前卡片是黑的，量出来恰好是
+    // 17:1 的高对比假通过；自测28 人清楚之后立刻变成 2.09:1 的假失败。两头都是假的。
+    const cardSpans = shots.filter(s => s.kind === 'card').map(s => [s.f0, s.f1])
     for (const s of scene.subs || []) {
       const em = [...String(s.text)].reduce((n, ch) => n + (/[\x00-\xff]/.test(ch) ? 0.56 : 1), 0)
       const pw = Math.min(w - 96, Math.round(em * SUB2.size + SUB2.padX * 2))
       const ph = Math.round(SUB2.size * 1.28 + SUB2.padY * 2)
-      items.push({ tag: 'sub', x: Math.round((w - pw) / 2), y: Math.round(h - SUB2.bottom - ph), w: pw, h: ph, t0: s.f0, t1: s.f1 })
+      let wins = [[s.f0, s.f1]]
+      for (const [a, b] of cardSpans) {
+        const next = []
+        for (const [c0, c1] of wins) {
+          if (b <= c0 || a >= c1) { next.push([c0, c1]); continue }
+          if (c0 < a) next.push([c0, a])
+          if (b < c1) next.push([b, c1])
+        }
+        wins = next
+      }
+      wins = wins.filter(x => x[1] - x[0] > 0.25)
+      if (!wins.length) continue
+      const win = wins.reduce((p, c) => (c[1] - c[0] > p[1] - p[0] ? c : p))
+      items.push({ tag: 'sub', x: Math.round((w - pw) / 2), y: Math.round(h - SUB2.bottom - ph), w: pw, h: ph, t0: win[0], t1: win[1] })
     }
     // 人物窗口矩形：和 film.js 的 personRect 同一个算法（几何全在 template.json 里）
     const M0 = L.margin || 56

@@ -276,6 +276,35 @@ ok('时间线统计齐', scene.stats && scene.stats.out > 0 && scene.frames > 0)
   ok('章节卡占场那 1.5 秒，大字不进盒子', Boolean(bigE) && bigE.t0 >= 1.5 - 1e-6, bigE ? String(bigE.t0) : '-')
 }
 
+// 9) 字卡页的大字：居中排版，盒子必须跟着居中（自测28）
+//
+// 以前 layout-boxes 不分版式：字卡页的大字盒子按满幅页那条（压在 0.775h）算，
+// 量的就不是画面上的那块字——先量出 1.03:1 的假失败，后来干脆一个盒子都量不到。
+// 现在两个分支分开算，这条盯住「盒子和画面是同一套几何」。
+{
+  const W9 = 1080, H9 = 1920
+  const sc9 = {
+    template: 'zheguang', ratio: '9:16', size: [W9, H9], fps: 30, frames: 180, duration: 6,
+    shots: [{ f0: 0, f1: 2, kind: 'full' }, { f0: 2, f1: 5, kind: 'card' }, { f0: 5, f1: 6, kind: 'full' }],
+    subs: [], chips: [], sections: [], pages: [{ index: 1, total: 1, start: 0, end: 6, title: '最赚钱的不是技术' }],
+    bigs: [
+      { f0: 0.2, f1: 1.9, lines: ['今天大家都在卷'], text: '今天大家都在卷', hot: '' },
+      { f0: 2.2, f1: 4.8, lines: ['知道的人会做的人太少'], text: '知道的人会做的人太少', hot: '' },
+    ],
+    blocks: [],
+  }
+  const bx = (layoutBoxes({ scene: sc9, template: tpl }).items || []).filter(x => x.tag === 'big')
+  const cardBig = bx.find(x => x.shot === 'card'), fullBig = bx.find(x => x.shot === 'full')
+  const mid = cardBig ? (cardBig.y + cardBig.h / 2) / H9 : 0
+  // 墨迹中心定在 0.62h：压胸口，不压嘴（自测28 第一次重出把字卡画在正中，正好切在嘴上）
+  ok('字卡页的大字盒子压胸口（0.62h 附近，不是满幅页那条 0.775h、也不是正中的 0.50h）', Boolean(cardBig) && mid > 0.56 && mid < 0.68, cardBig ? mid.toFixed(2) : '没有')
+  ok('字卡页的大字盒子是满宽减页边距', Boolean(cardBig) && cardBig.w === W9 - ((tpl.layouts['9:16'].margin) || 56) * 2, cardBig ? String(cardBig.w) : '-')
+  ok('同一场景里，字卡页和满幅页的大字盒子不相同', Boolean(cardBig) && Boolean(fullBig) && cardBig.y !== fullBig.y)
+  // 反向验证：把字卡页的字号按满幅页那条算，这条就必须报出来——尺子得有分辨力
+  const wrongY = Math.round(H9 * 0.775 - (Math.min(96, Math.floor((W9 - 124) / 10)) * 1.06))
+  ok('按满幅页算出来的盒子会被这条判成不合格', Math.abs((cardBig ? cardBig.y : 0) - wrongY) > 60, cardBig ? cardBig.y + ' vs 满幅 ' + wrongY : '-')
+}
+
 console.log('折光自检：' + pass + ' 通过，' + fails.length + ' 失败')
 if (fails.length) { for (const f of fails) console.log('  ✗ ' + f) }
 

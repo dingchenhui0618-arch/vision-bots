@@ -181,6 +181,49 @@ export function boxContrast({ frames, box, color, fps }) {
   return { ok: true, worst, samples: per }
 }
 
+/**
+ * 字卡页的人还在不在。
+ *
+ * 自测27 之前字卡把人物虚化到 brightness 0.40、再叠 0.40 黑幕——白字是读得出了，
+ * 代价是钩子那 3.9 秒里人是一团虚影。对比度那一项量不出这件事：底越黑，对比度越高。
+ * 所以单列一条：字卡页上半区（人所在的那一带）的平均亮度，至少要到满幅页同一带的 55%。
+ * 量的是「人还在不在」，不是审美。
+ */
+export function cardLiveness({ frames, shots, fps = 30, band = [0.06, 0.46], minRatio = 0.55 }) {
+  const cards = (shots || []).filter(s => s.kind === 'card')
+  if (!cards.length) return { ok: true, reason: '这一版没有全屏字卡（不用量）', cards: 0, ratio: null }
+  if (!frames || !frames.length) return { ok: false, reason: '没取到成片像素，量不了字卡上的人还在不在', cards: cards.length, ratio: null }
+  const kindAt = t => ((shots || []).find(x => t >= x.f0 && t < x.f1) || {}).kind || null
+  const bandMean = f => {
+    const y0 = Math.max(0, Math.round(f.h * band[0])), y1 = Math.min(f.h - 1, Math.round(f.h * band[1]))
+    let sum = 0, n = 0
+    for (let y = y0; y <= y1; y++) {
+      for (let x = 0; x < f.w; x++) {
+        const i = (y * f.w + x) * 3
+        sum += 0.2126 * (f.rgb[i] / 255) + 0.7152 * (f.rgb[i + 1] / 255) + 0.0722 * (f.rgb[i + 2] / 255)
+        n++
+      }
+    }
+    return n ? sum / n : 0
+  }
+  const med = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)] }
+  const cardM = [], fullM = []
+  for (const f of frames) {
+    const k = kindAt(f.frame / fps)
+    if (k === 'card') cardM.push(bandMean(f))
+    else if (k === 'full') fullM.push(bandMean(f))
+  }
+  if (!cardM.length) return { ok: false, reason: '样帧没落在字卡页上，量不了（不许当通过）', cards: cards.length, ratio: null, samples: 0 }
+  if (!fullM.length) return { ok: true, reason: '这一版没有满幅页可比，只记字卡亮度', cards: cards.length, ratio: null, cardLuma: Number(cardM[0].toFixed(3)) }
+  const c = med(cardM), fu = med(fullM)
+  const ratio = c / Math.max(1e-6, fu)
+  return {
+    ok: ratio >= minRatio, ratio: Number(ratio.toFixed(2)),
+    cardLuma: Number(c.toFixed(3)), fullLuma: Number(fu.toFixed(3)),
+    cards: cards.length, samples: cardM.length + fullM.length, minRatio,
+  }
+}
+
 export function rectOf(b) {
   return { x: b.x, y: b.y, w: b.w, h: b.h }
 }

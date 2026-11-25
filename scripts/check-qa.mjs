@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { ff } from '../src/ffmpeg.mjs'
 import { qa, BAR, TARGET_TOLERANCE } from '../src/qa.mjs'
 import { adjudicateByAudio } from '../src/qa-semantic.mjs'
+import { cardLiveness } from '../src/frame-audit.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -176,6 +177,30 @@ console.log('\n[12] 「没解决」要分清：没听过 / 音频与字幕不一
   ok(c && /没听过 2 个、音频与字幕不一致 1 个/.test(String(c.detail)), '两类分开计数写进 detail', c && c.detail)
   ok(c && c.evidence && c.evidence.never === 2 && c.evidence.differs === 1, '证据里带两个数', JSON.stringify(c && c.evidence))
   ok(c && c.ok === true, '3/248 = 1.2%，数量本身仍在门槛内 → 通过', c && c.detail)
+}
+
+console.log('\n[13] 字卡页的人还在不在（自测28）')
+{
+  // 对比度越高不等于画面越好：把底压黑，白字对比度反而更高。
+  // 这一条量的是「字卡上半区相对满幅页的亮度」——人还在不在。
+  const shots13 = [{ f0: 0, f1: 1, kind: 'full' }, { f0: 1, f1: 4, kind: 'card' }, { f0: 4, f1: 6, kind: 'full' }]
+  const mk = (n, v) => { const b = Buffer.alloc(54 * 96 * 3); b.fill(v); return { frame: n, w: 54, h: 96, rgb: b } }
+  const crushed = cardLiveness({ frames: [mk(15, 150), mk(45, 60)], shots: shots13, fps: 30 })
+  ok(crushed.ok === false && Math.round((crushed.ratio || 0) * 100) === 40, '虚化压暗的字卡（60/150=40%）判不过', JSON.stringify(crushed))
+  const alive = cardLiveness({ frames: [mk(15, 150), mk(45, 145)], shots: shots13, fps: 30 })
+  ok(alive.ok === true && Math.round((alive.ratio || 0) * 100) === 97, '人清楚的卡（145/150=97%）判过', JSON.stringify(alive))
+  const none = cardLiveness({ frames: [mk(15, 150)], shots: [{ f0: 0, f1: 6, kind: 'full' }], fps: 30 })
+  ok(none.ok === true && /没有全屏字卡/.test(String(none.reason)), '没有字卡的片子不新增这一项', none.reason)
+  const noFx = cardLiveness({ frames: [], shots: shots13, fps: 30 })
+  ok(noFx.ok === false && /没取到成片像素/.test(String(noFx.reason)), '没有像素判不过（不许当通过）', noFx.reason)
+  // 接到 qa() 上：真跑一遍，报告里要有这条，而且压暗那版要被打红
+  const scene13 = { size: [540, 960], fps: 30, shots: shots13, duration: 6 }
+  const r1 = await qa(base({ scene: scene13, frames: [mk(15, 150), mk(45, 145)] }))
+  const c1 = r1.checks.find(x => x.id === 'card_subject')
+  ok(c1 && c1.ok === true, '质检报告里出现 card_subject 且通过', c1 && c1.detail)
+  const r2 = await qa(base({ scene: scene13, frames: [mk(15, 150), mk(45, 60)] }))
+  const c2 = r2.checks.find(x => x.id === 'card_subject')
+  ok(c2 && c2.ok === false, '同一版画面被压暗后质检打红', c2 && c2.detail)
 }
 
 console.log('\n' + (fail ? 'FAIL ' : 'PASS ') + pass + ' 条通过 / ' + fail + ' 条失败')

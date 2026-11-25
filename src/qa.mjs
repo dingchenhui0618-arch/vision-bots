@@ -1,5 +1,5 @@
 import { ff, probeFile } from './ffmpeg.mjs'
-import { TEXT_COLOR, boxContrast, contrastRatio, intersect, unionBoxes, coverMap } from './frame-audit.mjs'
+import { TEXT_COLOR, boxContrast, contrastRatio, intersect, unionBoxes, coverMap, cardLiveness } from './frame-audit.mjs'
 import { judgeSemantic } from './qa-semantic.mjs'
 
 // 目标时长允许多少差：制片人拍板和质检用同一个数，不许一处 15%、一处 12%——
@@ -309,12 +309,14 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
     }
     if (frames && frames.length) {
       const need = { big: BAR.contrastBig, rail: BAR.contrastRail, sub: BAR.contrastSmall, 'hud:rec': BAR.contrastSmall, 'hud:sec': BAR.contrastSmall }
-      // 色卡是反白：荧光绿底 + 近黑大字。以前一律按 bone（骨白）量，色卡上就量出 1.4:1
-      // 这种假失败——字色得跟着画的颜色走，否则量的是不存在的字。
+      // 字色得跟着画的颜色走，否则量的是不存在的字。
+      // 这里曾经写「色卡是反白：荧光绿底 + 近黑大字」——那是自测18 之前的绿卡。
+      // 自测18 起字卡改成暗底 + 纸白大字，这行就过期了：字卡片子一直没进盒子表，
+      // 所以没人发现；自测28 把字卡盒子算对之后，立刻量出「近黑字压在人脸上」的 1.17:1 假失败。
       const onCardAt = t => Boolean(scene && (scene.shots || []).some(s => s.kind === 'card' && t >= s.f0 - 0.01 && t < s.f1))
       const colorOf = (tag) => {
         if (tag === 'rail') return TEXT_COLOR.signal
-        if (tag === 'big') return t => (onCardAt(t) ? TEXT_COLOR.void : TEXT_COLOR.bone)
+        if (tag === 'big') return TEXT_COLOR.bone   // 大字一律纸白（字卡也是），红底/绿底只占一个词
         return TEXT_COLOR.bone
       }
       const fails = []
@@ -382,6 +384,18 @@ export async function qa({ file, plan, captions, targetDuration = null, asrFix =
         ? `轨道在 ${(layout.railY / (vstr ? vstr.height : 1920) * 100).toFixed(0)}% 高度，字幕 pill 上沿 ${layout.subTop}px`
         : `${layout.mode} 版式：大字底边 ${layout.bigBottom}px，字幕 pill 上沿 ${layout.subTop}px`,
       layout)
+  }
+
+  // 字卡页的人还在不在：对比度越高不等于画面越好——把底压黑，对比度反而更高。
+  // 自测27 之前字卡把人物虚化压暗到 40%，全片 9.5% 的帧低于自身中位锐度的 0.4 倍
+  // （参考片 1.6%），钩子那 3.9 秒里认不出人。单列一条，量字卡上半区相对满幅页的亮度。
+  if (scene && frames && frames.length && (scene.shots || []).some(s => s.kind === 'card')) {
+    const lv = cardLiveness({ frames, shots: scene.shots, fps: scene.fps || 30 })
+    add('card_subject', lv.ok,
+      lv.ok
+        ? '字卡页的人还在：上半区亮度是满幅页的 ' + Math.round((lv.ratio || 0) * 100) + '%（下限 ' + Math.round((lv.minRatio || 0.55) * 100) + '%）'
+        : (lv.ratio == null ? lv.reason : '字卡页的人被压没了：上半区亮度只有满幅页的 ' + Math.round(lv.ratio * 100) + '%（下限 ' + Math.round((lv.minRatio || 0.55) * 100) + '%）'),
+      lv)
   }
 
   // 语义层：模型读交付文本找数值查不出的错（同音错、整句崩、重复句、跑题）。
